@@ -1,0 +1,36 @@
+# tests/test_rangebear.py
+import numpy as np
+import tensorflow as tf
+
+
+def test_range_bearing_ssm(range_bearing_ssm):
+    T = 80
+    batch_size = 16
+
+    x_traj, y_traj = range_bearing_ssm.simulate(T=T, batch_size=batch_size, seed=0)
+
+    dx = range_bearing_ssm.state_dim
+    dy = range_bearing_ssm.obs_dim
+
+    assert x_traj.shape == (batch_size, T, dx)
+    assert y_traj.shape == (batch_size, T, dy)
+
+    # NaN / Inf checks
+    assert not tf.reduce_any(tf.math.is_nan(x_traj))
+    assert not tf.reduce_any(tf.math.is_nan(y_traj))
+
+    # Geometric checks
+    rng = y_traj[..., 0]      # [batch, T]
+    bearing = y_traj[..., 1]  # [batch, T]
+
+    # positive range
+    mean_rng = tf.reduce_mean(rng)
+    assert mean_rng > 0.0
+    sigma_r = tf.sqrt(range_bearing_ssm.cov_eps_y[0, 0])  
+    assert tf.reduce_min(rng) > -3.0 * sigma_r
+
+    # bearing in [-pi, pi]
+    pi = tf.constant(np.pi, dtype=tf.float32)
+    sigma_b = tf.sqrt(range_bearing_ssm.cov_eps_y[1, 1])
+    assert tf.reduce_max(bearing) <= pi + 3.0 * sigma_b
+    assert tf.reduce_min(bearing) >= -pi - 3.0 * sigma_b
