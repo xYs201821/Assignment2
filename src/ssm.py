@@ -1,7 +1,64 @@
 import tensorflow as tf
 import numpy as np
+from src.motion_model import MotionModel
 
 class SSM(tf.Module):
+    @property 
+    def state_dim(self):
+        raise NotImplementedError
+
+    @property
+    def obs_dim(self):
+        raise NotImplementedError
+
+    def initialize(self, batch_size = 1, seed = None):
+        raise NotImplementedError
+    
+    def step(self, x_prev):
+        q = self.sample_transition_noise(tf.shape(x_prev)[0])
+        x_next = self.f(x_prev) + q
+        r = self.sample_observation_noise(tf.shape(x_next)[0])
+        y_next = self.h(x_next) + r
+        return x_next, y_next
+    
+    def simulate(self, T, batch_size=1, x0=None, seed=None):
+        if seed is not None:
+            tf.random.set_seed(seed)
+
+        if x0 is None:
+            x = self.initialize(batch_size=batch_size)
+        else:
+            x = tf.convert_to_tensor(x0, dtype=tf.float32)
+            if len(x.shape) == 1: # [dx] → [1, dx]
+                x = x[tf.newaxis, :]
+            batch_size = tf.shape(x)[0]
+
+        x_traj = []
+        y_traj = []
+        for _ in range(T):
+            x, y = self.step(x)
+            x_traj.append(x)
+            y_traj.append(y)
+
+        x_traj = tf.stack(x_traj, axis=1)  # [batch, T, dx]
+        y_traj = tf.stack(y_traj, axis=1)  # [batch, T, dy]
+        return x_traj, y_traj
+
+    def sample_transition_noise(self, batch_size = 1, seed = None):
+        raise NotImplementedError
+    
+    def sample_observation_noise(self, batch_size = 1, seed = None):
+        raise NotImplementedError
+    
+    def f(self, x):
+        """Transition function"""
+        raise NotImplementedError
+    
+    def h(self, x):
+        """Observation function"""
+        raise NotImplementedError
+    
+class LinearGaussianSSM(SSM):
     def __init__(self, A, B, C, D, m0, P0):
         super().__init__()
 
@@ -34,44 +91,129 @@ class SSM(tf.Module):
         x0 = tf.einsum('ij,bj->bi', L0, z0) + self.m0[tf.newaxis, :]
 
         return x0
+    def sample_transition_noise(self, batch_size = 1, seed = None):
+        if seed is not None:
+            tf.random.set_seed(seed)
+        q_dim = int(self.B.shape[1])
+        q = tf.random.normal(shape=(batch_size, q_dim), mean=0.0, stddev=1.0)
+        return tf.einsum('ij,bj->bi', self.B, q)
 
-    def step(self, x_prev):
-        batch_size = tf.shape(x_prev)[0]
-        dx = self.state_dim
-        dy = self.obs_dim
+    def sample_observation_noise(self, batch_size = 1, seed = None):
+        if seed is not None:
+            tf.random.set_seed(seed)
+        r_dim = int(self.D.shape[1])
+        r = tf.random.normal(shape=(batch_size, r_dim), mean=0.0, stddev=1.0)
+        return tf.einsum('ij,bj->bi', self.D, r)
 
-        eps_q = tf.random.normal(shape=(batch_size, dx), mean=0.0, stddev=1.0)
-        x_next = tf.einsum('ij,bj->bi', self.A, x_prev) + tf.einsum('ij,bj->bi', self.B, eps_q)
+    def f(self, x):
+        return tf.einsum('ij,bj->bi', self.A, x) 
 
-        eps_r = tf.random.normal(shape=(batch_size, dy), mean=0.0, stddev=1.0)
-        y_next = tf.einsum('ij,bj->bi', self.C, x_next) + tf.einsum('ij,bj->bi', self.D, eps_r)
-        return x_next, y_next
+    def h(self, x):
+        return tf.einsum('ij,bj->bi', self.C, x)
+
+class StochasticVolatilitySSM(SSM):
+
+    def __init__(self, alpha, sigma, beta):
+        self.alpha = tf.convert_to_tensor(alpha, dtype=tf.float32)
+        self.sigma = tf.convert_to_tensor(sigma, dtype=tf.float32)
+        self.beta = tf.convert_to_tensor(beta, dtype=tf.float32)
+
+        self.m0 = tf.constant([0.0], dtype=tf.float32)
+        self.P0 = tf.linalg.diag([self.sigma**2 / (1.0 - self.alpha**2), 1.0])
+        self.cov_eps_x = tf.linalg.diag([self.sigma**2, 1.0])
+        self.cov_eps_y = tf.zeros([1, 1], dtype=tf.float32)
+
+    @property
+    def state_dim(self): # [x_t, w_t]
+        return 2
+        
+    @property
+    def obs_dim(self):
+        return 1
+
+    def initialize(self, batch_size = 1, seed = None):
+        if seed is not None:
+            tf.random.set_seed(seed)
+        L0 = tf.linalg.cholesky(self.P0)
+        z0 = tf.random.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
+        x0 = self.m0 + tf.einsum('ij,bj->bi', L0, z0)
+        return x0
     
-    def simulate(self, T, batch_size=1, x0=None, seed=None):
+    def sample_transition_noise(self, batch_size = 1, seed = None):
+        if seed is not None:
+            tf.random.set_seed(seed)
+        q = tf.random.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
+        scale = tf.stack([self.sigma, 1.0], axis=0)
+        return q * scale
+
+    def sample_observation_noise(self, batch_size = 1, seed = None):
+        if seed is not None:
+            tf.random.set_seed(seed)
+        return tf.zeros((batch_size, self.obs_dim), dtype=tf.float32)
+    
+    def f(self, x):
+        x_t = x[:, 0]
+        w_t = x[:, 1]  # unused here
+
+        return tf.stack([self.alpha * x_t, tf.zeros_like(w_t)], axis=1)
+    
+    def h(self, x):
+        x_t = x[:, 0]
+        w_t = x[:, 1]  
+        y = self.beta * tf.exp(0.5 * x_t) * w_t
+        return y[:, tf.newaxis] # [batch, 1]
+
+
+class RangeBearingSSM(SSM):
+    
+    def __init__(self, motion_model, cov_eps_y):
+        super().__init__()
+        assert isinstance(motion_model, MotionModel)
+        self.motion_model = motion_model
+
+        self.m0 = tf.zeros([self.motion_model.state_dim], dtype=tf.float32)
+        self.P0 = tf.eye(self.motion_model.state_dim, dtype=tf.float32)
+        self.cov_eps_y = tf.convert_to_tensor(cov_eps_y, dtype=tf.float32)
+
+        self.L0 = tf.linalg.cholesky(self.P0)
+        self.Lr = tf.linalg.cholesky(self.cov_eps_y)
+
+    @property
+    def state_dim(self):
+        return self.motion_model.state_dim
+
+    @property
+    def obs_dim(self):
+        return int(self.cov_eps_y.shape[0])
+    
+    def initialize(self, batch_size = 1, seed = None):
+        if seed is not None:
+            tf.random.set_seed(seed)
+        z0 = tf.random.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
+        x0 = self.m0 + tf.einsum('ij,bj->bi', self.L0, z0)
+        return x0
+
+    def sample_transition_noise(self, batch_size=1, seed=None):
         if seed is not None:
             tf.random.set_seed(seed)
 
-        # ----- handle initial state -----
-        if x0 is None:
-            # sample x0 ~ N(m0, P0), shape = [batch_size, dx]
-            x = self.initialize(batch_size=batch_size)
-        else:
-            # convert x0 to tensor
-            x = tf.convert_to_tensor(x0, dtype=tf.float32)
-            # [dx] → [1, dx]
-            if len(x.shape) == 1:
-                x = x[tf.newaxis, :]   
-            # [batch, dx] → use its batch size
-            batch_size = tf.shape(x)[0]
+        return self.motion_model.sample_transition_noise(batch_size, seed)
 
-        x_traj = []
-        y_traj = []
-        for _ in range(T):
-            x, y = self.step(x)
-            x_traj.append(x)
-            y_traj.append(y)
+    def sample_observation_noise(self, batch_size=1, seed=None):
+        if seed is not None:
+            tf.random.set_seed(seed)
+        r = tf.random.normal(shape=(batch_size, self.obs_dim), mean=0.0, stddev=1.0)
+        return tf.einsum('ij,bj->bi', self.Lr, r)
 
-        x_traj = tf.stack(x_traj, axis=1)    # [batch, T, dx]
-        y_traj = tf.stack(y_traj, axis=1)    # [batch, T, dy]
+    def f(self, x):
+        return self.motion_model.f(x)  
 
-        return x_traj, y_traj
+    def h(self, x):
+        px = x[:, 0]
+        py = x[:, 1]
+
+        rng = tf.sqrt(px**2 + py**2 + 1e-20)
+        bearing = tf.atan2(py, px)
+        y = tf.stack([rng, bearing], axis=1)
+
+        return y
