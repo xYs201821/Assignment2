@@ -7,7 +7,7 @@ def test_range_bearing_ssm(range_bearing_ssm):
     T = 80
     batch_size = 16
 
-    x_traj, y_traj = range_bearing_ssm.simulate(T=T, batch_size=batch_size, seed=0)
+    x_traj, y_traj = range_bearing_ssm.simulate(T=T, batch_size=batch_size)
 
     dx = range_bearing_ssm.state_dim
     dy = range_bearing_ssm.obs_dim

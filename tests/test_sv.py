@@ -7,7 +7,7 @@ def test_sv_simulate_shapes_and_nan(sv_model):
     T = 50
     batch_size = 8
 
-    x_traj, y_traj = sv_model.simulate(T=T, batch_size=batch_size, seed=0)
+    x_traj, y_traj = sv_model.simulate(T=T, batch_size=batch_size)
 
     dx = sv_model.state_dim  
     dy = sv_model.obs_dim    
@@ -29,7 +29,7 @@ def test_sv_stationary_distribution_timewise(sv_model):
 
     T = 250
     batch_size = 256
-    x_traj, y_traj = sv_model.simulate(T=T, batch_size=batch_size, seed=123)
+    x_traj, y_traj = sv_model.simulate(T=T, batch_size=batch_size)
 
     x = x_traj[..., 0]
 

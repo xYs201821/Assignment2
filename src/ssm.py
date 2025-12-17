@@ -4,6 +4,16 @@ from src.motion_model import MotionModel
 from src.utility import weighted_mean
 
 class SSM(tf.Module):
+    def __init__(self, seed=None):
+        super().__init__()
+        if seed is not None:
+            self.rng = tf.random.Generator.from_seed(seed)
+        else:
+            self.rng = tf.random.Generator.from_non_deterministic_state()
+            
+    def set_seed(self, seed):
+        self.rng = tf.random.Generator.from_seed(seed)
+        print(f"{self.__class__.__name__} set seed to {seed}.")    
     @property 
     def state_dim(self):
         raise NotImplementedError
@@ -13,10 +23,10 @@ class SSM(tf.Module):
         raise NotImplementedError
 
     @staticmethod
-    def _weighted_mean(X, W=None, axis=1):
-        return weighted_mean(X, W, axis=axis)
+    def _weighted_mean(X, W=None, axis=1, normalize=True):
+        return weighted_mean(X, W, axis=axis, normalize=normalize)
     
-    def initialize(self, batch_size = 1, seed = None):
+    def initialize(self, batch_size = 1):
         raise NotImplementedError
     
     def step(self, x_prev):
@@ -26,10 +36,7 @@ class SSM(tf.Module):
         y_next = self.h(x_next) + r
         return x_next, y_next
     
-    def simulate(self, T, batch_size=1, x0=None, seed=None):
-        if seed is not None:
-            tf.random.set_seed(seed)
-
+    def simulate(self, T, batch_size=1, x0=None):
         if x0 is None:
             x = self.initialize(batch_size=batch_size)
         else:
@@ -49,10 +56,10 @@ class SSM(tf.Module):
         y_traj = tf.stack(y_traj, axis=1)  # [batch, T, dy]
         return x_traj, y_traj
 
-    def sample_transition_noise(self, batch_size = 1, seed = None):
+    def sample_transition_noise(self, batch_size = 1):
         raise NotImplementedError
     
-    def sample_observation_noise(self, batch_size = 1, seed = None):
+    def sample_observation_noise(self, batch_size = 1):
         raise NotImplementedError
     
     def f(self, x):
@@ -80,8 +87,8 @@ class SSM(tf.Module):
         return x - x_mean[:, tf.newaxis, :]
 
 class LinearGaussianSSM(SSM):
-    def __init__(self, A, B, C, D, m0, P0):
-        super().__init__()
+    def __init__(self, A, B, C, D, m0, P0, seed=42):
+        super().__init__(seed)
 
         self.A = tf.convert_to_tensor(A, dtype=tf.float32)
         self.B = tf.convert_to_tensor(B, dtype=tf.float32)
@@ -102,28 +109,21 @@ class LinearGaussianSSM(SSM):
     def obs_dim(self):
         return int(self.C.shape[0])
 
-    def initialize(self, batch_size = 1, seed = None):
-        if seed is not None:
-            tf.random.set_seed(seed)
-
+    def initialize(self, batch_size = 1):
         dx = self.state_dim
         L0 = tf.linalg.cholesky(self.P0)
-        z0 = tf.random.normal(shape=(batch_size, dx), mean=0.0, stddev=1.0)
+        z0 = self.rng.normal(shape=(batch_size, dx), mean=0.0, stddev=1.0)
         x0 = tf.einsum('ij,bj->bi', L0, z0) + self.m0[tf.newaxis, :]
 
         return x0
-    def sample_transition_noise(self, batch_size = 1, seed = None):
-        if seed is not None:
-            tf.random.set_seed(seed)
+    def sample_transition_noise(self, batch_size = 1):
         q_dim = int(self.B.shape[1])
-        q = tf.random.normal(shape=(batch_size, q_dim), mean=0.0, stddev=1.0)
+        q = self.rng.normal(shape=(batch_size, q_dim), mean=0.0, stddev=1.0)
         return tf.einsum('ij,bj->bi', self.B, q)
 
-    def sample_observation_noise(self, batch_size = 1, seed = None):
-        if seed is not None:
-            tf.random.set_seed(seed)
+    def sample_observation_noise(self, batch_size = 1):
         r_dim = int(self.D.shape[1])
-        r = tf.random.normal(shape=(batch_size, r_dim), mean=0.0, stddev=1.0)
+        r = self.rng.normal(shape=(batch_size, r_dim), mean=0.0, stddev=1.0)
         return tf.einsum('ij,bj->bi', self.D, r)
 
     def f(self, x):
@@ -134,7 +134,8 @@ class LinearGaussianSSM(SSM):
 
 class StochasticVolatilitySSM(SSM):
 
-    def __init__(self, alpha, sigma, beta):
+    def __init__(self, alpha, sigma, beta, seed=42):
+        super().__init__(seed)
         self.alpha = tf.convert_to_tensor(alpha, dtype=tf.float32)
         self.sigma = tf.convert_to_tensor(sigma, dtype=tf.float32)
         self.beta = tf.convert_to_tensor(beta, dtype=tf.float32)
@@ -152,24 +153,18 @@ class StochasticVolatilitySSM(SSM):
     def obs_dim(self):
         return 1
 
-    def initialize(self, batch_size = 1, seed = None):
-        if seed is not None:
-            tf.random.set_seed(seed)
+    def initialize(self, batch_size = 1):
         L0 = tf.linalg.cholesky(self.P0)
-        z0 = tf.random.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
+        z0 = self.rng.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
         x0 = self.m0 + tf.einsum('ij,bj->bi', L0, z0)
         return x0
     
-    def sample_transition_noise(self, batch_size = 1, seed = None):
-        if seed is not None:
-            tf.random.set_seed(seed)
-        q = tf.random.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
+    def sample_transition_noise(self, batch_size = 1):
+        q = self.rng.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
         scale = tf.stack([self.sigma, 1.0], axis=0)
         return q * scale
 
-    def sample_observation_noise(self, batch_size = 1, seed = None):
-        if seed is not None:
-            tf.random.set_seed(seed)
+    def sample_observation_noise(self, batch_size = 1):
         return tf.zeros((batch_size, self.obs_dim), dtype=tf.float32)
     
     def f(self, x):
@@ -187,12 +182,8 @@ class StochasticVolatilitySSM(SSM):
 
 class RangeBearingSSM(SSM):
     
-    @staticmethod
-    def _wrap_angle(bearing):
-        return tf.math.atan2(tf.sin(bearing), tf.cos(bearing))
-    
-    def __init__(self, motion_model, cov_eps_y):
-        super().__init__()
+    def __init__(self, motion_model, cov_eps_y, seed=42):
+        super().__init__(seed)
         assert isinstance(motion_model, MotionModel)
         self.motion_model = motion_model
 
@@ -204,6 +195,10 @@ class RangeBearingSSM(SSM):
         self.L0 = tf.linalg.cholesky(self.P0)
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 
+    @staticmethod
+    def _wrap_angle(bearing):
+        return tf.math.atan2(tf.sin(bearing), tf.cos(bearing))
+
     @property
     def state_dim(self):
         return self.motion_model.state_dim
@@ -212,24 +207,17 @@ class RangeBearingSSM(SSM):
     def obs_dim(self):
         return int(self.cov_eps_y.shape[0])
     
-    def initialize(self, batch_size = 1, seed = None):
-        if seed is not None:
-            tf.random.set_seed(seed)
-        z0 = tf.random.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
+    def initialize(self, batch_size = 1):
+        z0 = self.rng.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
         x0 = self.m0 + tf.einsum('ij,bj->bi', self.L0, z0)
         return x0
 
-    def sample_transition_noise(self, batch_size=1, seed=None):
-        if seed is not None:
-            tf.random.set_seed(seed)
+    def sample_transition_noise(self, batch_size=1):
 
-        return self.motion_model.sample_transition_noise(batch_size, seed)
+        return self.motion_model.sample_transition_noise(batch_size)
 
-    def sample_observation_noise(self, batch_size=1, seed=None):
-        if seed is not None:
-            tf.random.set_seed(seed)
-        r = tf.random.normal(shape=(batch_size, self.obs_dim), mean=0.0, stddev=1.0)
-        return tf.einsum('ij,bj->bi', self.Lr, r)
+    def sample_observation_noise(self, batch_size=1):
+        return tf.einsum('ij,bj->bi', self.Lr, self.rng.normal(shape=(batch_size, self.obs_dim), mean=0.0, stddev=1.0))
 
     def f(self, x):
         return self.motion_model.f(x)  

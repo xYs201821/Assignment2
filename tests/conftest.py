@@ -25,7 +25,7 @@ def lgssm_3d():
     m0 = np.zeros(dx, dtype=np.float32)
     P0 = np.eye(dx, dtype=np.float32)
 
-    model = LinearGaussianSSM(A, B, C, D, m0, P0)
+    model = LinearGaussianSSM(A, B, C, D, m0, P0, seed=42)
     return model
 
 @pytest.fixture
@@ -39,7 +39,7 @@ def lgssm_2d():
 
     m0 = np.zeros(dx, dtype=np.float32)
     P0 = np.eye(dx, dtype=np.float32)
-    model = LinearGaussianSSM(A, B, C, D, m0, P0)
+    model = LinearGaussianSSM(A, B, C, D, m0, P0, seed=42)
     return model
 
 @pytest.fixture
@@ -48,7 +48,7 @@ def sim_data_3d(lgssm_3d):
     batch_size = 1
     seed = 7
 
-    x_traj, y_traj = lgssm_3d.simulate(T=T, batch_size=batch_size, seed=seed)
+    x_traj, y_traj = lgssm_3d.simulate(T=T, batch_size=batch_size)
     return {
         "T": T,
         "batch_size": batch_size,
@@ -68,7 +68,7 @@ def sv_model():
     alpha = 0.91
     sigma = 1.0
     beta  = 0.5
-    return StochasticVolatilitySSM(alpha=alpha, sigma=sigma, beta=beta)
+    return StochasticVolatilitySSM(alpha=alpha, sigma=sigma, beta=beta, seed=42)
 
 @pytest.fixture
 def constant_velocity_motion_model():
@@ -76,10 +76,10 @@ def constant_velocity_motion_model():
     v = tf.constant([1.0, 0.7], dtype=tf.float32)
     dt = 0.1
     cov_eps = 0.0001*np.eye(2, dtype=np.float32)  # small perturabtion of velocity
-    return ConstantVelocityMotionModel(v=v, dt=dt, cov_eps=cov_eps)
+    return ConstantVelocityMotionModel(v=v, dt=dt, cov_eps=cov_eps, seed=42)
 
 @pytest.fixture
 def range_bearing_ssm(constant_velocity_motion_model):
     """Range Bearing SSM"""
     cov_eps_y = 0.09*np.eye(2, dtype=np.float32)
-    return RangeBearingSSM(motion_model=constant_velocity_motion_model, cov_eps_y=cov_eps_y)
+    return RangeBearingSSM(motion_model=constant_velocity_motion_model, cov_eps_y=cov_eps_y, seed=42)
