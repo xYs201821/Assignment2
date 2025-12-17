@@ -1,7 +1,7 @@
 # tests/test_rangebear.py
 import numpy as np
 import tensorflow as tf
-
+from tests.testhelper import assert_all_finite
 
 def test_range_bearing_ssm(range_bearing_ssm):
     T = 80
@@ -16,8 +16,7 @@ def test_range_bearing_ssm(range_bearing_ssm):
     assert y_traj.shape == (batch_size, T, dy)
 
     # NaN / Inf checks
-    assert not tf.reduce_any(tf.math.is_nan(x_traj))
-    assert not tf.reduce_any(tf.math.is_nan(y_traj))
+    assert_all_finite(x_traj, y_traj)
 
     # Geometric checks
     rng = y_traj[..., 0]      # [batch, T]

@@ -1,6 +1,7 @@
 import tensorflow as tf
 import numpy as np
 from src.motion_model import MotionModel
+from src.utility import weighted_mean
 
 class SSM(tf.Module):
     @property 
@@ -11,6 +12,10 @@ class SSM(tf.Module):
     def obs_dim(self):
         raise NotImplementedError
 
+    @staticmethod
+    def _weighted_mean(X, W=None, axis=1):
+        return weighted_mean(X, W, axis=axis)
+    
     def initialize(self, batch_size = 1, seed = None):
         raise NotImplementedError
     
@@ -58,6 +63,22 @@ class SSM(tf.Module):
         """Observation function"""
         raise NotImplementedError
     
+    def innovation(self, y, y_pred):
+        return y - y_pred
+
+    def measurement_mean(self, y, W=None, axis=1): # [batch, n, dy], [n] -> [batch, dy]
+        """ compute weighted mean of observations """
+        return self._weighted_mean(y, W, axis=axis)
+
+    def measurement_residual(self, y, y_mean): # [batch, n, dy], [batch, dy] -> [batch, n, dy]
+        return y - y_mean[:, tf.newaxis, :]
+
+    def state_mean(self, x, W=None, axis=1): # [batch, n, dx], [n] -> [batch, dx]
+        return self._weighted_mean(x, W, axis=axis)
+
+    def state_residual(self, x, x_mean): # [batch, n, dx], [batch, dx] -> [batch, n, dx]
+        return x - x_mean[:, tf.newaxis, :]
+
 class LinearGaussianSSM(SSM):
     def __init__(self, A, B, C, D, m0, P0):
         super().__init__()
@@ -118,7 +139,7 @@ class StochasticVolatilitySSM(SSM):
         self.sigma = tf.convert_to_tensor(sigma, dtype=tf.float32)
         self.beta = tf.convert_to_tensor(beta, dtype=tf.float32)
 
-        self.m0 = tf.constant([0.0], dtype=tf.float32)
+        self.m0 = tf.constant([0.0, 0.0], dtype=tf.float32)
         self.P0 = tf.linalg.diag([self.sigma**2 / (1.0 - self.alpha**2), 1.0])
         self.cov_eps_x = tf.linalg.diag([self.sigma**2, 1.0])
         self.cov_eps_y = tf.zeros([1, 1], dtype=tf.float32)
@@ -153,7 +174,7 @@ class StochasticVolatilitySSM(SSM):
     
     def f(self, x):
         x_t = x[:, 0]
-        w_t = x[:, 1]  # unused here
+        w_t = x[:, 1]  
 
         return tf.stack([self.alpha * x_t, tf.zeros_like(w_t)], axis=1)
     
@@ -166,6 +187,10 @@ class StochasticVolatilitySSM(SSM):
 
 class RangeBearingSSM(SSM):
     
+    @staticmethod
+    def _wrap_angle(bearing):
+        return tf.math.atan2(tf.sin(bearing), tf.cos(bearing))
+    
     def __init__(self, motion_model, cov_eps_y):
         super().__init__()
         assert isinstance(motion_model, MotionModel)
@@ -173,8 +198,9 @@ class RangeBearingSSM(SSM):
 
         self.m0 = tf.zeros([self.motion_model.state_dim], dtype=tf.float32)
         self.P0 = tf.eye(self.motion_model.state_dim, dtype=tf.float32)
+        self.cov_eps_x = self.motion_model.cov_eps
         self.cov_eps_y = tf.convert_to_tensor(cov_eps_y, dtype=tf.float32)
-
+        self.angle_indices = (1, )
         self.L0 = tf.linalg.cholesky(self.P0)
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 
@@ -213,7 +239,26 @@ class RangeBearingSSM(SSM):
         py = x[:, 1]
 
         rng = tf.sqrt(px**2 + py**2 + 1e-20)
-        bearing = tf.atan2(py, px)
+        bearing = self._wrap_angle(tf.atan2(py, px))
         y = tf.stack([rng, bearing], axis=1)
 
         return y
+
+    def innovation(self, y, y_pred):
+        v = y - y_pred
+        v_bearing = self._wrap_angle(v[:, 1])
+        return tf.stack([v[:, 0], v_bearing], axis=1)
+
+    def measurement_mean(self, x, W=None): # [batch, n, 2], [n] -> [batch, 2]
+        if W is None:
+            W = tf.ones([tf.shape(x)[1]], dtype=tf.float32)
+        mean_range = self._weighted_mean(x[:, :, 0], W, axis=1)
+        mean_sin_bearing = self._weighted_mean(tf.sin(x[:, :, 1]), W, axis=1)
+        mean_cos_bearing = self._weighted_mean(tf.cos(x[:, :, 1]), W, axis=1)
+        mean_bearing = tf.math.atan2(mean_sin_bearing, mean_cos_bearing) # [batch]
+        return tf.stack([mean_range, mean_bearing], axis=1) # [batch, 2]
+
+    def measurement_residual(self, y, y_mean): # [batch, n, 2], [batch, 2] -> [batch, n, 2]
+        dr  = y[:, :, 0] - y_mean[:, 0][:, None]
+        dth = self._wrap_angle(y[:, :, 1] - y_mean[:, 1][:, None])
+        return tf.stack([dr, dth], axis=2)  

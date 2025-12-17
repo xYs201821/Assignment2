@@ -102,3 +102,32 @@ def tfp_lgssm(observations, ssm, mode="filter"):
 
     else:
         raise ValueError(f"Unknown mode '{mode}'. Use 'smooth' or 'filter'.")
+
+
+def weighted_mean(X, W=None, axis=1, normalize=True):
+    X = tf.convert_to_tensor(X)
+    if W is None:
+        return tf.reduce_mean(X, axis=axis)
+
+    W = tf.convert_to_tensor(W, dtype=X.dtype)
+
+    x_rank = tf.rank(X)
+    axis_ = axis if axis >= 0 else axis + x_rank
+
+    if W.shape.rank == 1:
+        pre = tf.ones([axis_], dtype=tf.int32)
+        post = tf.ones([x_rank - axis_ - 1], dtype=tf.int32)
+        Wb = tf.reshape(W, tf.concat([pre, tf.shape(W), post], axis=0))
+    elif W.shape.rank == 2 and (axis_ == 1):
+        # W [B,n] with X [B,n,...]
+        post = tf.ones([x_rank - 2], dtype=tf.int32)
+        Wb = tf.reshape(W, tf.concat([tf.shape(W), post], axis=0))
+    else:
+        Wb = W
+
+    num = tf.reduce_sum(X * Wb, axis=axis_)
+    if not normalize:
+        return num
+
+    den = tf.reduce_sum(Wb, axis=axis_)
+    return tf.math.divide_no_nan(num, den)

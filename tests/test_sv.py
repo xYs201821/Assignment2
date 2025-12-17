@@ -1,6 +1,7 @@
 import numpy as np
 import tensorflow as tf
 
+from tests.testhelper import assert_all_finite
 
 def test_sv_simulate_shapes_and_nan(sv_model):
     T = 50
@@ -14,14 +15,7 @@ def test_sv_simulate_shapes_and_nan(sv_model):
     assert x_traj.shape == (batch_size, T, dx)
     assert y_traj.shape == (batch_size, T, dy)
 
-    assert not tf.reduce_any(tf.math.is_nan(x_traj))
-    assert not tf.reduce_any(tf.math.is_nan(y_traj))
-    assert not tf.reduce_any(tf.math.is_inf(x_traj))
-    assert not tf.reduce_any(tf.math.is_inf(y_traj))
-
-
-import numpy as np
-import tensorflow as tf
+    assert_all_finite(x_traj, y_traj)
 
 
 def test_sv_stationary_distribution_timewise(sv_model):
