@@ -10,7 +10,7 @@ class SSM(tf.Module):
             self.rng = tf.random.Generator.from_seed(seed)
         else:
             self.rng = tf.random.Generator.from_non_deterministic_state()
-            
+
     def set_seed(self, seed):
         self.rng = tf.random.Generator.from_seed(seed)
         print(f"{self.__class__.__name__} set seed to {seed}.")    
@@ -29,11 +29,11 @@ class SSM(tf.Module):
     def initialize(self, batch_size = 1):
         raise NotImplementedError
     
-    def step(self, x_prev):
+    def step(self, x_prev): # by default, additive noise model
         q = self.sample_transition_noise(tf.shape(x_prev)[0])
-        x_next = self.f(x_prev) + q
+        x_next = self.f_with_noise(x_prev, q) 
         r = self.sample_observation_noise(tf.shape(x_next)[0])
-        y_next = self.h(x_next) + r
+        y_next = self.h_with_noise(x_next, r)
         return x_next, y_next
     
     def simulate(self, T, batch_size=1, x0=None):
@@ -85,6 +85,12 @@ class SSM(tf.Module):
 
     def state_residual(self, x, x_mean): # [batch, n, dx], [batch, dx] -> [batch, n, dx]
         return x - x_mean[:, tf.newaxis, :]
+
+    def f_with_noise(self, x, q): # additive noise model
+        return self.f(x) + q
+
+    def h_with_noise(self, x, r): # additive noise model
+        return self.h(x) + r
 
 class LinearGaussianSSM(SSM):
     def __init__(self, A, B, C, D, m0, P0, seed=42):
@@ -140,14 +146,14 @@ class StochasticVolatilitySSM(SSM):
         self.sigma = tf.convert_to_tensor(sigma, dtype=tf.float32)
         self.beta = tf.convert_to_tensor(beta, dtype=tf.float32)
 
-        self.m0 = tf.constant([0.0, 0.0], dtype=tf.float32)
-        self.P0 = tf.linalg.diag([self.sigma**2 / (1.0 - self.alpha**2), 1.0])
-        self.cov_eps_x = tf.linalg.diag([self.sigma**2, 1.0])
-        self.cov_eps_y = tf.zeros([1, 1], dtype=tf.float32)
+        self.m0 = tf.constant([0.0], dtype=tf.float32)
+        self.P0 = tf.reshape(self.sigma**2 / (1.0 - self.alpha**2), [1, 1])
+        self.cov_eps_x = self.sigma**2 * tf.eye(1, dtype=tf.float32)
+        self.cov_eps_y = tf.eye(1, dtype=tf.float32)
 
     @property
-    def state_dim(self): # [x_t, w_t]
-        return 2
+    def state_dim(self): # [x_t]
+        return 1
         
     @property
     def obs_dim(self):
@@ -161,24 +167,24 @@ class StochasticVolatilitySSM(SSM):
     
     def sample_transition_noise(self, batch_size = 1):
         q = self.rng.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
-        scale = tf.stack([self.sigma, 1.0], axis=0)
-        return q * scale
+        return self.sigma * q
+
 
     def sample_observation_noise(self, batch_size = 1):
-        return tf.zeros((batch_size, self.obs_dim), dtype=tf.float32)
+        return self.rng.normal(shape=(batch_size, self.obs_dim), mean=0.0, stddev=1.0)
     
     def f(self, x):
-        x_t = x[:, 0]
-        w_t = x[:, 1]  
-
-        return tf.stack([self.alpha * x_t, tf.zeros_like(w_t)], axis=1)
+        return self.alpha * x
     
     def h(self, x):
-        x_t = x[:, 0]
-        w_t = x[:, 1]  
-        y = self.beta * tf.exp(0.5 * x_t) * w_t
-        return y[:, tf.newaxis] # [batch, 1]
+        return tf.zeros((tf.shape(x)[0], self.obs_dim), dtype=tf.float32)
 
+    def f_with_noise(self, x, q):
+        x_det = self.alpha * x
+        return x_det + q
+    
+    def h_with_noise(self, x, r):
+        return self.beta * tf.exp(0.5 * x) * r
 
 class RangeBearingSSM(SSM):
     

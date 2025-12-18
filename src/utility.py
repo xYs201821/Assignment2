@@ -10,11 +10,48 @@ def tf_cond(M): # find condition number of M in tensorflow, [batch, n, n] -> [ba
     eps = 1e-20
     return s_max / (s_min + eps)
 
-def cholesky_solve(A, B): # solve AX = B, [batch, n, m] x [batch, m, k] -> [batch, n, k]
-    L = tf.linalg.cholesky(A)
-    U = tf.linalg.triangular_solve(L, B, lower=True)
-    X = tf.linalg.triangular_solve(tf.transpose(L, perm=[0, 2, 1]), U, lower=False)
+def cholesky_solve(A, B, eps=0):
+    """
+    Solves AX = B using Cholesky decomposition.
+    """
+    A_sym = (A + tf.transpose(A, perm=[0, 2, 1])) / 2.0
+    eye = tf.eye(tf.shape(A_sym)[-1], batch_shape=tf.shape(A_sym)[:-2], dtype=A_sym.dtype)
+    A_robust = A_sym + eye * eps
+    try:
+        L = tf.linalg.cholesky(A_robust)
+    except:
+        L = tf.linalg.cholesky(A_robust + eye * 1e-8)
+    Y = tf.linalg.triangular_solve(L, B, lower=True)
+    X = tf.linalg.triangular_solve(tf.transpose(L, perm=[0, 2, 1]), Y, lower=False)
+    
     return X
+
+def block_diag(A, B):
+    """
+    Create a block diagonal matrix from two matrices.
+    A: [batch, n, n] or [n, n]
+    B: [batch, m, m] or [m, m]
+
+    returns: [batch, n+m, n+m]
+    """
+
+    A = tf.convert_to_tensor(A, dtype=tf.float32)
+    B = tf.convert_to_tensor(B, dtype=tf.float32)
+    if A.shape.rank == 2:
+        A = A[tf.newaxis, :, :]
+    if B.shape.rank == 2:
+        B = B[tf.newaxis, :, :]
+    batch = tf.shape(A)[0]
+    if tf.shape(B)[0] != batch:
+        B = tf.broadcast_to(B, [batch, tf.shape(B)[1], tf.shape(B)[2]])
+
+    a = tf.shape(A)[1]
+    b = tf.shape(B)[1]
+    Z_ab = tf.zeros([batch, a, b], dtype=tf.float32)
+    Z_ba = tf.zeros([batch, b, a], dtype=tf.float32)
+    top = tf.concat([A, Z_ab], axis=2)
+    bot = tf.concat([Z_ba, B], axis=2)
+    return tf.concat([top, bot], axis=1)
 
 def plot_ssm_trajectory(ssm, T=200, seed=None, title=None):
     # ---- simulate ----

@@ -55,11 +55,11 @@ def test_sigma_points_moment_matching(lgssm_2d):
     m = tf.random.normal([batch, n], dtype=tf.float32)
     P = make_spd(batch, n, eps=1e-3)
 
-    X = ukf.generate_sigma_points(m, P)  # [batch, 2n+1, n]
+    X, Wm, Wc = ukf.generate_sigma_points(m, P)  # [batch, 2n+1, n]
 
-    m_rec = tf.einsum("i,bin->bn", ukf.Wm, X)
+    m_rec = tf.einsum("i,bin->bn", Wm, X)
     Xc = X - m_rec[:, tf.newaxis, :]
-    P_rec = tf.einsum("i,bin,bim->bnm", ukf.Wc, Xc, Xc)
+    P_rec = tf.einsum("i,bin,bim->bnm", Wc, Xc, Xc)
 
     tf.debugging.assert_near(m_rec, m, atol=1e-4, rtol=1e-4)
     tf.debugging.assert_near(P_rec, P, atol=1e-3, rtol=1e-3)

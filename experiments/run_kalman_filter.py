@@ -1,11 +1,15 @@
 # experiments/analyze_kalman_stability.py
 import numpy as np
 import tensorflow as tf
-from src.ssm import LinearGaussianSSM
-from src.filter import Filter
-from src.utility import max_asym, cond_matrix
+import os
+import sys
 
-def run():
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+from src.ssm import LinearGaussianSSM
+from src.filter import KalmanFilter
+from src.utility import max_asym
+def run_lgssm_experiment():
     dx, dy = 3, 2
     dtype = tf.float32
 
@@ -20,41 +24,35 @@ def run():
     m0 = np.zeros(dx, dtype=np.float32)
     P0 = np.eye(dx, dtype=np.float32)
 
-    ssm = LinearGaussianSSM(A=A, B=B, C=C, D=D, m0=m0, P0=P0)
+    ssm = LinearGaussianSSM(A=A, B=B, C=C, D=D, m0=m0, P0=P0, seed=42)
 
     T = 100
-    x_traj, y_traj = ssm.simulate(T=T, batch_size=1, seed=0)
+    x_traj, y_traj = ssm.simulate(T=T, batch_size=1)
     y = y_traj
 
-    kalman = Filter(ssm)
-    res_j = kalman.filter(y, joseph=True)
-    res_s = kalman.filter(y, joseph=False)
+    kalman = KalmanFilter(ssm)
+    res = kalman.filter(y, joseph=True)
 
-    P_j = res_j["P_filt"][0]    # [T, dx, dx]
-    P_s = res_s["P_filt"][0]
-    S_j = res_j["S"][0]         # innovation covariances if you store them
-    S_s = res_s["S"][0]
-
+    P_filt = res["P_filt"][0]    # [T, dx, dx]
+    P_pred = res["P_pred"][0]
+    m_filt = res["m_filt"][0]
+    m_pred = res["m_pred"][0]
+    cond_P = res["cond_P"][0]
+    cond_S = res["cond_S"][0]
+    # mse error
+    mse_filt = tf.reduce_mean((m_filt - x_traj) ** 2)
+    mse_pred = tf.reduce_mean((m_pred - x_traj) ** 2)
+    print("mse_filt:", mse_filt)
+    print("mse_pred:", mse_pred)
     # condition numbers per time step
-    cond_P_j = cond_matrix(P_j)  # [T]
-    cond_P_s = cond_matrix(P_s)
-    cond_S_j = cond_matrix(S_j)
-    cond_S_s = cond_matrix(S_s)
-
-    print("=== Joseph vs Std: covariance conditioning ===")
-    print("P (Joseph): min / max cond =", float(tf.reduce_min(cond_P_j)),
-                                       "/", float(tf.reduce_max(cond_P_j)))
-    print("P (Std)   : min / max cond =", float(tf.reduce_min(cond_P_s)),
-                                       "/", float(tf.reduce_max(cond_P_s)))
-
-    print("S (Joseph): min / max cond =", float(tf.reduce_min(cond_S_j)),
-                                       "/", float(tf.reduce_max(cond_S_j)))
-    print("S (Std)   : min / max cond =", float(tf.reduce_min(cond_S_s)),
-                                       "/", float(tf.reduce_max(cond_S_s)))
+    print("P (Joseph): min / max cond =", float(tf.reduce_min(cond_P)),
+                                       "/", float(tf.reduce_max(cond_P)))
+    print("S (Joseph): min / max cond =", float(tf.reduce_min(cond_S)),
+                                       "/", float(tf.reduce_max(cond_S)))
 
     print("\nMax asymmetry ||P - P^T||:")
-    print("Joseph:", float(max_asym(P_j)))
-    print("Std   :", float(max_asym(P_s)))
+    print("Joseph:", float(max_asym(P_filt)))
+    print("Std   :", float(max_asym(P_pred)))
 
 if __name__ == "__main__":
-    run()
+    run_lgssm_experiment()

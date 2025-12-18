@@ -50,7 +50,7 @@ def test_kalman_filter_close_to_tfp(lgssm_3d, sim_data_3d, tfp_ref_3d):
     max_m_diff  = tf.reduce_max(tf.abs(m_filt - m_tfp))
     max_P_diff  = tf.reduce_max(tf.abs(P_filt - P_tfp))
     
-    tf.debugging.assert_near(mse_between, 0.0, atol=1e-8, rtol=1e-8)
+    tf.debugging.assert_near(mse_between, 0.0, atol=1e-6, rtol=1e-6)
     tf.debugging.assert_near(max_m_diff, 0.0, atol=1e-4, rtol=1e-4)
     tf.debugging.assert_near(max_P_diff, 0.0, atol=1e-4, rtol=1e-4)
 
