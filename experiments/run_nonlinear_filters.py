@@ -94,7 +94,7 @@ def run_sv_once(common: CommonConfig, cfg: SVConfig, seed: int) -> Dict[str, Any
     ssm.set_seed(seed)
 
     x0_true = tf.constant([cfg.x0_true], dtype=tf.float32)
-    x_true, y_obs = ssm.simulate(common.T, batch_size=common.batch_size, x0=x0_true)
+    x_true, y_obs = ssm.simulate(common.T, shape=(common.batch_size, ), x0=x0_true)
 
     m0 = tf.constant([cfg.m0_est], dtype=tf.float32)
     P0 = tf.eye(ssm.state_dim, dtype=tf.float32) * cfg.P0_scale
@@ -168,7 +168,7 @@ def run_rb_once(common: CommonConfig, cfg: RBConfig, seed: int) -> Dict[str, Any
     ssm.set_seed(seed)
 
     x0_true = tf.constant(cfg.x0_true, dtype=tf.float32)
-    x_true, y_obs = ssm.simulate(common.T, batch_size=common.batch_size, x0=x0_true)
+    x_true, y_obs = ssm.simulate(common.T, shape=(common.batch_size, ), x0=x0_true)
 
     m0 = tf.constant(cfg.m0_est, dtype=tf.float32)
     P0 = tf.eye(ssm.state_dim, dtype=tf.float32) * cfg.P0_scale

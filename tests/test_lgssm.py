@@ -8,7 +8,7 @@ def test_lgssm_simulate_shapes_and_nan(lgssm_2d):
     T = 50
     batch_size = 4
 
-    x_traj, y_traj = lgssm_2d.simulate(T=T, batch_size=batch_size)
+    x_traj, y_traj = lgssm_2d.simulate(T=T, shape=(batch_size, ))
 
     dx = lgssm_2d.state_dim
     dy = lgssm_2d.obs_dim

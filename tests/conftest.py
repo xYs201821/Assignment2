@@ -31,7 +31,6 @@ def lgssm_3d():
 @pytest.fixture
 def lgssm_2d():
     dx, dy = 2, 1
-    dtype = tf.float32
     A = np.eye(dx, dtype=np.float32)
     B = 0.49 * np.eye(dx, dtype=np.float32)
     C = np.ones((dy, dx), dtype=np.float32)
@@ -46,9 +45,8 @@ def lgssm_2d():
 def sim_data_3d(lgssm_3d):
     T = 80
     batch_size = 1
-    seed = 7
 
-    x_traj, y_traj = lgssm_3d.simulate(T=T, batch_size=batch_size)
+    x_traj, y_traj = lgssm_3d.simulate(T=T, shape=(batch_size, ))
     return {
         "T": T,
         "batch_size": batch_size,

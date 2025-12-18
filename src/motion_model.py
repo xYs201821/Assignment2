@@ -22,7 +22,7 @@ class MotionModel(tf.Module):
         """Transition function"""
         raise NotImplementedError
     
-    def sample_transition_noise(self, batch_size = 1):
+    def sample_transition_noise(self, shape):
         raise NotImplementedError
 
 class ConstantVelocityMotionModel(MotionModel):
@@ -48,9 +48,9 @@ class ConstantVelocityMotionModel(MotionModel):
         return int(self.cov_eps.shape[0])
 
     def f(self, x):
-        px, py, vx, vy = tf.unstack(x, axis=1)
-        return tf.stack([px + vx * self.dt, py + vy * self.dt, vx, vy], axis=1)
+        px, py, vx, vy = tf.unstack(x, axis=-1)
+        return tf.stack([px + vx * self.dt, py + vy * self.dt, vx, vy], axis=-1)
     
-    def sample_transition_noise(self, batch_size=1):
-        q = self.rng.normal(shape=(batch_size, self.state_dim), mean=0.0, stddev=1.0)
-        return tf.einsum('ij,bj->bi', self.Lq, q)
+    def sample_transition_noise(self, shape):
+        q = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
+        return tf.einsum('ij,...j->...i', self.Lq, q)

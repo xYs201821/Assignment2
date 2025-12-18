@@ -68,7 +68,7 @@ def test_sv_ekf_ukf_runs(sv_model):
     sv = sv_model
     sv.cov_eps_y = tf.eye(sv.obs_dim, dtype=tf.float32) * 1e-4
 
-    _, y = sv.simulate(T=30, batch_size=2)
+    _, y = sv.simulate(T=30, shape=(2, ))
 
     ekf = ExtendedKalmanFilter(sv)
     ukf = UnscentedKalmanFilter(sv)
@@ -93,7 +93,7 @@ def test_range_bearing_ekf_ukf_runs(range_bearing_ssm):
     rb.m0 = tf.constant([1.0, 1.0, 1.0, 0.7], dtype=tf.float32)
     rb.P0 = tf.eye(rb.state_dim, dtype=tf.float32) * 0.1
 
-    _, y = rb.simulate(T=30, batch_size=2)
+    _, y = rb.simulate(T=30, shape=(2, ))
 
     ekf = ExtendedKalmanFilter(rb)
     ukf = UnscentedKalmanFilter(rb)

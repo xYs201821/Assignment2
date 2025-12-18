@@ -27,7 +27,7 @@ def run_lgssm_experiment():
     ssm = LinearGaussianSSM(A=A, B=B, C=C, D=D, m0=m0, P0=P0, seed=42)
 
     T = 100
-    x_traj, y_traj = ssm.simulate(T=T, batch_size=1)
+    x_traj, y_traj = ssm.simulate(T=T, shape=(1, ))
     y = y_traj
 
     kalman = KalmanFilter(ssm)

@@ -10,6 +10,13 @@ def tf_cond(M): # find condition number of M in tensorflow, [batch, n, n] -> [ba
     eps = 1e-20
     return s_max / (s_min + eps)
 
+def quadratic_matmul(A, B, C):
+    """
+    Computes ABC^T 
+    """
+    AB = tf.linalg.matmul(A, B)
+    return tf.linalg.matmul(AB, C, transpose_b=True)
+
 def cholesky_solve(A, B, eps=0):
     """
     Solves AX = B using Cholesky decomposition.
