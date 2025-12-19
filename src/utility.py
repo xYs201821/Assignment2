@@ -148,7 +148,7 @@ def tfp_lgssm(observations, ssm, mode="filter"):
         raise ValueError(f"Unknown mode '{mode}'. Use 'smooth' or 'filter'.")
 
 
-def weighted_mean(X, W=None, axis=1, normalize=True):
+def weighted_mean(X, W=None, axis=-2, normalize=True):
     X = tf.convert_to_tensor(X)
     if W is None:
         return tf.reduce_mean(X, axis=axis)

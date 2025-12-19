@@ -1,4 +1,6 @@
 import tensorflow as tf
+import tensorflow_probability as tfp
+tfd = tfp.distributions
 import numpy as np
 from src.motion_model import MotionModel
 from src.utility import weighted_mean
@@ -10,10 +12,29 @@ class SSM(tf.Module):
             self.rng = tf.random.Generator.from_seed(seed)
         else:
             self.rng = tf.random.Generator.from_non_deterministic_state()
-
+    
+    def _tfp_seed(self):
+        return tf.cast(self.rng.make_seeds(2)[0], dtype=tf.int32)
+    
+    def initial_state_dist(self, shape, **kwargs):
+        raise NotImplementedError
+    
+    def transition_noise_dist(self, shape, **kwargs):
+        raise NotImplementedError
+    
+    def observation_noise_dist(self, shape, **kwargs):
+        raise NotImplementedError
+    
+    def transition_dist(self, x_prev, **kwargs):
+        return None
+    
+    def observation_dist(self, x, **kwargs):
+        return None
+    
     def set_seed(self, seed):
         self.rng = tf.random.Generator.from_seed(seed)
         print(f"{self.__class__.__name__} set seed to {seed}.")    
+
     @property 
     def state_dim(self):
         raise NotImplementedError
@@ -26,34 +47,85 @@ class SSM(tf.Module):
     def _weighted_mean(X, W=None, axis=1, normalize=True):
         return weighted_mean(X, W, axis=axis, normalize=normalize)
     
-    def sample_initial_state(self, shape):
-        raise NotImplementedError
+    def sample_initial_state(self, shape, return_log_prob=False, **kwargs):
+        dist = self.initial_state_dist(shape, **kwargs)
+        if dist is None:
+            raise NotImplementedError("initial state distribution not implemented")
 
-    def sample_transition_noise(self, shape):
-        raise NotImplementedError
+        x0 = tf.cast(dist.sample(seed=self._tfp_seed), dtype=tf.float32)
+        if return_log_prob:
+            return x0, tf.cast(dist.log_prob(x0), dtype=tf.float32)
+        return x0
+
+    def sample_transition_noise(self, shape, return_log_prob=False, **kwargs):
+        dist = self.transition_noise_dist(shape, **kwargs)
+        if dist is None:
+            raise NotImplementedError("transition noise distribution not implemented")
+        q = tf.cast(dist.sample(seed=self._tfp_seed), dtype=tf.float32)
+        if return_log_prob:
+            return q, tf.cast(dist.log_prob(q), dtype=tf.float32)
+        return q
     
-    def sample_observation_noise(self, shape):
-        raise NotImplementedError
+    def sample_observation_noise(self, shape, return_log_prob=False, **kwargs):
+        dist = self.observation_noise_dist(shape, **kwargs)
+        if dist is None:
+            raise NotImplementedError("observation noise distribution not implemented")
+        r = tf.cast(dist.sample(seed=self._tfp_seed), dtype=tf.float32)
+        if return_log_prob:
+            return r, tf.cast(dist.log_prob(r), dtype=tf.float32)
+        return r
+
+    def sample_transition(self, x_prev, return_log_prob=False, **kwargs):
+        dist = self.transition_dist(x_prev, **kwargs)
+        if dist is not None:
+            x_next = tf.cast(dist.sample(seed=self._tfp_seed), dtype=tf.float32)
+            if return_log_prob:
+                return x_next, tf.cast(dist.log_prob(x_next), dtype=tf.float32)
+            return x_next
+
+        # fallback to using self.f_with_noise, require mannual log prob computation
+        q = self.sample_transition_noise(tf.shape(x_prev)[:-1], **kwargs)
+        x_next = self.f_with_noise(x_prev, q, **kwargs)
+        if return_log_prob:
+            # generally unavailable
+            raise NotImplementedError("manual log prob computation for transition not implemented")
+        return x_next
     
-    def f(self, x):
+    def sample_observation(self, x, return_log_prob=False, **kwargs):
+        dist = self.observation_dist(x, **kwargs)
+        if dist is not None:
+            y = tf.cast(dist.sample(seed=self._tfp_seed), dtype=tf.float32)
+            if return_log_prob:
+                return y, tf.cast(dist.log_prob(y), dtype=tf.float32)
+            return y
+
+        # fallback to using self.h_with_noise, require mannual log prob computation
+        r = self.sample_observation_noise(tf.shape(x)[:-1], **kwargs)
+        y = self.h_with_noise(x, r, **kwargs)
+        if return_log_prob:
+            # generally unavailable
+            raise NotImplementedError("manual log prob computation for observation not implemented")
+        return y
+
+    def f(self, x, **kwargs):
         """Transition function"""
         raise NotImplementedError
     
-    def h(self, x):
+    def h(self, x, **kwargs):
         """Observation function"""
         raise NotImplementedError
     
     def innovation(self, y, y_pred):
         return y - y_pred
 
-    def measurement_mean(self, y, W=None, axis=1): # [batch, n, dy], [n] -> [batch, dy]
+    def measurement_mean(self, y, W=None, axis=-2): # [batch, n, dy], [n] -> [batch, dy]
         """ compute weighted mean of observations """
         return self._weighted_mean(y, W, axis=axis)
 
     def measurement_residual(self, y, y_mean): # [batch, n, dy], [batch, dy] -> [batch, n, dy]
         return y - y_mean[:, tf.newaxis, :]
 
-    def state_mean(self, x, W=None, axis=1): # [batch, n, dx], [n] -> [batch, dx]
+    def state_mean(self, x, W=None, axis=-2): # [batch, n, dx], [n] -> [batch, dx]
         return self._weighted_mean(x, W, axis=axis)
 
     def state_residual(self, x, x_mean): # [batch, n, dx], [batch, dx] -> [batch, n, dx]
@@ -65,31 +137,12 @@ class SSM(tf.Module):
     def h_with_noise(self, x, r): # additive noise model
         return self.h(x) + r
 
-    def log_likelihood(self, y, x):
-        '''
-        Placeholder. Must return log p(y|x).
-        y: [B, dy] or [..., dy]
-        x: [B, N, dx] or [..., dx]
-            return: [..., N] or [...]
-        '''
-        raise NotImplementedError
-    
-    def sample_transition(self, x_prev, q=None):
-        if q is None:
-            q = self.sample_transition_noise(tf.shape(x_prev)[:-1])
-        return self.f_with_noise(x_prev, q) # [batch, dx]
-    
-    def sample_observation(self, x, r=None):
-        if r is None:
-            r = self.sample_observation_noise(tf.shape(x)[:-1])
-        return self.h_with_noise(x, r)
-
-    def step(self, x_prev): # by default, additive noise model
+    def step(self, x_prev, **kwargs): # by default, additive noise model
         x_next = self.sample_transition(x_prev)
         y_next = self.sample_observation(x_next)
         return x_next, y_next
     
-    def simulate(self, T, shape, x0=None):
+    def simulate(self, T, shape, x0=None, **kwargs):
         if x0 is None:
             x = self.sample_initial_state(shape)
         else:
@@ -125,8 +178,10 @@ class LinearGaussianSSM(SSM):
 
         self.cov_eps_x = tf.linalg.matmul(self.B, self.B, adjoint_b=True)
         self.cov_eps_y = tf.linalg.matmul(self.D, self.D, adjoint_b=True)
-
-    @property
+        self.L0 = tf.linalg.cholesky(self.P0)
+        self.Lq = tf.linalg.cholesky(self.cov_eps_x)
+        self.Lr = tf.linalg.cholesky(self.cov_eps_y)
+    @property   
     def state_dim(self):
         return int(self.P0.shape[0])
 
@@ -134,21 +189,33 @@ class LinearGaussianSSM(SSM):
     def obs_dim(self):
         return int(self.cov_eps_y.shape[0])
 
-    def sample_initial_state(self, shape):
-        L0 = tf.linalg.cholesky(self.P0)
-        z0 = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
-        x0 = tf.einsum('ij,...j->...i', L0, z0) + self.m0
-        return x0
+    def initial_state_dist(self, shape, **kwargs):
+        loc = tf.broadcast_to(self.m0, tf.concat([shape, [self.state_dim]], axis=0))
+        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.L0)
 
-    def sample_transition_noise(self, shape):
-        q_dim = int(self.B.shape[-1])
-        q = self.rng.normal(tf.concat([shape, [q_dim]], axis=0), mean=0.0, stddev=1.0)
-        return tf.einsum('ij,...j->...i', self.B, q) # [batch, q_dim] -> [batch, dx]
+    def transition_dist(self, x_prev, **kwargs):
+        loc = self.f(x_prev)  # [..., dx]
+        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.Lq)
 
-    def sample_observation_noise(self, shape):
-        r_dim = int(self.D.shape[-1])
-        r = self.rng.normal(tf.concat([shape, [r_dim]], axis=0), mean=0.0, stddev=1.0)
-        return tf.einsum('ij,...j->...i', self.D, r) # [batch, r_dim] -> [batch, dy]
+    def observation_dist(self, x, **kwargs):
+        loc = self.h(x)  # [..., dy]
+        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.Lr)
+
+    # def sample_initial_state(self, shape):
+    #     L0 = tf.linalg.cholesky(self.P0)
+    #     z0 = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
+    #     x0 = tf.einsum('ij,...j->...i', L0, z0) + self.m0
+    #     return x0
+
+    # def sample_transition_noise(self, shape):
+    #     q_dim = int(self.B.shape[-1])
+    #     q = self.rng.normal(tf.concat([shape, [q_dim]], axis=0), mean=0.0, stddev=1.0)
+    #     return tf.einsum('ij,...j->...i', self.B, q) # [batch, q_dim] -> [batch, dx]
+
+    # def sample_observation_noise(self, shape):
+    #     r_dim = int(self.D.shape[-1])
+    #     r = self.rng.normal(tf.concat([shape, [r_dim]], axis=0), mean=0.0, stddev=1.0)
+    #     return tf.einsum('ij,...j->...i', self.D, r) # [batch, r_dim] -> [batch, dy]
 
     def f(self, x):
         return tf.einsum('ij,...j->...i', self.A, x) 
@@ -177,19 +244,35 @@ class StochasticVolatilitySSM(SSM):
     def obs_dim(self):
         return 1
 
-    def sample_initial_state(self, shape):
+    def initial_state_dist(self, shape, **kwargs):
+        shape = tf.convert_to_tensor(shape, tf.int32)
         L0 = tf.linalg.cholesky(self.P0)
-        z0 = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
-        x0 = self.m0 + tf.einsum('ij,...j->...i', L0, z0)
-        return x0
+        loc = tf.broadcast_to(self.m0, tf.concat([shape, [1]], axis=0))
+        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=L0)
+
+    def transition_dist(self, x_prev, **kwargs):
+        loc = self.alpha * x_prev  
+        scale = tf.broadcast_to(self.sigma, tf.shape(loc))  
+        return tfd.MultivariateNormalDiag(loc=loc, scale_diag=scale)
+
+    def observation_dist(self, x, **kwargs):
+        loc = tf.zeros(tf.concat([tf.shape(x)[:-1], [1]], axis=0), tf.float32)  
+        scale = self.beta * tf.exp(0.5 * x) 
+        return tfd.MultivariateNormalDiag(loc=loc, scale_diag=scale)
+
+    # def sample_initial_state(self, shape):
+    #     L0 = tf.linalg.cholesky(self.P0)
+    #     z0 = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
+    #     x0 = self.m0 + tf.einsum('ij,...j->...i', L0, z0)
+    #     return x0
     
-    def sample_transition_noise(self, shape):
-        q = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
-        return self.sigma * q
+    # def sample_transition_noise(self, shape):
+    #     q = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
+    #     return self.sigma * q
 
 
-    def sample_observation_noise(self, shape):
-        return self.rng.normal(tf.concat([shape, [self.obs_dim]], axis=0), mean=0.0, stddev=1.0)
+    # def sample_observation_noise(self, shape):
+    #     return self.rng.normal(tf.concat([shape, [self.obs_dim]], axis=0), mean=0.0, stddev=1.0)
     
     def f(self, x):
         return self.alpha * x
@@ -217,6 +300,7 @@ class RangeBearingSSM(SSM):
         self.cov_eps_y = tf.convert_to_tensor(cov_eps_y, dtype=tf.float32)
         self.angle_indices = (1, )
         self.L0 = tf.linalg.cholesky(self.P0)
+        self.Lq = tf.linalg.cholesky(self.cov_eps_x)
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 
     @staticmethod
@@ -230,17 +314,30 @@ class RangeBearingSSM(SSM):
     @property
     def obs_dim(self):
         return int(self.cov_eps_y.shape[0])
-    
-    def sample_initial_state(self, shape):
-        z0 = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
-        x0 = self.m0 + tf.einsum('ij,...j->...i', self.L0, z0)
-        return x0
 
-    def sample_transition_noise(self, shape):
-        return self.motion_model.sample_transition_noise(shape)
+    def initial_state_dist(self, shape, **kwargs):
+        shape = tf.convert_to_tensor(shape, tf.int32)
+        loc = tf.broadcast_to(self.m0, tf.concat([shape, [self.state_dim]], axis=0))
+        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.L0)
 
-    def sample_observation_noise(self, shape):
-        return tf.einsum('ij,...j->...i', self.Lr, self.rng.normal(tf.concat([shape, [self.obs_dim]], axis=0), mean=0.0, stddev=1.0))
+    def transition_dist(self, x_prev, **kwargs):
+        loc = self.motion_model.f(x_prev)
+        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.Lq)
+
+    def observation_dist(self, x, **kwargs):
+        loc = self.h(x)
+        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.Lr)
+
+    # def sample_initial_state(self, shape):
+    #     z0 = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
+    #     x0 = self.m0 + tf.einsum('ij,...j->...i', self.L0, z0)
+    #     return x0
+
+    # def sample_transition_noise(self, shape):
+    #     return self.motion_model.sample_transition_noise(shape)
+
+    # def sample_observation_noise(self, shape):
+    #     return tf.einsum('ij,...j->...i', self.Lr, self.rng.normal(tf.concat([shape, [self.obs_dim]], axis=0), mean=0.0, stddev=1.0))
 
     def f(self, x):
         return self.motion_model.f(x)  

@@ -330,10 +330,11 @@ class ParticleFilter(BaseFilter):
         batch_size = tf.shape(y)[0]
         T = tf.shape(y)[1]
 
-        x_particles = self.ssm.sample_initial_state(batch_size, self.num_particles)
+        x_particles = self.ssm.sample_initial_state(shape=(batch_size, self.num_particles))
         weights = tf.ones([batch_size, self.num_particles], dtype=tf.float32) / self.num_particles
 
         for t in range(T):
             y_t = y[:, t, :]
+            x = self.ssm.sample_transition(x_particles)
             x_particles, weights = self.update(x_particles, weights, y_t)
         return x_particles, weights
