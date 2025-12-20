@@ -165,20 +165,24 @@ def weighted_mean(X, W=None, axis=-2, normalize=True):
 
     x_rank = tf.rank(X)
     axis_ = axis if axis >= 0 else axis + x_rank
+    w_rank = tf.rank(W)
 
-    if W.shape.rank == 1:
-        pre = tf.ones([axis_], dtype=tf.int32)
-        post = tf.ones([x_rank - axis_ - 1], dtype=tf.int32)
-        Wb = tf.reshape(W, tf.concat([pre, tf.shape(W), post], axis=0))
-    elif W.shape.rank == 2 and (axis_ == 1):
-        # W [B,n] with X [B,n,...]
-        post = tf.ones([x_rank - 2], dtype=tf.int32)
-        Wb = tf.reshape(W, tf.concat([tf.shape(W), post], axis=0))
-    elif W.shape.rank == X.shape.rank - 1:
-        # W [*, n] with X [*, n, d] -> expand to align last dim
-        Wb = W[..., tf.newaxis]
-    else:
-        Wb = W
+    def _rank1():
+        shape = tf.ones([x_rank], dtype=tf.int32)
+        shape = tf.tensor_scatter_nd_update(shape, [[axis_]], [tf.shape(W)[0]])
+        return tf.reshape(W, shape)
+
+    def _rank_xminus1():
+        return W[..., tf.newaxis]
+
+    def _default():
+        return W
+
+    Wb = tf.cond(
+        tf.equal(w_rank, 1),
+        _rank1,
+        lambda: tf.cond(tf.equal(w_rank, x_rank - 1), _rank_xminus1, _default),
+    )
 
     num = tf.reduce_sum(X * Wb, axis=axis_)
     if not normalize:

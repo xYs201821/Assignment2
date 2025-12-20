@@ -87,7 +87,7 @@ def constant_velocity_motion_model():
 @pytest.fixture
 def constant_turn_rate_motion_model():
     dt = 0.1
-    cov_eps = 0.01 * np.eye(2, dtype=np.float32)
+    cov_eps = 0.01 * np.eye(3, dtype=np.float32)
     return ConstantTurnRateMotionModel(dt=dt, cov_eps=cov_eps)
 
 @pytest.fixture

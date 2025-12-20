@@ -27,10 +27,11 @@ class MotionModel(tf.Module):
 
 class ConstantVelocityMotionModel(MotionModel):
 
-    def __init__(self, v, dt, cov_eps, seed=42):
+    def __init__(self, v, dt, cov_eps, seed=42, jitter=1e-12):
         super().__init__(seed)
         self.dt = tf.convert_to_tensor(dt, dtype=tf.float32)
         self.v = tf.convert_to_tensor(v, dtype=tf.float32)
+        self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
         self.A = tf.stack(
             [
                 tf.stack([1.0, 0.0, self.dt, 0.0]),
@@ -42,7 +43,6 @@ class ConstantVelocityMotionModel(MotionModel):
         )
         if cov_eps.shape[0] == 2 * v.shape[-1]:
             self.cov_eps = cov_eps
-            self.Lq = tf.linalg.cholesky(self.cov_eps)
         elif cov_eps.shape[0] == v.shape[-1]:
             Q_v = cov_eps  # only velocity noise
             zeros = tf.zeros((tf.shape(self.v)[-1], tf.shape(self.v)[-1]), tf.float32)
@@ -50,9 +50,10 @@ class ConstantVelocityMotionModel(MotionModel):
                 tf.concat([1e-32 * tf.eye(tf.shape(self.v)[-1], dtype=tf.float32), zeros], axis=1),
                 tf.concat([zeros, Q_v], axis=1)
             ], axis=0)
-            self.Lq = tf.linalg.cholesky(self.cov_eps)
         else:
             raise ValueError("cov_eps must be [2*dim,2*dim] or [dim,dim] for ConstantVelocityMotionModel")
+        self.cov_eps = self.cov_eps + self.jitter * tf.eye(self.state_dim, dtype=tf.float32)
+        self.Lq = tf.linalg.cholesky(self.cov_eps)
         
     @property
     def state_dim(self):
@@ -63,22 +64,29 @@ class ConstantVelocityMotionModel(MotionModel):
 
 
 class ConstantTurnRateMotionModel(MotionModel):
-    """State: [x, y, v, heading, omega]."""
+    """Standard CTRV state: [x, y, v, psi, omega]."""
 
-    def __init__(self, dt, cov_eps, seed=42, eps=1e-6):
+    def __init__(self, dt, cov_eps, seed=42, eps=1e-12):
         super().__init__(seed)
         self.dt = tf.convert_to_tensor(dt, dtype=tf.float32)
         self.eps = tf.convert_to_tensor(eps, dtype=tf.float32)
         cov_eps = tf.convert_to_tensor(cov_eps, dtype=tf.float32)
         if cov_eps.shape[0] == 5:
             self.cov_eps = cov_eps
-        elif cov_eps.shape[0] == 2:
+        elif cov_eps.shape[0] == 3:
             zeros = tf.zeros((5, 5), tf.float32)
-            indices = tf.constant([[2, 2], [2, 4], [4, 2], [4, 4]], dtype=tf.int32)
-            updates = tf.stack([cov_eps[0, 0], cov_eps[0, 1], cov_eps[1, 0], cov_eps[1, 1]], axis=0)
+            indices = tf.constant(
+                [
+                    [2, 2], [2, 3], [2, 4],
+                    [3, 2], [3, 3], [3, 4],
+                    [4, 2], [4, 3], [4, 4],
+                ],
+                dtype=tf.int32,
+            )
+            updates = tf.reshape(cov_eps, [-1])
             self.cov_eps = tf.tensor_scatter_nd_update(zeros, indices, updates)
         else:
-            raise ValueError("cov_eps must be [5,5] or [2,2] for ConstantTurnRateMotionModel")
+            raise ValueError("cov_eps must be [5,5] or [3,3] for ConstantTurnRateMotionModel")
         self.cov_eps = self.cov_eps + self.eps * tf.eye(5, dtype=tf.float32)
         self.Lq = tf.linalg.cholesky(self.cov_eps)
 
@@ -90,25 +98,29 @@ class ConstantTurnRateMotionModel(MotionModel):
         px = x[..., 0]
         py = x[..., 1]
         v = x[..., 2]
-        heading = x[..., 3]
+        psi = x[..., 3]
         omega = x[..., 4]
 
         dt = self.dt
         omega_dt = omega * dt
-        sin_h = tf.sin(heading)
-        cos_h = tf.cos(heading)
-        sin_h_dt = tf.sin(heading + omega_dt)
-        cos_h_dt = tf.cos(heading + omega_dt)
+        psi_next = psi + omega_dt
 
-        omega_safe = tf.where(tf.abs(omega) < self.eps, tf.ones_like(omega), omega)
-        px_turn = px + v / omega_safe * (sin_h_dt - sin_h)
-        py_turn = py + v / omega_safe * (-cos_h_dt + cos_h)
-        px_lin = px + v * dt * cos_h
-        py_lin = py + v * dt * sin_h
+        small_turn = tf.abs(omega) < self.eps
+        cos_psi = tf.cos(psi)
+        sin_psi = tf.sin(psi)
+        cos_psi_next = tf.cos(psi_next)
+        sin_psi_next = tf.sin(psi_next)
 
-        use_lin = tf.abs(omega) < self.eps
-        px_next = tf.where(use_lin, px_lin, px_turn)
-        py_next = tf.where(use_lin, py_lin, py_turn)
-        heading_next = heading + omega_dt
+        v_dt = v * dt
+        px_straight = px + v_dt * cos_psi
+        py_straight = py + v_dt * sin_psi
 
-        return tf.stack([px_next, py_next, v, heading_next, omega], axis=-1)
+        omega_safe = tf.where(small_turn, tf.ones_like(omega), omega)
+        radius = v / omega_safe
+        px_turn = px + radius * (sin_psi_next - sin_psi)
+        py_turn = py + radius * (-cos_psi_next + cos_psi)
+
+        px_next = tf.where(small_turn, px_straight, px_turn)
+        py_next = tf.where(small_turn, py_straight, py_turn)
+
+        return tf.stack([px_next, py_next, v, psi_next, omega], axis=-1)

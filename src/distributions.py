@@ -19,6 +19,3 @@ class Proposal(tf.Module):
 class BootstrapProposal(Proposal):
     def dist(self, ssm, x_prev, y_t):
         return ssm.transition_dist(x_prev)
-
-
-    

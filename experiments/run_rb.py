@@ -19,6 +19,7 @@ from src.ssm import RangeBearingSSM
 from src.motion_model import ConstantVelocityMotionModel, ConstantTurnRateMotionModel
 from src.utility import weighted_mean
 from src.filter import ExtendedKalmanFilter, UnscentedKalmanFilter, ParticleFilter
+from src.distributions import BootstrapProposal
 from experiment_helper import (
     CommonConfig,
     set_global_seed,
@@ -37,21 +38,23 @@ from experiment_helper import (
 class RBConfig:
     dt: float = 0.1
     motion_model: str = "cv"
-    q_scale_pos: float = 0.0
-    q_scale_v: float = 0.2
-    q_scale_omega: float = 0.01
-    r_range: float = 0.5
-    r_kappa: float = 1e4
+    q_scale_pos: float = 0.
+    q_scale_v: float = 0.1
+    q_scale_psi: float = 0.
+    q_scale_omega: float = 0.003
+    r_range: float = 0.7
+    r_kappa: float = 1e2
 
-    x0_true: Tuple[float, ...] = (10.0, 10.0, 2.0, 1.5)
-    m0_est: Tuple[float, ...] = (8.0, 12.0, 0.0, 0.0)
-    P0_scale: float = 5.0
+    x0_true: Tuple[float, ...] = (10.0, 10.0, 2.0, 0.3, 0.01)
+    m0_est: Tuple[float, ...] = (8.0, 12.0, 1.5, 0.3, 0.01)
+    P0_scale: Tuple[float, ...] = (1.0, 1.0, 0.3, 0.1, 0.003)
 
     ukf_alpha: float = 1.0
     ukf_beta: float = 2.0
     ukf_kappa: float = 0.0
-    pf_particles: int = 800
+    pf_particles: int = 1000
     pf_ess_threshold: float = 0.5
+    pf_resample: str = "always"
 
 
 def run_rb_once(common: CommonConfig, cfg: RBConfig, seed: Optional[int]) -> Dict[str, Any]:
@@ -60,7 +63,7 @@ def run_rb_once(common: CommonConfig, cfg: RBConfig, seed: Optional[int]) -> Dic
 
     cov_eps_y = np.diag([cfg.r_range**2, 1.0 / cfg.r_kappa]).astype(np.float32)
     if cfg.motion_model == "cv":
-        cov_eps_x = np.diag([cfg.q_scale_pos**2, cfg.q_scale_pos**2]).astype(np.float32)
+        cov_eps_x = np.diag([cfg.q_scale_v**2, cfg.q_scale_v**2]).astype(np.float32)
         motion_model = ConstantVelocityMotionModel(
             v=tf.zeros([2], dtype=tf.float32),
             dt=cfg.dt,
@@ -68,28 +71,41 @@ def run_rb_once(common: CommonConfig, cfg: RBConfig, seed: Optional[int]) -> Dic
         )
         expected_dim = 4
     elif cfg.motion_model == "ctrv":
-        cov_eps_x = np.diag([cfg.q_scale_v**2, cfg.q_scale_omega**2]).astype(np.float32)
+        cov_eps_x = np.diag([cfg.q_scale_v**2, cfg.q_scale_psi**2, cfg.q_scale_omega**2]).astype(np.float32)
         motion_model = ConstantTurnRateMotionModel(dt=cfg.dt, cov_eps=cov_eps_x)
         expected_dim = 5
     else:
         raise ValueError("motion_model must be 'cv' or 'ctrv'")
 
-    if len(cfg.x0_true) != expected_dim or len(cfg.m0_est) != expected_dim:
+    x0_true = cfg.x0_true
+    m0_est = cfg.m0_est
+    if cfg.motion_model == "cv":
+        if len(x0_true) == 5:
+            vx0 = x0_true[2] * np.cos(x0_true[3])
+            vy0 = x0_true[2] * np.sin(x0_true[3])
+            x0_true = (x0_true[0], x0_true[1], vx0, vy0)
+        if len(m0_est) == 5:
+            vx0 = m0_est[2] * np.cos(m0_est[3])
+            vy0 = m0_est[2] * np.sin(m0_est[3])
+            m0_est = (m0_est[0], m0_est[1], vx0, vy0)
+
+    if len(x0_true) != expected_dim or len(m0_est) != expected_dim:
         raise ValueError(f"motion_model '{cfg.motion_model}' expects {expected_dim}D x0_true/m0_est")
 
     ssm = RangeBearingSSM(motion_model=motion_model, cov_eps_y=cov_eps_y, seed=seed)
     if seed is not None:
         ssm.set_seed(seed)
 
-    x0_true = tf.constant(cfg.x0_true, dtype=tf.float32)
+    x0_true = tf.constant(x0_true, dtype=tf.float32)
     x_true, y_obs = ssm.simulate(common.T, shape=(common.batch_size, ), x0=x0_true)
 
-    m0 = tf.constant(cfg.m0_est, dtype=tf.float32)
-    P0 = tf.eye(ssm.state_dim, dtype=tf.float32) * cfg.P0_scale
+    m0 = tf.constant(m0_est, dtype=tf.float32)
+    P0 = tf.linalg.diag(tf.constant(cfg.P0_scale, dtype=tf.float32) ** 2)
 
     ekf = ExtendedKalmanFilter(ssm)
     ukf = UnscentedKalmanFilter(ssm, alpha=cfg.ukf_alpha, beta=cfg.ukf_beta, kappa=cfg.ukf_kappa)
-    pf = ParticleFilter(ssm, num_particles=cfg.pf_particles, ess_threshold=cfg.pf_ess_threshold)
+    proposal = BootstrapProposal()
+    pf = ParticleFilter(ssm, proposal=proposal, num_particles=cfg.pf_particles, ess_threshold=cfg.pf_ess_threshold)
 
     ekf_res = ekf.filter(y_obs, m0=m0, P0=P0)
     ukf_res = ukf.filter(y_obs, m0=m0, P0=P0)
@@ -341,6 +357,7 @@ def main():
     parser.add_argument("--rb_motion", choices=["cv", "ctrv"], default=None)
     parser.add_argument("--q_scale_pos", type=float, default=None)
     parser.add_argument("--q_scale_v", type=float, default=None)
+    parser.add_argument("--q_scale_psi", type=float, default=None)
     parser.add_argument("--q_scale_omega", type=float, default=None)
     parser.add_argument("--r_range", type=float, default=None)
     parser.add_argument("--r_kappa", type=float, default=None)
@@ -379,6 +396,8 @@ def main():
         cfg.q_scale_pos = args.q_scale_pos
     if args.q_scale_v is not None:
         cfg.q_scale_v = args.q_scale_v
+    if args.q_scale_psi is not None:
+        cfg.q_scale_psi = args.q_scale_psi
     if args.q_scale_omega is not None:
         cfg.q_scale_omega = args.q_scale_omega
     if args.r_range is not None:
@@ -399,13 +418,10 @@ def main():
         cfg.pf_ess_threshold = args.pf_ess_threshold
     if args.x0_true is not None:
         cfg.x0_true = tuple(args.x0_true)
-    elif cfg.motion_model == "ctrv":
-        cfg.x0_true = (10.0, 10.0, 2.0, 1.5, 0.0)
     if args.m0_est is not None:
         cfg.m0_est = tuple(args.m0_est)
-    elif cfg.motion_model == "ctrv":
-        cfg.m0_est = (8.0, 12.0, 0.0, 0.0, 0.0)
-
+    if args.P0_scale is not None:
+        cfg.P0_scale = tuple(args.P0_scale)
     seeds = args.seeds if not args.no_seed else [None]
     run(common, cfg, seeds)
 

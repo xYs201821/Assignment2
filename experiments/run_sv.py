@@ -17,6 +17,7 @@ sys.path.append(this_dir)
 from src.ssm import StochasticVolatilitySSM
 from src.utility import weighted_mean
 from src.filter import ExtendedKalmanFilter, UnscentedKalmanFilter, ParticleFilter
+from src.distributions import BootstrapProposal
 from experiment_helper import (
     CommonConfig,
     set_global_seed,
@@ -75,7 +76,8 @@ def run_sv_once(common: CommonConfig, cfg: SVConfig, seed: Optional[int]) -> Dic
 
     ekf = ExtendedKalmanFilter(ssm)
     ukf = UnscentedKalmanFilter(ssm, alpha=cfg.ukf_alpha, beta=cfg.ukf_beta, kappa=cfg.ukf_kappa)
-    pf = ParticleFilter(ssm, num_particles=cfg.pf_particles, ess_threshold=cfg.pf_ess_threshold)
+    proposal = BootstrapProposal()
+    pf = ParticleFilter(ssm, proposal=proposal, num_particles=cfg.pf_particles, ess_threshold=cfg.pf_ess_threshold)
 
     ekf_res = ekf.filter(y_obs, m0=m0, P0=P0)
     ukf_res = ukf.filter(y_obs, m0=m0, P0=P0)
