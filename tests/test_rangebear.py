@@ -25,11 +25,10 @@ def test_range_bearing_ssm(range_bearing_ssm):
     # positive range
     mean_rng = tf.reduce_mean(rng)
     assert mean_rng > 0.0
-    sigma_r = tf.sqrt(range_bearing_ssm.cov_eps_y[0, 0])  
+    sigma_r = tf.sqrt(range_bearing_ssm.cov_eps_y[0, 0])
     assert tf.reduce_min(rng) > -3.0 * sigma_r
 
     # bearing in [-pi, pi]
     pi = tf.constant(np.pi, dtype=tf.float32)
-    sigma_b = tf.sqrt(range_bearing_ssm.cov_eps_y[1, 1])
-    assert tf.reduce_max(bearing) <= pi + 3.0 * sigma_b
-    assert tf.reduce_min(bearing) >= -pi - 3.0 * sigma_b
+    assert tf.reduce_max(bearing) <= pi
+    assert tf.reduce_min(bearing) >= -pi

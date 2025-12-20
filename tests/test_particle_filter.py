@@ -20,8 +20,8 @@ def test_particle_filter_runs(sv_model):
     assert x_particles.shape == (batch_size, T, N, dx)
     assert w.shape == (batch_size, T, N)
     assert parent_indices.shape == (batch_size, T, N)
-    assert diagnostics["ess"].shape == (T, batch_size)
-    assert diagnostics["logZ"].shape == (T, batch_size)
+    assert diagnostics["ess"].shape == (batch_size, T)
+    assert diagnostics["logZ"].shape == (batch_size, T)
 
     assert_all_finite(x_particles, w, diagnostics["ess"], diagnostics["logZ"])
 

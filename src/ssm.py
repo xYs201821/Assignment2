@@ -284,6 +284,7 @@ class RangeBearingSSM(SSM):
         self.m0 = tf.zeros([self.motion_model.state_dim], dtype=tf.float32)
         self.P0 = tf.eye(self.motion_model.state_dim, dtype=tf.float32)
         self.cov_eps_x = self.motion_model.cov_eps
+        # Observation noise params: diag([sigma_r^2, kappa^{-1}]).
         self.cov_eps_y = tf.convert_to_tensor(cov_eps_y, dtype=tf.float32)
         self.angle_indices = (1, )
         self.L0 = tf.linalg.cholesky(self.P0)
@@ -313,7 +314,13 @@ class RangeBearingSSM(SSM):
 
     def observation_dist(self, x, **kwargs):
         loc = self.h(x)
-        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.Lr)
+        range_loc = loc[..., 0]
+        bearing_loc = loc[..., 1]
+        sigma_r = tf.sqrt(tf.maximum(self.cov_eps_y[0, 0], 1e-12))
+        kappa = 1.0 / tf.maximum(self.cov_eps_y[1, 1], 1e-12)
+        range_dist = tfd.Normal(loc=range_loc, scale=tf.ones_like(range_loc) * sigma_r)
+        bearing_dist = tfd.VonMises(loc=bearing_loc, concentration=tf.ones_like(bearing_loc) * kappa)
+        return tfd.Blockwise([range_dist, bearing_dist])
 
     # def sample_initial_state(self, shape):
     #     z0 = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)

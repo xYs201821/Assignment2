@@ -197,7 +197,7 @@ class UnscentedKalmanFilter(GaussianFilter):
 
         self.Wm, self.Wc, self.lamb = self._build_ukf_weights(self.state_dim)
 
-    def _build_ukf_weights(self, n: int):
+    def _build_ukf_weights(self, n: tf.Tensor):
         alpha = self.alpha
         beta = self.beta
         kappa = self.kappa
@@ -215,10 +215,18 @@ class UnscentedKalmanFilter(GaussianFilter):
         return Wm, Wc, lamb
 
     def generate_sigma_points(self, m, P):
-
-        n = int(P.shape[-1])
-        W_m, W_c, lamb = self._build_ukf_weights(n)
-        scale = n + lamb
+        n = tf.shape(P)[-1]
+        n_f = tf.cast(n, tf.float32)
+        lamb = self.alpha ** 2 * (n_f + self.kappa) - n_f
+        num_sigma = 2 * n + 1
+        w = 1.0 / (2.0 * (n_f + lamb))
+        w0 = lamb / (n_f + lamb)
+        W_m = tf.concat([tf.reshape(w0, [1]), tf.fill([num_sigma - 1], w)], axis=0)
+        W_c = tf.concat(
+            [tf.reshape(w0 + (1.0 - self.alpha**2 + self.beta), [1]), tf.fill([num_sigma - 1], w)],
+            axis=0,
+        )
+        scale = tf.cast(n_f + lamb, P.dtype)
         P_scaled = P * scale                                # [batch, n, n]
 
         P_sqrt = tf.linalg.cholesky(P_scaled)                    # [batch, n, n]
@@ -416,15 +424,10 @@ class ParticleFilter(BaseFilter):
         if init_dist is None:
             x = self.ssm.sample_initial_state(tf.concat([batch_shape, [N]], axis=0), return_log_prob=False)
         else:
-            if callable(init_dist):
-                dist = init_dist(tf.concat([batch_shape, [N]], axis=0))
-                x = tf.cast(dist.sample(seed=self.ssm._tfp_seed()), dtype=tf.float32)
-            else:
-                dist = init_dist
-                x = tf.cast(
-                    dist.sample(tf.concat([batch_shape, [N]], axis=0), seed=self.ssm._tfp_seed()),
-                    dtype=tf.float32,
-                )
+            if not callable(init_dist):
+                raise TypeError("init_dist must be a callable: init_dist(shape) -> tfd.Distribution")
+            dist = init_dist(tf.concat([batch_shape, [N]], axis=0))
+            x = tf.cast(dist.sample(seed=self.ssm._tfp_seed()), dtype=tf.float32)
         log_w = -tf.math.log(tf.cast(N, tf.float32)) * tf.ones(tf.concat([batch_shape, [N]], axis=0), tf.float32)
         parent_indices = tf.broadcast_to(
             tf.range(self.num_particles, dtype=tf.int32),
@@ -450,5 +453,8 @@ class ParticleFilter(BaseFilter):
         w_seq = self._stack_and_permute(w_ta, tail_dims=1)
         parent_seq = self._stack_and_permute(parent_ta, tail_dims=1)
         
-        diagnostics = {"ess": ess_ta.stack(), "logZ": logZ_ta.stack()}
+        diagnostics = {
+            "ess": self._stack_and_permute(ess_ta, tail_dims=0),
+            "logZ": self._stack_and_permute(logZ_ta, tail_dims=0),
+        }
         return x_seq, w_seq, diagnostics, parent_seq

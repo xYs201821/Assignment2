@@ -17,20 +17,28 @@ def quadratic_matmul(A, B, C):
     AB = tf.linalg.matmul(A, B)
     return tf.linalg.matmul(AB, C, transpose_b=True)
 
-def cholesky_solve(A, B, eps=0):
+def cholesky_solve(A, B, eps=0.0):
     """
     Solves AX = B using Cholesky decomposition.
     """
-    A_sym = (A + tf.transpose(A, perm=[0, 2, 1])) / 2.0
+    A = tf.convert_to_tensor(A)
+    B = tf.convert_to_tensor(B)
+    squeeze = False
+    if A.shape.rank == 2:
+        A = A[tf.newaxis, ...]
+        B = B[tf.newaxis, ...]
+        squeeze = True
+
+    A_sym = (A + tf.linalg.matrix_transpose(A)) / 2.0
     eye = tf.eye(tf.shape(A_sym)[-1], batch_shape=tf.shape(A_sym)[:-2], dtype=A_sym.dtype)
-    A_robust = A_sym + eye * eps
-    try:
-        L = tf.linalg.cholesky(A_robust)
-    except:
-        L = tf.linalg.cholesky(A_robust + eye * 1e-8)
+    jitter = tf.cast(1e-8, A_sym.dtype)
+    A_robust = A_sym + eye * (eps + jitter)
+    L = tf.linalg.cholesky(A_robust)
     Y = tf.linalg.triangular_solve(L, B, lower=True)
-    X = tf.linalg.triangular_solve(tf.transpose(L, perm=[0, 2, 1]), Y, lower=False)
-    
+    X = tf.linalg.triangular_solve(tf.linalg.matrix_transpose(L), Y, lower=False)
+
+    if squeeze:
+        X = X[0]
     return X
 
 def block_diag(A, B):
@@ -166,6 +174,9 @@ def weighted_mean(X, W=None, axis=-2, normalize=True):
         # W [B,n] with X [B,n,...]
         post = tf.ones([x_rank - 2], dtype=tf.int32)
         Wb = tf.reshape(W, tf.concat([tf.shape(W), post], axis=0))
+    elif W.shape.rank == X.shape.rank - 1:
+        # W [*, n] with X [*, n, d] -> expand to align last dim
+        Wb = W[..., tf.newaxis]
     else:
         Wb = W
 

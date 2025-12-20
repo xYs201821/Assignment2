@@ -7,7 +7,7 @@ import tensorflow as tf
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.ssm import LinearGaussianSSM, StochasticVolatilitySSM, RangeBearingSSM
-from src.motion_model import ConstantVelocityMotionModel
+from src.motion_model import ConstantVelocityMotionModel, ConstantTurnRateMotionModel
 from src.utility import tfp_lgssm  
 
 @pytest.fixture
@@ -83,8 +83,17 @@ def constant_velocity_motion_model():
     cov_eps = 0.0001*np.eye(2, dtype=np.float32)  # small perturabtion of velocity
     return ConstantVelocityMotionModel(v=v, dt=dt, cov_eps=cov_eps)
 
+
+@pytest.fixture
+def constant_turn_rate_motion_model():
+    dt = 0.1
+    cov_eps = 0.01 * np.eye(2, dtype=np.float32)
+    return ConstantTurnRateMotionModel(dt=dt, cov_eps=cov_eps)
+
 @pytest.fixture
 def range_bearing_ssm(constant_velocity_motion_model):
     """Range Bearing SSM"""
-    cov_eps_y = 0.09*np.eye(2, dtype=np.float32)
+    sigma_r = 0.5
+    kappa = 100.0
+    cov_eps_y = np.diag([sigma_r**2, 1.0 / kappa]).astype(np.float32)
     return RangeBearingSSM(motion_model=constant_velocity_motion_model, cov_eps_y=cov_eps_y)
