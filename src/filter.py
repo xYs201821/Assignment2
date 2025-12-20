@@ -1,5 +1,6 @@
 import tensorflow as tf
 import numpy as np
+from src.distributions import BootstrapProposal
 from src.utility import tf_cond, cholesky_solve, weighted_mean, block_diag, quadratic_matmul
 
 class BaseFilter(tf.Module):
@@ -12,6 +13,15 @@ class BaseFilter(tf.Module):
     def filter(self, y, **kwargs):
         raise NotImplementedError
     
+    @staticmethod
+    def _stack_and_permute(ta, tail_dims=1):
+        seq = ta.stack()
+        rank = tf.rank(seq)
+        batch_rank = rank - (1 + tail_dims)
+        prefix = tf.range(1, 1 + batch_rank)
+        perm = tf.concat([prefix, [0], tf.range(1 + batch_rank, rank)], axis=0)
+        return tf.transpose(seq, perm)
+
 class GaussianFilter(BaseFilter):
     def __init__(self, ssm):
         super().__init__(ssm)
@@ -52,36 +62,34 @@ class GaussianFilter(BaseFilter):
             # [dx, dx] → [batch, dx, dx]
             P_pred = P_pred[tf.newaxis, :, :]
             P_pred = tf.tile(P_pred, [batch_size, 1, 1])
-        m_filt_list = []
-        P_filt_list = []
-        m_pred_list = []
-        P_pred_list = []
-        cond_P_list = []
-        cond_S_list = []
+        m_filt_ta = tf.TensorArray(dtype=tf.float32, size=T)
+        P_filt_ta = tf.TensorArray(dtype=tf.float32, size=T)
+        m_pred_ta = tf.TensorArray(dtype=tf.float32, size=T)
+        P_pred_ta = tf.TensorArray(dtype=tf.float32, size=T)
+        cond_P_ta = tf.TensorArray(dtype=tf.float32, size=T)
+        cond_S_ta = tf.TensorArray(dtype=tf.float32, size=T)
 
-        for t in range(T):
+        for t in tf.range(T):
             y_t = y[:, t, :]
-            m_pred_list.append(m_pred)
-            P_pred_list.append(P_pred)
-            m_filt, P_filt, cond_P, cond_S = self.update(m_pred, P_pred, y_t)
-            m_filt_list.append(m_filt)
-            P_filt_list.append(P_filt)
+            m_pred_ta = m_pred_ta.write(t, m_pred)
+            P_pred_ta = P_pred_ta.write(t, P_pred)
+            
+            m_filt, P_filt, cond_P, cond_S = self.update(m_pred, P_pred, y_t, joseph=joseph)
+            
+            m_filt_ta = m_filt_ta.write(t, m_filt)
+            P_filt_ta = P_filt_ta.write(t, P_filt)
+            cond_P_ta = cond_P_ta.write(t, cond_P)
+            cond_S_ta = cond_S_ta.write(t, cond_S)
+            
             m_pred, P_pred = self.predict(m_filt, P_filt)
-            cond_P_list.append(cond_P)
-            cond_S_list.append(cond_S)
-        m_filt = tf.stack(m_filt_list, axis=1)
-        P_filt = tf.stack(P_filt_list, axis=1)
-        m_pred = tf.stack(m_pred_list, axis=1)
-        P_pred = tf.stack(P_pred_list, axis=1)
-        cond_P = tf.stack(cond_P_list, axis=1)
-        cond_S = tf.stack(cond_S_list, axis=1)
+
         return {
-            "m_filt": m_filt,
-            "P_filt": P_filt,
-            "m_pred": m_pred,
-            "P_pred": P_pred,
-            "cond_P": cond_P,
-            "cond_S": cond_S,
+            "m_filt": self._stack_and_permute(m_filt_ta, tail_dims=1),
+            "P_filt": self._stack_and_permute(P_filt_ta, tail_dims=2),
+            "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
+            "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
+            "cond_P": self._stack_and_permute(cond_P_ta, tail_dims=0),
+            "cond_S": self._stack_and_permute(cond_S_ta, tail_dims=0),
         }
 
     @staticmethod
@@ -310,31 +318,137 @@ class UnscentedKalmanFilter(GaussianFilter):
         return m_filt, P_filt, cond_P, cond_S
 
 class ParticleFilter(BaseFilter):
-    def __init__(self, ssm, num_particles=100, ess_threshold=0.5):
+    def __init__(self, ssm, proposal=None, num_particles=100, ess_threshold=0.5):
         super().__init__(ssm)
-        self.num_particles = num_particles
-        self.ssm = ssm
-        self.ess_threshold = tf.convert_to_tensor(ess_threshold, dtype=tf.float32)
+        self.num_particles = int(num_particles)
+        self.ess_threshold = tf.convert_to_tensor(ess_threshold, tf.float32)
+        self.proposal = proposal if proposal is not None else BootstrapProposal()
 
     @staticmethod
-    def _normalize_weights(weights):
-        log_norm = tf.reduce_logsumexp(weights, axis=-1)
-        w = tf.exp(weights - log_norm)
-        return w, log_norm
+    def _log_normalize(log_w):
+        logZ = tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
+        log_w_norm = log_w - logZ
+        w = tf.exp(log_w_norm)
+        return log_w_norm, w, tf.squeeze(logZ, axis=-1)
+
+    @staticmethod
+    def ess(w):
+        return 1.0 / tf.reduce_sum(tf.square(w), axis=-1)
+
+    @staticmethod
+    def systematic_resample(w, rng):
+        shape = tf.shape(w)
+        N = shape[-1]
+        B = tf.reduce_prod(shape[:-1])
+        w2 = tf.reshape(w, [B, N])
+        cdf = tf.cumsum(w2, axis=-1)
+
+        u0 = rng.uniform([B, 1], 0.0, 1.0 / tf.cast(N, tf.float32), dtype=tf.float32)
+        js = tf.cast(tf.range(N)[tf.newaxis, :], tf.float32)
+        u = u0 + js / tf.cast(N, tf.float32)
+
+        idx = tf.searchsorted(cdf, u, side='left')
+        idx = tf.clip_by_value(idx, 0, N - 1)
+        return tf.reshape(idx, shape)
+
+    @staticmethod
+    def resample_particles(x, idx):
+        shape = tf.shape(x)
+        B = tf.reduce_prod(shape[:-2])
+        x_flatten = tf.reshape(x, [B, shape[-2], shape[-1]])
+        idx_flatten = tf.reshape(idx, [B, shape[-2]])
+        out_flatten = tf.gather(x_flatten, idx_flatten, batch_dims=1)
+        return tf.reshape(out_flatten, shape)
+
+    def step(self, x_prev, log_w_prev, y_t, resample="auto"):
+        x_t = self.proposal.sample(self.ssm, x_prev, y_t, seed=self.ssm._tfp_seed())
+
+        loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
+        logtrans = self.ssm.transition_dist(x_prev).log_prob(x_t)
+        logq = self.proposal.log_prob(self.ssm, x_t, x_prev, y_t)
+
+        log_w = log_w_prev + tf.cast(loglik + logtrans - logq, tf.float32)
+
+        log_w_norm, w, logZ = self._log_normalize(log_w)
+        ess = self.ess(w)
+
+        if resample in ("auto", "always"):
+            N_float = tf.cast(self.num_particles, tf.float32)
+            if resample == "always":
+                mask_do_rs = tf.ones_like(ess, dtype=tf.bool)
+            else:
+                mask_do_rs = ess < (self.ess_threshold * N_float)
+
+            rs_indices = self.systematic_resample(w, self.ssm.rng)
+
+            batch_shape = tf.shape(x_t)[:-2]
+            no_rs_indices = tf.broadcast_to(tf.range(self.num_particles, dtype=tf.int32),
+             tf.concat([batch_shape, [self.num_particles]], axis=0))
+            mask_do_rs = mask_do_rs[..., tf.newaxis]
+            parent_indices = tf.where(mask_do_rs, rs_indices, no_rs_indices)
+
+            x_t = self.resample_particles(x_t, parent_indices)
+            log_w_reset = -tf.math.log(N_float) * tf.ones_like(log_w_norm)
+            log_w_final = tf.where(mask_do_rs, log_w_reset, log_w_norm)
+        else:
+            batch_shape = tf.shape(x_t)[:-2]
+            parent_indices = tf.broadcast_to(tf.range(self.num_particles, dtype=tf.int32),
+                tf.concat([batch_shape, [self.num_particles]], axis=0))
+            log_w_final = log_w_norm
+        w_final = tf.exp(log_w_final)
+        return x_t, log_w_final, w_final, ess, logZ, parent_indices
 
     @tf.function(reduce_retracing=True)
-    def filter(self, y, resample=True):
-        y = tf.convert_to_tensor(y, dtype=tf.float32)
-        if (len(y.shape) == 2):
-            y = y[tf.newaxis, :] # [T, dy] → [batch, T, dy]
-        batch_size = tf.shape(y)[0]
-        T = tf.shape(y)[1]
+    def filter(self, y, resample="auto", init_dist=None):
+        y = tf.convert_to_tensor(y, tf.float32)
+        if tf.rank(y) == 2:
+            y = y[tf.newaxis, ...]   # [1, T, dy]
 
-        x_particles = self.ssm.sample_initial_state(shape=(batch_size, self.num_particles))
-        weights = tf.ones([batch_size, self.num_particles], dtype=tf.float32) / self.num_particles
+        if isinstance(resample, bool):
+            resample = "auto" if resample else "never"
+        if resample not in ("auto", "never", "always"):
+            raise ValueError("resample must be True/False or one of 'auto', 'never', 'always'")
 
-        for t in range(T):
-            y_t = y[:, t, :]
-            x = self.ssm.sample_transition(x_particles)
-            x_particles, weights = self.update(x_particles, weights, y_t)
-        return x_particles, weights
+        batch_shape = tf.shape(y)[:-2]
+        T = tf.shape(y)[-2]
+        N = self.num_particles
+
+        if init_dist is None:
+            x = self.ssm.sample_initial_state(tf.concat([batch_shape, [N]], axis=0), return_log_prob=False)
+        else:
+            if callable(init_dist):
+                dist = init_dist(tf.concat([batch_shape, [N]], axis=0))
+                x = tf.cast(dist.sample(seed=self.ssm._tfp_seed()), dtype=tf.float32)
+            else:
+                dist = init_dist
+                x = tf.cast(
+                    dist.sample(tf.concat([batch_shape, [N]], axis=0), seed=self.ssm._tfp_seed()),
+                    dtype=tf.float32,
+                )
+        log_w = -tf.math.log(tf.cast(N, tf.float32)) * tf.ones(tf.concat([batch_shape, [N]], axis=0), tf.float32)
+        parent_indices = tf.broadcast_to(
+            tf.range(self.num_particles, dtype=tf.int32),
+            tf.concat([batch_shape, [self.num_particles]], axis=0),
+        )
+
+        ess_ta = tf.TensorArray(tf.float32, size=T)
+        logZ_ta = tf.TensorArray(tf.float32, size=T)
+        x_ta = tf.TensorArray(tf.float32, size=T)
+        w_ta = tf.TensorArray(tf.float32, size=T)
+        parent_ta = tf.TensorArray(tf.int32, size=T)
+
+        for t in tf.range(T):
+            y_t = y[..., t, :]  # [..., dy]
+            x, log_w, w, ess, logZ, parent_indices = self.step(x, log_w, y_t, resample=resample)
+            ess_ta = ess_ta.write(t, ess)
+            logZ_ta = logZ_ta.write(t, logZ)
+            x_ta = x_ta.write(t, x)
+            w_ta = w_ta.write(t, w)
+            parent_ta = parent_ta.write(t, parent_indices)
+
+        x_seq = self._stack_and_permute(x_ta, tail_dims=2)
+        w_seq = self._stack_and_permute(w_ta, tail_dims=1)
+        parent_seq = self._stack_and_permute(parent_ta, tail_dims=1)
+        
+        diagnostics = {"ess": ess_ta.stack(), "logZ": logZ_ta.stack()}
+        return x_seq, w_seq, diagnostics, parent_seq
