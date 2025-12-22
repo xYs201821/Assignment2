@@ -7,8 +7,8 @@ from src.motion_model import MotionModel
 from src.utility import weighted_mean
 
 class SSM(tf.Module):
-    def __init__(self, seed=None):
-        super().__init__()
+    def __init__(self, seed=None, name=None):
+        super().__init__(name=name)
         if seed is not None:
             self.rng = tf.random.Generator.from_seed(seed)
         else:
