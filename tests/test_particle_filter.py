@@ -1,6 +1,6 @@
 import tensorflow as tf
 
-from src.filter import ExtendedKalmanFilter, ParticleFilter, UnscentedKalmanFilter
+from src.filter import ExtendedKalmanFilter, BootstrapParticleFilter, UnscentedKalmanFilter
 from src.utility import weighted_mean
 from tests.testhelper import assert_all_finite
 
@@ -11,8 +11,8 @@ def test_particle_filter_runs(sv_model):
 
     _, y_traj = sv_model.simulate(T=T, shape=(batch_size,))
 
-    pf = ParticleFilter(sv_model, num_particles=200, ess_threshold=0.5)
-    x_particles, w, diagnostics, parent_indices = pf.filter(y_traj, resample=True)
+    pf = BootstrapParticleFilter(sv_model, num_particles=200, ess_threshold=0.5)
+    x_particles, w, diagnostics, parent_indices = pf.filter(y_traj, reweight=True)
 
     dx = sv_model.state_dim
     N = pf.num_particles
@@ -45,8 +45,8 @@ def test_particle_filter_sv_compares(sv_model):
 
     x_traj, y_traj = sv_model.simulate(T=T, shape=(batch_size,))
 
-    pf = ParticleFilter(sv_model, num_particles=500, ess_threshold=0.5)
-    x_particles, w, _, _ = pf.filter(y_traj, resample=True)
+    pf = BootstrapParticleFilter(sv_model, num_particles=500, ess_threshold=0.5)
+    x_particles, w, _, _ = pf.filter(y_traj, reweight=True)
 
     ekf = ExtendedKalmanFilter(sv_model)
     ekf_out = ekf.filter(y_traj, joseph=True)
@@ -64,6 +64,21 @@ def test_particle_filter_sv_compares(sv_model):
     tf.debugging.assert_less_equal(mse_pf, mse_ekf * 2.0 + 1e-4)
     tf.debugging.assert_less_equal(mse_pf, mse_ukf * 2.0 + 1e-4)
 
+def test_pf_matches_kf_on_lgssm(lgssm_3d, sim_data_3d, tfp_ref_3d):
+    # Bootstrap PF should track the true state similarly to TFP on linear-Gaussian models.
+    T = 100
+    y = sim_data_3d["y_traj"][:, :T, :]
+    x_true = sim_data_3d["x_traj"][:, :T, :]
+    m_tfp, _ = tfp_ref_3d
+    m_ref = m_tfp[:T]
+
+    pf = BootstrapParticleFilter(lgssm_3d, num_particles=800, ess_threshold=0.5)
+    x_particles, w, _, _ = pf.filter(y, reweight="always")
+
+    x_mean = weighted_mean(x_particles, w, axis=-2)
+    mse_pf = tf.reduce_mean((x_mean - x_true) ** 2)
+    mse_tfp = tf.reduce_mean((m_ref - x_true) ** 2)
+    tf.debugging.assert_less_equal(mse_pf, mse_tfp * 3.0 + 1e-4)
 
 def test_particle_filter_range_bearing_compares(range_bearing_ssm):
     rb = range_bearing_ssm
@@ -76,8 +91,8 @@ def test_particle_filter_range_bearing_compares(range_bearing_ssm):
 
     x_traj, y_traj = rb.simulate(T=T, shape=(batch_size,))
 
-    pf = ParticleFilter(rb, num_particles=800, ess_threshold=0.5)
-    x_particles, w, _, _ = pf.filter(y_traj, resample=True)
+    pf = BootstrapParticleFilter(rb, num_particles=800, ess_threshold=0.5)
+    x_particles, w, _, _ = pf.filter(y_traj, reweight=True)
 
     ekf = ExtendedKalmanFilter(rb)
     ukf = UnscentedKalmanFilter(rb)

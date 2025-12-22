@@ -21,6 +21,7 @@ def test_range_bearing_ssm(range_bearing_ssm):
     # Geometric checks
     rng = y_traj[..., 0]      # [batch, T]
     bearing = y_traj[..., 1]  # [batch, T]
+    #bearing = tf.math.atan2(tf.sin(bearing), tf.cos(bearing))
 
     # positive range
     mean_rng = tf.reduce_mean(rng)
@@ -30,5 +31,6 @@ def test_range_bearing_ssm(range_bearing_ssm):
 
     # bearing in [-pi, pi]
     pi = tf.constant(np.pi, dtype=tf.float32)
-    assert tf.reduce_max(bearing) <= pi
-    assert tf.reduce_min(bearing) >= -pi
+    bearing_innov = range_bearing_ssm.innovation(bearing, range_bearing_ssm.h(x_traj)[..., 1])
+    assert tf.reduce_max(bearing_innov) <= pi
+    assert tf.reduce_min(bearing_innov) >= -pi

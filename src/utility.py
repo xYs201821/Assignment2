@@ -3,12 +3,20 @@ from matplotlib import pyplot as plt
 import numpy as np
 import tensorflow_probability as tfp
 
+
 def tf_cond(M): # find condition number of M in tensorflow, [batch, n, n] -> [batch]
-    s = tf.linalg.svd(M, compute_uv=False)
-    s_max = tf.reduce_max(s, axis=-1)
-    s_min = tf.reduce_min(s, axis=-1)
-    eps = 1e-20
-    return s_max / (s_min + eps)
+    M = tf.convert_to_tensor(M)
+    tf.debugging.assert_all_finite(M, "tf_cond received NaN/Inf in input matrix")
+    M_sym = (M + tf.linalg.matrix_transpose(M)) / 2.0
+    eye = tf.eye(tf.shape(M_sym)[-1], batch_shape=tf.shape(M_sym)[:-2], dtype=M_sym.dtype)
+    jitter = tf.cast(1e-8, M_sym.dtype)
+    M_sym = M_sym + eye * jitter
+    M_sym = tf.where(tf.math.is_finite(M_sym), M_sym, tf.zeros_like(M_sym))
+    evals = tf.linalg.eigvalsh(M_sym)
+    e_max = tf.reduce_max(evals, axis=-1)
+    e_min = tf.reduce_min(evals, axis=-1)
+    eps = tf.cast(1e-20, M_sym.dtype)
+    return e_max / (e_min + eps)
 
 def quadratic_matmul(A, B, C):
     """
@@ -190,3 +198,4 @@ def weighted_mean(X, W=None, axis=-2, normalize=True):
 
     den = tf.reduce_sum(Wb, axis=axis_)
     return tf.math.divide_no_nan(num, den)
+

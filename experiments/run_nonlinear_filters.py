@@ -7,6 +7,7 @@ sys.path.append(os.path.join(this_dir, '..'))
 sys.path.append(this_dir)
 
 from experiment_helper import CommonConfig
+from experiment_helper import make_seeds
 import run_sv
 import run_rb
 
@@ -22,6 +23,7 @@ def main():
     parser.add_argument("--T", type=int, default=common.T)
     parser.add_argument("--batch", type=int, default=common.batch_size)
     parser.add_argument("--seeds", type=int, nargs="*", default=common.seed)
+    parser.add_argument("--num_seeds", type=int, default=None)
     parser.add_argument("--no_seed", action="store_true")
     parser.add_argument("--out_dir", type=str, default=common.out_dir)
     parser.add_argument("--no_save", action="store_true")
@@ -35,13 +37,17 @@ def main():
     if args.out_dir is not None:
         common.out_dir = args.out_dir
 
-    common.seed = None if args.no_seed else args.seeds
+    seeds = args.seeds
+    if not args.no_seed and args.num_seeds is not None:
+        base_seed = seeds[0] if isinstance(seeds, (list, tuple)) and len(seeds) > 0 else None
+        seeds = make_seeds(args.num_seeds, base_seed=base_seed)
+    common.seed = None if args.no_seed else seeds
     common.save = (not args.no_save)
     common.show = (not args.no_show)
 
     run_sv_flag = args.sv or (not args.sv and not args.rb)
     run_rb_flag = args.rb or (not args.sv and not args.rb)
-    seeds = args.seeds if not args.no_seed else [None]
+    seeds = [None] if args.no_seed else seeds
 
     if run_sv_flag:
         sv_cfg = run_sv.SVConfig()
@@ -49,13 +55,27 @@ def main():
             sv_cfg.obs_mode = args.sv_obs_mode
         if args.sv_obs_eps is not None:
             sv_cfg.obs_eps = args.sv_obs_eps
-        run_sv.run(common, sv_cfg, seeds)
+        sv_summary = run_sv.run(common, sv_cfg, seeds)
 
     if run_rb_flag:
         rb_cfg = run_rb.RBConfig()
         if args.rb_motion is not None:
             rb_cfg.motion_model = args.rb_motion
-        run_rb.run(common, rb_cfg, seeds)
+        rb_summary = run_rb.run(common, rb_cfg, seeds)
+
+    if run_sv_flag and run_rb_flag:
+        print("\n==== Combined Summary ====")
+        if sv_summary is not None:
+            print("SV Summary (mean±std):")
+            for k in sorted(sv_summary.keys()):
+                v = sv_summary[k]
+                print(f"  {k}: {v['mean']:.6g} ± {v['std']:.6g}")
+        if rb_summary is not None:
+            print("RB Summary (mean±std):")
+            for k in sorted(rb_summary.keys()):
+                v = rb_summary[k]
+                print(f"  {k}: {v['mean']:.6g} ± {v['std']:.6g}")
+        print("====")
 
 
 if __name__ == "__main__":

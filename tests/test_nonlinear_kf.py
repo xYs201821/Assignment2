@@ -37,8 +37,8 @@ def test_ekf_jacobian_linear_matches_A_C(lgssm_3d):
     batch = 4
     x = tf.random.normal([batch, dx], dtype=tf.float32)
 
-    F = ekf._jacobian(lgssm_3d.f, x)  # [batch, dx, dx]
-    H = ekf._jacobian(lgssm_3d.h, x)  # [batch, dy, dx]
+    F, _ = ekf._jacobian(lgssm_3d.f, x)  # [batch, dx, dx]
+    H, _ = ekf._jacobian(lgssm_3d.h, x)  # [batch, dy, dx]
 
     tf.debugging.assert_near(F, tf.broadcast_to(lgssm_3d.A[tf.newaxis, :, :], tf.shape(F)),
                              atol=1e-5, rtol=1e-5)

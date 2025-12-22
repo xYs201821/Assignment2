@@ -38,10 +38,39 @@ class SSM(tf.Module):
     def obs_dim(self):
         raise NotImplementedError
 
+    @property
+    def q_dim(self):
+        raise NotImplementedError
+
+    @property
+    def r_dim(self):
+        raise NotImplementedError
+
     @staticmethod
     def _weighted_mean(X, W=None, axis=1, normalize=True):
         return weighted_mean(X, W, axis=axis, normalize=normalize)
     
+    @staticmethod
+    def weighted_cov(X, W=None, axis=-2, mean_fn=None, residual_fn=None):
+        """
+        Weighted covariance over particles.
+        X: [..., num, dim]
+        W: [..., num] or [num]
+        returns: [..., dim, dim]
+        """
+        X = tf.convert_to_tensor(X, dtype=tf.float32)
+        if W is None:
+            W = tf.ones(tf.shape(X)[:-1], dtype=X.dtype)
+
+        W = tf.convert_to_tensor(W, dtype=X.dtype)
+        w_sum = tf.reduce_sum(W, axis=-1, keepdims=True)
+        Wn = tf.math.divide_no_nan(W, w_sum)
+
+        mean = mean_fn(X, Wn) if mean_fn is not None else weighted_mean(X, Wn, axis=axis)
+        resid = residual_fn(X, mean) if residual_fn is not None else X - mean[:, tf.newaxis, :]
+        cov = tf.einsum("...n,...ni,...nj->...ij", Wn, resid, resid)
+        return mean, cov
+
     def sample_initial_state(self, shape, return_log_prob=False, **kwargs):
         dist = self.initial_state_dist(shape, **kwargs)
         if dist is None:
@@ -79,22 +108,6 @@ class SSM(tf.Module):
     def h(self, x, **kwargs):
         """Observation function"""
         raise NotImplementedError
-    
-    def innovation(self, y, y_pred):
-        return y - y_pred
-
-    def measurement_mean(self, y, W=None, axis=-2): # [batch, n, dy], [n] -> [batch, dy]
-        """ compute weighted mean of observations """
-        return self._weighted_mean(y, W, axis=axis)
-
-    def measurement_residual(self, y, y_mean): # [batch, n, dy], [batch, dy] -> [batch, n, dy]
-        return y - y_mean[:, tf.newaxis, :]
-
-    def state_mean(self, x, W=None, axis=-2): # [batch, n, dx], [n] -> [batch, dx]
-        return self._weighted_mean(x, W, axis=axis)
-
-    def state_residual(self, x, x_mean): # [batch, n, dx], [batch, dx] -> [batch, n, dx]
-        return x - x_mean[:, tf.newaxis, :]
 
     def f_with_noise(self, x, q): # additive noise model
         return self.f(x) + q
@@ -128,6 +141,30 @@ class SSM(tf.Module):
         x_traj = tf.stack(x_traj, axis=1)  # [batch, T, dx]
         y_traj = tf.stack(y_traj, axis=1)  # [batch, T, dy]
         return x_traj, y_traj
+    
+    def innovation(self, y, y_pred):
+        return y - y_pred
+
+    def measurement_mean(self, y, W=None, axis=-2): # [batch, n, dy], [n] -> [batch, dy]
+        """ compute weighted mean of observations """
+        return self._weighted_mean(y, W, axis=axis)
+
+    def measurement_residual(self, y, y_mean): # [batch, n, dy], [batch, dy] -> [batch, n, dy]
+        return y - y_mean[..., tf.newaxis, :]
+
+    def state_mean(self, x, W=None, axis=-2): # [batch, n, dx], [n] -> [batch, dx]
+        return self._weighted_mean(x, W, axis=axis)
+
+    def state_residual(self, x, x_mean): # [batch, n, dx], [batch, dx] -> [batch, n, dx]
+        return x - x_mean[..., tf.newaxis, :]
+
+    def state_cov(self, x, W=None, axis=-2): # [..., n, dx], [n] -> [..., dx, dx]
+        _, cov = self.weighted_cov(x, W, axis=axis, mean_fn=self.state_mean, residual_fn=self.state_residual)
+        return cov
+
+    def measurement_cov(self, y, W=None, axis=-2): # [..., n, dy], [n] -> [..., dy, dy]
+        _, cov = self.weighted_cov(y, W, axis=axis, mean_fn=self.measurement_mean, residual_fn=self.measurement_residual)
+        return cov
 
 class LinearGaussianSSM(SSM):
     def __init__(self, A, B, C, D, m0, P0, seed=42):
@@ -148,11 +185,19 @@ class LinearGaussianSSM(SSM):
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
     @property   
     def state_dim(self):
-        return int(self.P0.shape[0])
+        return int(self.P0.shape[-1])
 
     @property
     def obs_dim(self):
-        return int(self.cov_eps_y.shape[0])
+        return int(self.cov_eps_y.shape[-1])
+
+    @property
+    def q_dim(self):
+        return int(self.B.shape[-1])
+
+    @property
+    def r_dim(self):
+        return int(self.D.shape[-1])
 
     def initial_state_dist(self, shape, **kwargs):
         loc = tf.broadcast_to(self.m0, tf.concat([shape, [self.state_dim]], axis=0))
@@ -214,6 +259,14 @@ class StochasticVolatilitySSM(SSM):
         
     @property
     def obs_dim(self):
+        return 1
+
+    @property
+    def q_dim(self):
+        return 1
+
+    @property
+    def r_dim(self):
         return 1
 
     def initial_state_dist(self, shape, **kwargs):
@@ -301,7 +354,15 @@ class RangeBearingSSM(SSM):
 
     @property
     def obs_dim(self):
-        return int(self.cov_eps_y.shape[0])
+        return int(self.cov_eps_y.shape[-1])
+
+    @property
+    def q_dim(self):
+        return int(self.cov_eps_x.shape[-1])
+
+    @property
+    def r_dim(self):
+        return int(self.cov_eps_y.shape[-1])
 
     def initial_state_dist(self, shape, **kwargs):
         shape = tf.convert_to_tensor(shape, tf.int32)
@@ -314,13 +375,7 @@ class RangeBearingSSM(SSM):
 
     def observation_dist(self, x, **kwargs):
         loc = self.h(x)
-        range_loc = loc[..., 0]
-        bearing_loc = loc[..., 1]
-        sigma_r = tf.sqrt(tf.maximum(self.cov_eps_y[0, 0], 1e-12))
-        kappa = 1.0 / tf.maximum(self.cov_eps_y[1, 1], 1e-12)
-        range_dist = tfd.Normal(loc=range_loc, scale=tf.ones_like(range_loc) * sigma_r)
-        bearing_dist = tfd.VonMises(loc=bearing_loc, concentration=tf.ones_like(bearing_loc) * kappa)
-        return tfd.Blockwise([range_dist, bearing_dist])
+        return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.Lr)
 
     # def sample_initial_state(self, shape):
     #     z0 = self.rng.normal(tf.concat([shape, [self.state_dim]], axis=0), mean=0.0, stddev=1.0)
@@ -340,8 +395,12 @@ class RangeBearingSSM(SSM):
         px = x[..., 0]
         py = x[..., 1]
 
-        rng = tf.sqrt(px**2 + py**2 + 1e-20)
-        bearing = self._wrap_angle(tf.atan2(py, px))
+        eps = tf.cast(1e-6, dtype = tf.float32)
+        rng_sq = px**2 + py**2
+        rng = tf.sqrt(rng_sq + eps)
+        px_safe = tf.where(rng_sq < eps, eps, px)
+        py_safe = tf.where(rng_sq < eps, tf.zeros_like(py), py)
+        bearing = tf.atan2(py_safe, px_safe)
         y = tf.stack([rng, bearing], axis=-1)
 
         return y

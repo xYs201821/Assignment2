@@ -10,7 +10,8 @@ class Proposal(tf.Module):
         raise NotImplementedError
 
     def sample(self, ssm, x_prev, y_t, seed=None):
-        return self.dist(ssm, x_prev, y_t).sample(seed=seed)
+        z = self.dist(ssm, x_prev, y_t).sample(seed=seed)
+        return z, self.log_prob(ssm, z, x_prev, y_t)
 
     def log_prob(self, ssm, x, x_prev, y_t):
         return self.dist(ssm, x_prev, y_t).log_prob(x)
