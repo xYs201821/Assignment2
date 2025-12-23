@@ -329,11 +329,11 @@ class StochasticVolatilitySSM(SSM):
 
 class RangeBearingSSM(SSM):
     
-    def __init__(self, motion_model, cov_eps_y, seed=42):
+    def __init__(self, motion_model, cov_eps_y, jitter=1e-12, seed=42):
         super().__init__(seed)
         assert isinstance(motion_model, MotionModel)
         self.motion_model = motion_model
-
+        self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
         self.m0 = tf.zeros([self.motion_model.state_dim], dtype=tf.float32)
         self.P0 = tf.eye(self.motion_model.state_dim, dtype=tf.float32)
         self.cov_eps_x = self.motion_model.cov_eps
@@ -395,11 +395,11 @@ class RangeBearingSSM(SSM):
         px = x[..., 0]
         py = x[..., 1]
 
-        eps = tf.cast(1e-6, dtype = tf.float32)
+       
         rng_sq = px**2 + py**2
-        rng = tf.sqrt(rng_sq + eps)
-        px_safe = tf.where(rng_sq < eps, eps, px)
-        py_safe = tf.where(rng_sq < eps, tf.zeros_like(py), py)
+        rng = tf.sqrt(rng_sq + self.jitter)
+        px_safe = tf.where(rng_sq < self.jitter, self.jitter, px)
+        py_safe = tf.where(rng_sq < self.jitter, tf.zeros_like(py), py)
         bearing = tf.atan2(py_safe, px_safe)
         y = tf.stack([rng, bearing], axis=-1)
 

@@ -18,6 +18,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         reweight="auto",
         init_from_particles="sample",
         debug=False,
+        jitter=1e-12,
     ):
         super().__init__(ssm, num_particles=num_particles, ess_threshold=ess_threshold)
         self.num_lambda = int(num_lambda)
@@ -26,7 +27,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         self.init_from_particles = init_from_particles
         self._ekf = ExtendedKalmanFilter(ssm)
         self.debug = bool(debug)
-
+        self.jitter = jitter
     @staticmethod
     def _validate_prior_stats(prior_stats):
         value = str(prior_stats)
@@ -65,9 +66,8 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         m_flow_flat = tf.reshape(m_flow, tf.stack([batch_size, state_dim]))
         P_pred_flat = tf.reshape(P_pred, tf.stack([batch_size, state_dim, state_dim]))
         eye = tf.eye(state_dim, batch_shape=tf.shape(P_pred_flat)[:-2], dtype=P_pred_flat.dtype)
-        jitter = tf.cast(1e-6, P_pred_flat.dtype)
         P_pred_flat = tf.where(tf.math.is_finite(P_pred_flat), P_pred_flat, tf.zeros_like(P_pred_flat))
-        P_pred_flat = P_pred_flat + eye * jitter
+        P_pred_flat = P_pred_flat + eye * self.jitter
         y_flat = tf.reshape(y_t, tf.stack([batch_size, obs_dim]))
         m_filt_flat, P_filt_flat, _, _ = self._ekf.update(
             m_flow_flat,

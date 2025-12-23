@@ -13,6 +13,7 @@ class LEDHFlow(FlowBase):
         prior_stats="ekf",
         reweight="auto",
         debug=False,
+        jitter=1e-12,
     ):
         super().__init__(
             ssm,
@@ -169,9 +170,8 @@ class LEDHFlow(FlowBase):
             tf.stack([batch_size * self.num_particles, state_dim, state_dim]),
         )
         eye = tf.eye(state_dim, batch_shape=tf.shape(P_pred_flat)[:-2], dtype=P_pred_flat.dtype)
-        jitter = tf.cast(1e-6, P_pred_flat.dtype)
         P_pred_flat = tf.where(tf.math.is_finite(P_pred_flat), P_pred_flat, tf.zeros_like(P_pred_flat))
-        P_pred_flat = P_pred_flat + eye * jitter
+        P_pred_flat = P_pred_flat + eye * self.jitter
         y_flat = tf.reshape(y_broadcast, tf.stack([batch_size * self.num_particles, -1]))
         m_filt_flat, P_filt_flat, _, _ = self._ekf.update(
             x_t_flat,

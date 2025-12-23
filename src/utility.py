@@ -4,19 +4,17 @@ import numpy as np
 import tensorflow_probability as tfp
 
 
-def tf_cond(M): # find condition number of M in tensorflow, [batch, n, n] -> [batch]
+def tf_cond(M, jitter=1e-12): # find condition number of M in tensorflow, [batch, n, n] -> [batch]
     M = tf.convert_to_tensor(M)
     tf.debugging.assert_all_finite(M, "tf_cond received NaN/Inf in input matrix")
     M_sym = (M + tf.linalg.matrix_transpose(M)) / 2.0
     eye = tf.eye(tf.shape(M_sym)[-1], batch_shape=tf.shape(M_sym)[:-2], dtype=M_sym.dtype)
-    jitter = tf.cast(1e-8, M_sym.dtype)
     M_sym = M_sym + eye * jitter
     M_sym = tf.where(tf.math.is_finite(M_sym), M_sym, tf.zeros_like(M_sym))
     evals = tf.linalg.eigvalsh(M_sym)
     e_max = tf.reduce_max(evals, axis=-1)
     e_min = tf.reduce_min(evals, axis=-1)
-    eps = tf.cast(1e-20, M_sym.dtype)
-    return e_max / (e_min + eps)
+    return e_max / (e_min + jitter)
 
 def quadratic_matmul(A, B, C):
     """
@@ -25,7 +23,7 @@ def quadratic_matmul(A, B, C):
     AB = tf.linalg.matmul(A, B)
     return tf.linalg.matmul(AB, C, transpose_b=True)
 
-def cholesky_solve(A, B, eps=0.0):
+def cholesky_solve(A, B, jitter=1e-12):
     """
     Solves AX = B using Cholesky decomposition.
     """
@@ -39,8 +37,7 @@ def cholesky_solve(A, B, eps=0.0):
 
     A_sym = (A + tf.linalg.matrix_transpose(A)) / 2.0
     eye = tf.eye(tf.shape(A_sym)[-1], batch_shape=tf.shape(A_sym)[:-2], dtype=A_sym.dtype)
-    jitter = tf.cast(1e-8, A_sym.dtype)
-    A_robust = A_sym + eye * (eps + jitter)
+    A_robust = A_sym + eye * jitter
     L = tf.linalg.cholesky(A_robust)
     Y = tf.linalg.triangular_solve(L, B, lower=True)
     X = tf.linalg.triangular_solve(tf.linalg.matrix_transpose(L), Y, lower=False)

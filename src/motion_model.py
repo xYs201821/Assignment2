@@ -47,7 +47,7 @@ class ConstantVelocityMotionModel(MotionModel):
             Q_v = cov_eps  # only velocity noise
             zeros = tf.zeros((tf.shape(self.v)[-1], tf.shape(self.v)[-1]), tf.float32)
             self.cov_eps = tf.concat([
-                tf.concat([1e-32 * tf.eye(tf.shape(self.v)[-1], dtype=tf.float32), zeros], axis=1),
+                tf.concat([self.jitter * tf.eye(tf.shape(self.v)[-1], dtype=tf.float32), zeros], axis=1),
                 tf.concat([zeros, Q_v], axis=1)
             ], axis=0)
         else:
@@ -66,10 +66,10 @@ class ConstantVelocityMotionModel(MotionModel):
 class ConstantTurnRateMotionModel(MotionModel):
     """Standard CTRV state: [x, y, v, psi, omega]."""
 
-    def __init__(self, dt, cov_eps, seed=42, eps=1e-12):
+    def __init__(self, dt, cov_eps, seed=42, jitter=1e-12):
         super().__init__(seed)
         self.dt = tf.convert_to_tensor(dt, dtype=tf.float32)
-        self.eps = tf.convert_to_tensor(eps, dtype=tf.float32)
+        self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
         cov_eps = tf.convert_to_tensor(cov_eps, dtype=tf.float32)
         if cov_eps.shape[0] == 5:
             self.cov_eps = cov_eps
@@ -87,7 +87,7 @@ class ConstantTurnRateMotionModel(MotionModel):
             self.cov_eps = tf.tensor_scatter_nd_update(zeros, indices, updates)
         else:
             raise ValueError("cov_eps must be [5,5] or [3,3] for ConstantTurnRateMotionModel")
-        self.cov_eps = self.cov_eps + self.eps * tf.eye(5, dtype=tf.float32)
+        self.cov_eps = self.cov_eps + self.jitter * tf.eye(5, dtype=tf.float32)
         self.Lq = tf.linalg.cholesky(self.cov_eps)
 
     @property
@@ -105,7 +105,7 @@ class ConstantTurnRateMotionModel(MotionModel):
         omega_dt = omega * dt
         psi_next = psi + omega_dt
 
-        small_turn = tf.abs(omega) < self.eps
+        small_turn = tf.abs(omega) < self.jitter
         cos_psi = tf.cos(psi)
         sin_psi = tf.sin(psi)
         cos_psi_next = tf.cos(psi_next)
