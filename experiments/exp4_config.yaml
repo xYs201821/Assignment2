@@ -1,0 +1,48 @@
+experiment:
+  output_root: results/exp4_lorenz96
+  T: 40
+  batch_size: 1
+  seeds: [42, ]
+  pair_particles: true
+model:
+  dims: [40, 200, 1000]
+  obs_ratios: [0.5, 0.25, 0.1]
+  obs_ops: [linear, abs, square]
+  dt: 0.05
+  F: 8.0
+  q_scale: 0.1
+  r_scale: 0.5
+  x0: 8.0
+  x0_noise: 0.01
+filters:
+  methods: [ekf, ukf, pf, edh, ledh, kflow_scalar, kflow_diag]
+  ukf:
+    alpha: 1e-3
+    beta: 2.0
+    kappa: 0.0
+    jitter: 1e-6
+  pf:
+    num_particles: [10000]
+    ess_threshold: 0.5
+    reweight: auto
+  flow:
+    num_particles: [500]
+    num_lambda: 20
+    ess_threshold: 0.5
+    reweight: never
+  kflow:
+    optimizer: [none]
+    optimizer_eps: [1e-6]
+    optimizer_beta_1: [0.9]
+    optimizer_beta_2: [0.999]
+    num_particles: [100]
+    num_lambda: [20]
+    alpha: [median]
+    ll_grad_mode: [linearized]
+    alpha_update_every: [1]
+    ds_init: [0.05]
+    max_flow_norm: [null]
+    localization_radius: [null]
+metrics:
+  rmse_energy: true
+  rmse_final: true

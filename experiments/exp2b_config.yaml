@@ -1,0 +1,56 @@
+experiment:
+  output_root: results/exp2b_range_bearing
+  T: 100
+  batch_size: 10
+  seeds: [123, ]
+  pair_particles: true
+  save_particles_seed0: false
+  plot_state: true
+  plot_seed0_only: true
+  show_plots: true
+  plot_interactive: true
+  plot_time_gap: 5
+model:
+  dt: 0.1
+  cov_eps:
+    - [0.01, 0.0, 0.0, 0.0]
+    - [0.0, 0.01, 0.0, 0.0]
+    - [0.0, 0.0, 0.01, 0.0]
+    - [0.0, 0.0, 0.0, 0.01]
+  jitter: 1e-6
+  distances: [0.5]
+  sigma_thetas: [3.0]
+  sigma_rs: [0.1]
+filters:
+  methods: [ekf, ukf, pf, edh, ledh, kflow_diag, kflow_scalar]
+  ukf:
+    alpha: 5e-1
+    beta: 2.0
+    kappa: 0.0
+    jitter: 1e-6
+  pf:
+    num_particles: [10000]
+    ess_threshold: 0.5
+    reweight: always
+  flow:
+    num_particles: [200]
+    num_lambda: 20
+    ess_threshold: 0.5
+    reweight: never
+  kflow:
+    optimizer: [adam]
+    optimizer_eps: [1e-6]
+    optimizer_beta_1: [0.9]
+    optimizer_beta_2: [0.999]
+    num_particles: [100]
+    num_lambda: [40]
+    alpha: [median]
+    ll_grad_mode: [dist]
+    alpha_update_every: [2]
+    ds_init: [0.01]
+    max_flow_norm: [5.0]
+    localization_radius: [4.0]
+init:
+  x0: [1., .9, -.1, -.1]
+  m0_offset: [-.5, .5, 0.0, 0.0]
+  P0_diag: [1.0, 1.0, .5, .5]

@@ -1,0 +1,73 @@
+experiment:
+  output_root: results/exp3_multitarget_acoustic
+  T: 40
+  batch_size: 10
+  seeds: [42, ]
+  pair_particles: true
+  plot_state: true
+  plot_seed0_only: true
+  plot_pf_particles: false
+  show_plots: true
+model:
+  area_size: 40.0
+  targets: [4]
+  grid_size: 5
+  sigma_ws: [0.05,]
+  dt: 1.0
+  Psi: 10.0
+  d0: 0.1
+  init_targets: 
+  - [12.0, 6.0, 0.001, 0.001]
+  - [32.0, 33.0, -0.001, -0.005]
+  - [20.0, 15.0, -0.1, 0.01]
+  - [15.0, 35.0, 0.002, 0.002]
+  init_pos_std: 1.0
+  init_vel_std: 0.1
+  cov_eps_x: 
+  - [0.0333, 0.0, 0.025, 0.0]
+  - [0.0, 0.0333, 0.0, 0.025]
+  - [0.025, 0.0, 0.05, 0.0] 
+  - [0.0, 0.025, 0.0, 0.05]
+filters:
+  methods: [ekf, ukf, pf, edh, ledh, kflow_diag, kflow_scalar]
+  ukf:
+    alpha: 3e-1
+    beta: 2.0
+    kappa: 0.0
+    jitter: 1e-6
+  pf:
+    num_particles: [100000]
+    ess_threshold: 0.5
+    reweight: auto
+  flow:
+    num_particles: [500]
+    num_lambda: 25
+    ess_threshold: 0.5
+    reweight: never
+  kflow:
+    optimizer: [adam]
+    optimizer_eps: [1e-6]
+    optimizer_beta_1: [0.9]
+    optimizer_beta_2: [0.999]
+    num_particles: [100]
+    num_lambda: [25]
+    alpha: [median]
+    ll_grad_mode: [linearized]
+    alpha_update_every: [1]
+    ds_init: [0.05]
+    max_flow_norm: [5.0]
+    localization_radius: [null]
+metrics:
+  base:
+    rmse_obs: false
+    rmse_unobs: false
+    rmse_y: false
+    nll: false
+    nees: false
+    nis: false
+    ess: false
+    coverage_sigmas: null
+    rank_hist: false
+  ospa_cutoff: 20.0
+  ospa_p: 1.0
+  ospa_percentiles: [50, 90]

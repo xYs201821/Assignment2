@@ -1,0 +1,52 @@
+experiment:
+  output_root: results/exp2a_stochastic_vol
+  T: 60
+  batch_size: 10
+  seeds: [42, ]
+  pair_particles: true
+  calc_ekf_jacobian_error: false
+  plot_state: true
+  plot_seed0_only: true
+  show_plots: true
+  plot_interactive: true
+  plot_time_gap: 5
+model:
+  alpha: 0.99
+  mu: 0.01
+  noise_scale_func: false
+  obs_eps: 1e-16
+  betas: [2.0]
+  sigmas: [0.6]
+  obs_modes: [logy2, ]
+filters:
+  methods: [ekf, ukf, pf, edh, ledh, kflow_diag, kflow_scalar]
+  ukf:
+    alpha: 1e-1
+    beta: 2.0
+    kappa: 0.0
+    jitter: 1e-6
+  pf:
+    num_particles: [1000]
+    ess_threshold: 0.5
+    reweight: always
+  flow:
+    num_particles: [200]
+    num_lambda: 20
+    ess_threshold: 0.5
+    reweight: never
+  kflow:
+    optimizer: [adam]
+    optimizer_eps: [1e-6]
+    optimizer_beta_1: [0.9]
+    optimizer_beta_2: [0.999]
+    num_particles: [100]
+    num_lambda: [40]
+    alpha: [0.05]
+    ll_grad_mode: [dist]
+    alpha_update_every: [40]
+    ds_init: [0.1]
+    max_flow_norm: [5.0]
+    localization_radius: [null]
+init:
+  m0: [0.0]
+  P0: [[1.0]]
