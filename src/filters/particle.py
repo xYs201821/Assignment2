@@ -29,17 +29,37 @@ class ParticleFilter(BaseFilter):
             self.num_particles = int(num_particles)
         if ess_threshold is not None:
             self.ess_threshold = tf.convert_to_tensor(ess_threshold, tf.float32)
-        
-    def _init_particles(self, y, init_dist):
+
+    @staticmethod
+    def _normalize_init_seed(seed):
+        if seed is None:
+            return None
+        if isinstance(seed, (tuple, list)) and len(seed) == 2:
+            return tf.convert_to_tensor(seed, dtype=tf.int32)
+        seed = tf.convert_to_tensor(seed, dtype=tf.int32)
+        if seed.shape.rank == 1 and seed.shape[0] == 2:
+            return seed
+        if seed.shape.rank == 0:
+            return tf.stack([seed, tf.constant(0, dtype=seed.dtype)])
+        seed = tf.reshape(seed, [-1])
+        return tf.stack([seed[0], tf.constant(0, dtype=seed.dtype)])
+    def _init_particles(self, y, init_dist, init_seed=None):
         batch_shape = tf.shape(y)[:-2]
         N = self.num_particles
+        seed = self._normalize_init_seed(init_seed)
         if init_dist is None:
-            x = self.ssm.sample_initial_state(tf.concat([batch_shape, [N]], axis=0), return_log_prob=False)
+            shape = tf.concat([batch_shape, [N]], axis=0)
+            if seed is None:
+                x = self.ssm.sample_initial_state(shape, return_log_prob=False)
+            else:
+                dist = self.ssm.initial_state_dist(shape)
+                x = tf.cast(dist.sample(seed=seed), dtype=tf.float32)
         else:
             if not callable(init_dist):
                 raise TypeError("init_dist must be a callable: init_dist(shape) -> tfd.Distribution")
             dist = init_dist(tf.concat([batch_shape, [N]], axis=0))
-            x = tf.cast(dist.sample(seed=self.ssm._tfp_seed()), dtype=tf.float32)
+            sample_seed = self.ssm._tfp_seed() if seed is None else seed
+            x = tf.cast(dist.sample(seed=sample_seed), dtype=tf.float32)
         log_w = -tf.math.log(tf.cast(N, tf.float32)) * tf.ones(tf.concat([batch_shape, [N]], axis=0), tf.float32)
         parent_indices = tf.broadcast_to(
             tf.range(N, dtype=tf.int32),

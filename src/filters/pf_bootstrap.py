@@ -79,6 +79,7 @@ class BootstrapParticleFilter(ParticleFilter):
         ess_threshold=None,
         resample="auto",
         init_dist=None,
+        init_seed=None,
         memory_sampler=None,
     ):
         self.update_params(num_particles, ess_threshold)
@@ -86,7 +87,7 @@ class BootstrapParticleFilter(ParticleFilter):
         resample = self._normalize_reweight(resample)
 
         T = int(y.shape[1])
-        x_prev, log_w, parent_indices = self._init_particles(y, init_dist)
+        x_prev, log_w, parent_indices = self._init_particles(y, init_dist, init_seed=init_seed)
 
         x_ta = tf.TensorArray(tf.float32, size=T)
         x_pred_ta = tf.TensorArray(tf.float32, size=T)

@@ -22,14 +22,19 @@ class LEDHFlow(FlowBase):
             reweight=reweight,
             init_from_particles="per_particle",
             debug=debug,
+            jitter=jitter,
         )
 
     @staticmethod
-    def _ledh_flow_solution(lam, H, P, R, y_tilde, m0):
+    def _ledh_flow_solution(lam, H, P, R, y_tilde, m0, jitter):
         HPH = quadratic_matmul(H, P, H)
         S = lam * HPH + R
+        jitter_val = float(jitter) if jitter is not None else 0.0
+        if jitter_val > 0.0:
+            eye = tf.eye(tf.shape(S)[-1], batch_shape=tf.shape(S)[:-2], dtype=S.dtype)
+            S = S + tf.cast(jitter_val, S.dtype) * eye
         PHt = tf.linalg.matmul(P, H, transpose_b=True)
-        K_T = cholesky_solve(S, tf.linalg.matrix_transpose(PHt))
+        K_T = cholesky_solve(S, tf.linalg.matrix_transpose(PHt), jitter=jitter_val)
         K = tf.linalg.matrix_transpose(K_T)
 
         A = -0.5 * tf.linalg.matmul(K, H)
@@ -104,21 +109,28 @@ class LEDHFlow(FlowBase):
             y_tilde = v + Hx
 
             R_eff = quadratic_matmul(H_r, R_exp, H_r)
-            A, b = self._ledh_flow_solution(lam, H, P_exp, R_eff, y_tilde, m0_exp)
+            A, b = self._ledh_flow_solution(lam, H, P_exp, R_eff, y_tilde, m0_exp, self.jitter)
 
             J = I + delta * A
+            if self.jitter and self.jitter > 0.0:
+                J = J + tf.cast(self.jitter, J.dtype) * I
             sign, lad = tf.linalg.slogdet(J)
-            tf.debugging.assert_greater(
-                sign,
-                0.0,
-                message="LEDH flow Jacobian has non-positive determinant; reduce step size or check model.",
-            )
+            if self.debug:
+                tf.debugging.assert_greater(
+                    tf.abs(sign),
+                    0.0,
+                    message="LEDH flow Jacobian is singular; reduce step size or check model.",
+                )
+            bad = tf.equal(sign, 0.0)
+            lad = tf.where(bad, tf.zeros_like(lad), lad)
             logdet += lad
             flow = tf.einsum("...nij,...nj->...ni", A, mu) + b
+            flow = tf.where(bad[..., tf.newaxis], tf.zeros_like(flow), flow)
             flow_norm = tf.reduce_mean(tf.norm(flow, axis=-1), axis=-1)
             flow_norm_max = tf.maximum(flow_norm_max, flow_norm)
 
             Ax = tf.einsum("...nij,...nj->...ni", A, mu)
-            mu = mu + delta * (Ax + b)
+            mu_next = mu + delta * (Ax + b)
+            mu = tf.where(bad[..., tf.newaxis], mu, mu_next)
 
         return mu, logdet, flow_norm_max

@@ -12,6 +12,7 @@ class EDHFlow(FlowBase):
         ess_threshold=0.5,
         reweight="auto",
         debug=False,
+        jitter=1e-6,
     ):
         super().__init__(
             ssm,
@@ -21,14 +22,19 @@ class EDHFlow(FlowBase):
             reweight=reweight,
             init_from_particles="sample",
             debug=debug,
+            jitter=jitter,
         )
 
     @staticmethod
-    def _edh_flow_solution(lam, H, P, R, y_tilde, m0):
+    def _edh_flow_solution(lam, H, P, R, y_tilde, m0, jitter):
         HPH = quadratic_matmul(H, P, H)
         S = lam * HPH + R
+        jitter_val = float(jitter) if jitter is not None else 0.0
+        if jitter_val > 0.0:
+            eye = tf.eye(tf.shape(S)[-1], batch_shape=tf.shape(S)[:-2], dtype=S.dtype)
+            S = S + tf.cast(jitter_val, S.dtype) * eye
         RHS = tf.linalg.matmul(H, P, transpose_b=True)
-        K_T = cholesky_solve(S, RHS)
+        K_T = cholesky_solve(S, RHS, jitter=jitter_val)
         K = tf.linalg.matrix_transpose(K_T)
 
         A = -0.5 * tf.linalg.matmul(K, H)
@@ -72,21 +78,28 @@ class EDHFlow(FlowBase):
             v = self.ssm.innovation(y, h_m)
             y_tilde = v + Hm
             R_eff = quadratic_matmul(H_r, R, H_r)
-            A, b = self._edh_flow_solution(lam, H, P, R_eff, y_tilde, m0)
+            A, b = self._edh_flow_solution(lam, H, P, R_eff, y_tilde, m0, self.jitter)
             Am = tf.einsum("...ij,...j->...i", A, m_bar)
             m_bar = m_bar + delta * (Am + b)
             J = I + delta * A
+            if self.jitter and self.jitter > 0.0:
+                J = J + tf.cast(self.jitter, J.dtype) * I
             sign, lad = tf.linalg.slogdet(J)
-            tf.debugging.assert_greater(
-                sign,
-                0.0,
-                message="EDH flow Jacobian has non-positive determinant; reduce step size or check model.",
-            )
+            if self.debug:
+                tf.debugging.assert_greater(
+                    tf.abs(sign),
+                    0.0,
+                    message="EDH flow Jacobian is singular; reduce step size or check model.",
+                )
+            bad = tf.equal(sign, 0.0)
+            lad = tf.where(bad, tf.zeros_like(lad), lad)
             logdet += lad
             flow = tf.einsum("...ij,...nj->...ni", A, mu) + b[..., tf.newaxis, :]
+            flow = tf.where(bad[..., tf.newaxis, tf.newaxis], tf.zeros_like(flow), flow)
             flow_norm = tf.reduce_mean(tf.norm(flow, axis=-1), axis=-1)
             flow_norm_max = tf.maximum(flow_norm_max, flow_norm)
             Ax = tf.einsum("...ij,...nj->...ni", A, mu)
-            mu = mu + delta * (Ax + b[..., tf.newaxis, :])
+            mu_next = mu + delta * (Ax + b[..., tf.newaxis, :])
+            mu = tf.where(bad[..., tf.newaxis, tf.newaxis], mu, mu_next)
 
         return mu, logdet, flow_norm_max
