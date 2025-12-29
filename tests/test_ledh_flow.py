@@ -19,10 +19,9 @@ def test_ledh_flow_runs(lgssm_2d):
     assert x_particles.shape == (batch_size, T, N, dx)
     assert w.shape == (batch_size, T, N)
     assert parent_indices.shape == (batch_size, T, N)
-    assert diagnostics["ess"].shape == (batch_size, T)
-    assert diagnostics["logZ"].shape == (batch_size, T)
-
-    assert_all_finite(x_particles, w, diagnostics["ess"], diagnostics["logZ"])
+    tf.debugging.assert_equal(tf.shape(diagnostics["step_time_s"])[0], T)
+    ess = 1.0 / tf.reduce_sum(tf.square(w), axis=-1)
+    assert_all_finite(x_particles, w, ess, diagnostics["step_time_s"])
 
     tf.debugging.assert_near(
         tf.reduce_sum(w, axis=-1),

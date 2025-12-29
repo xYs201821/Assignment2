@@ -31,6 +31,6 @@ def test_range_bearing_ssm(range_bearing_ssm):
 
     # bearing in [-pi, pi]
     pi = tf.constant(np.pi, dtype=tf.float32)
-    bearing_innov = range_bearing_ssm.innovation(bearing, range_bearing_ssm.h(x_traj)[..., 1])
+    bearing_innov = range_bearing_ssm.innovation(y_traj, range_bearing_ssm.h(x_traj))[..., 1]
     assert tf.reduce_max(bearing_innov) <= pi
     assert tf.reduce_min(bearing_innov) >= -pi

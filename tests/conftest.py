@@ -78,10 +78,9 @@ def sv_model_logy2():
 @pytest.fixture
 def constant_velocity_motion_model():
     """Constant Velocity Motion Model"""
-    v = tf.constant([1.0, 0.7], dtype=tf.float32)
     dt = 0.1
-    cov_eps = 0.0001*np.eye(2, dtype=np.float32)  # small perturabtion of velocity
-    return ConstantVelocityMotionModel(v=v, dt=dt, cov_eps=cov_eps)
+    cov_eps = np.diag([0.0, 0.0, 0.0001, 0.0001]).astype(np.float32)
+    return ConstantVelocityMotionModel(dt=dt, cov_eps=cov_eps)
 
 
 @pytest.fixture

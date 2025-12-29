@@ -11,8 +11,8 @@ def test_particle_filter_runs(sv_model):
 
     _, y_traj = sv_model.simulate(T=T, shape=(batch_size,))
 
-    pf = BootstrapParticleFilter(sv_model, num_particles=200, ess_threshold=0.5)
-    x_particles, w, diagnostics, parent_indices = pf.filter(y_traj, reweight=True)
+    pf = BootstrapParticleFilter(sv_model, num_particles=200, ess_threshold=0.5, resample="always")
+    x_particles, w, diagnostics, parent_indices = pf.filter(y_traj)
 
     dx = sv_model.state_dim
     N = pf.num_particles
@@ -20,10 +20,10 @@ def test_particle_filter_runs(sv_model):
     assert x_particles.shape == (batch_size, T, N, dx)
     assert w.shape == (batch_size, T, N)
     assert parent_indices.shape == (batch_size, T, N)
-    assert diagnostics["ess"].shape == (batch_size, T)
-    assert diagnostics["logZ"].shape == (batch_size, T)
+    tf.debugging.assert_equal(tf.shape(diagnostics["step_time_s"])[0], T)
 
-    assert_all_finite(x_particles, w, diagnostics["ess"], diagnostics["logZ"])
+    ess = 1.0 / tf.reduce_sum(tf.square(w), axis=-1)
+    assert_all_finite(x_particles, w, ess, diagnostics["step_time_s"])
 
     tf.debugging.assert_near(
         tf.reduce_sum(w, axis=-1),
@@ -33,7 +33,6 @@ def test_particle_filter_runs(sv_model):
     )
     tf.debugging.assert_greater_equal(tf.reduce_min(w), 0.0)
 
-    ess = diagnostics["ess"]
     N_float = tf.cast(N, ess.dtype)
     tf.debugging.assert_greater_equal(tf.reduce_min(ess), 1.0 - 1e-3)
     tf.debugging.assert_less_equal(tf.reduce_max(ess), N_float + 1e-3)
@@ -45,13 +44,13 @@ def test_particle_filter_sv_compares(sv_model):
 
     x_traj, y_traj = sv_model.simulate(T=T, shape=(batch_size,))
 
-    pf = BootstrapParticleFilter(sv_model, num_particles=500, ess_threshold=0.5)
-    x_particles, w, _, _ = pf.filter(y_traj, reweight=True)
+    pf = BootstrapParticleFilter(sv_model, num_particles=500, ess_threshold=0.5, resample="always")
+    x_particles, w, _, _ = pf.filter(y_traj)
 
-    ekf = ExtendedKalmanFilter(sv_model)
-    ekf_out = ekf.filter(y_traj, joseph=True)
-    ukf = UnscentedKalmanFilter(sv_model)
-    ukf_out = ukf.filter(y_traj, joseph=True)
+    ekf = ExtendedKalmanFilter(sv_model, joseph=True)
+    ekf_out = ekf.filter(y_traj)
+    ukf = UnscentedKalmanFilter(sv_model, joseph=True)
+    ukf_out = ukf.filter(y_traj)
     x_true = x_traj
     x_pf = weighted_mean(x_particles, w, axis=-2)
     x_ekf = ekf_out["m_filt"]
@@ -72,8 +71,8 @@ def test_pf_matches_kf_on_lgssm(lgssm_3d, sim_data_3d, tfp_ref_3d):
     m_tfp, _ = tfp_ref_3d
     m_ref = m_tfp[:T]
 
-    pf = BootstrapParticleFilter(lgssm_3d, num_particles=800, ess_threshold=0.5)
-    x_particles, w, _, _ = pf.filter(y, reweight="always")
+    pf = BootstrapParticleFilter(lgssm_3d, num_particles=800, ess_threshold=0.5, resample="always")
+    x_particles, w, _, _ = pf.filter(y)
 
     x_mean = weighted_mean(x_particles, w, axis=-2)
     mse_pf = tf.reduce_mean((x_mean - x_true) ** 2)
@@ -91,13 +90,13 @@ def test_particle_filter_range_bearing_compares(range_bearing_ssm):
 
     x_traj, y_traj = rb.simulate(T=T, shape=(batch_size,))
 
-    pf = BootstrapParticleFilter(rb, num_particles=800, ess_threshold=0.5)
-    x_particles, w, _, _ = pf.filter(y_traj, reweight=True)
+    pf = BootstrapParticleFilter(rb, num_particles=800, ess_threshold=0.5, resample="always")
+    x_particles, w, _, _ = pf.filter(y_traj)
 
-    ekf = ExtendedKalmanFilter(rb)
-    ukf = UnscentedKalmanFilter(rb)
-    ekf_out = ekf.filter(y_traj, joseph=True)
-    ukf_out = ukf.filter(y_traj, joseph=True)
+    ekf = ExtendedKalmanFilter(rb, joseph=True)
+    ukf = UnscentedKalmanFilter(rb, joseph=True)
+    ekf_out = ekf.filter(y_traj)
+    ukf_out = ukf.filter(y_traj)
 
     x_true = x_traj
     x_pf = weighted_mean(x_particles, w, axis=-2)

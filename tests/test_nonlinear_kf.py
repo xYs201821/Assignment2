@@ -7,8 +7,8 @@ def test_ekf_matches_tfp_on_linear(lgssm_3d, sim_data_3d, tfp_ref_3d):
     _, y = sim_data_3d["x_traj"], sim_data_3d["y_traj"]
     m_tfp, P_tfp = tfp_ref_3d   
 
-    ekf = ExtendedKalmanFilter(lgssm_3d)
-    out = ekf.filter(y, joseph=True)
+    ekf = ExtendedKalmanFilter(lgssm_3d, joseph=True)
+    out = ekf.filter(y)
 
     m = out["m_filt"][0]   # [T, dx]
     P = out["P_filt"][0]   # [T, dx, dx]
@@ -21,8 +21,8 @@ def test_ukf_matches_tfp_on_linear(lgssm_3d, sim_data_3d, tfp_ref_3d):
     _, y = sim_data_3d["x_traj"], sim_data_3d["y_traj"]
     m_tfp, P_tfp = tfp_ref_3d  
 
-    ukf = UnscentedKalmanFilter(lgssm_3d, alpha=1e-1) # use a larger alpha to make UKF more accurate for linear system
-    out = ukf.filter(y, joseph=True)
+    ukf = UnscentedKalmanFilter(lgssm_3d, alpha=1e-1, joseph=True) # use a larger alpha to make UKF more accurate for linear system
+    out = ukf.filter(y)
 
     m = out["m_filt"][0]   # [T, dx]
     P = out["P_filt"][0]   # [T, dx, dx]
@@ -70,14 +70,14 @@ def test_sv_ekf_ukf_runs(sv_model):
 
     _, y = sv.simulate(T=30, shape=(2, ))
 
-    ekf = ExtendedKalmanFilter(sv)
-    ukf = UnscentedKalmanFilter(sv)
+    ekf = ExtendedKalmanFilter(sv, joseph=True)
+    ukf = UnscentedKalmanFilter(sv, joseph=True)
 
-    out_e = ekf.filter(y, joseph=True)
-    out_u = ukf.filter(y, joseph=True)
+    out_e = ekf.filter(y)
+    out_u = ukf.filter(y)
 
-    assert_all_finite(out_e["m_filt"], out_e["P_filt"], out_e["cond_P"], out_e["cond_S"])
-    assert_all_finite(out_u["m_filt"], out_u["P_filt"], out_u["cond_P"], out_u["cond_S"])
+    assert_all_finite(out_e["m_filt"], out_e["P_filt"], out_e["cond_P"])
+    assert_all_finite(out_u["m_filt"], out_u["P_filt"], out_u["cond_P"])
 
     assert_symmetric(out_e["P_filt"])
     assert_symmetric(out_u["P_filt"])
@@ -95,14 +95,14 @@ def test_range_bearing_ekf_ukf_runs(range_bearing_ssm):
 
     _, y = rb.simulate(T=30, shape=(2, ))
 
-    ekf = ExtendedKalmanFilter(rb)
-    ukf = UnscentedKalmanFilter(rb)
+    ekf = ExtendedKalmanFilter(rb, joseph=True)
+    ukf = UnscentedKalmanFilter(rb, alpha=1e-1, joseph=True)
 
-    out_e = ekf.filter(y, joseph=True)
-    out_u = ukf.filter(y, joseph=True)
+    out_e = ekf.filter(y)
+    out_u = ukf.filter(y)
 
-    assert_all_finite(out_e["m_filt"], out_e["P_filt"], out_e["cond_P"], out_e["cond_S"])
-    assert_all_finite(out_u["m_filt"], out_u["P_filt"], out_u["cond_P"], out_u["cond_S"])
+    assert_all_finite(out_e["m_filt"], out_e["P_filt"], out_e["cond_P"])
+    assert_all_finite(out_u["m_filt"], out_u["P_filt"], out_u["cond_P"])
 
     assert_symmetric(out_e["P_filt"])
     assert_symmetric(out_u["P_filt"])

@@ -1,7 +1,15 @@
 # tests/test_lgssm.py
+import inspect
 import tensorflow as tf
 from src.filter import KalmanFilter
 from tests.testhelper import assert_all_finite
+
+def _kalman_filter(kalman, y_traj, joseph=True):
+    if "joseph" in inspect.signature(kalman.filter).parameters:
+        return kalman.filter(y_traj, joseph=joseph)
+    if not joseph:
+        kalman.update = kalman.update_naive
+    return kalman.filter(y_traj)
 
 def test_lgssm_simulate_shapes_and_nan(lgssm_2d):
     """Basic sanity check for LinearGaussianSSM.simulate."""
@@ -37,7 +45,7 @@ def test_kalman_filter_close_to_tfp(lgssm_3d, sim_data_3d, tfp_ref_3d):
 
     # Our Kalman filter (Joseph form)
     kalman = KalmanFilter(lgssm_3d)
-    res = kalman.filter(y_traj, joseph=True)
+    res = _kalman_filter(kalman, y_traj, joseph=True)
     m_filt = res["m_filt"][0]        # [T, dx]
     P_filt = res["P_filt"][0]        # [T, dx, dx]
 
@@ -62,9 +70,10 @@ def test_kalman_filter_joseph_and_std(lgssm_3d, sim_data_3d):
     """
     y_traj = sim_data_3d["y_traj"]
 
-    kalman = KalmanFilter(lgssm_3d)
-    res_j = kalman.filter(y_traj, joseph=True)
-    res_s = kalman.filter(y_traj, joseph=False)
+    kalman_j = KalmanFilter(lgssm_3d)
+    kalman_s = KalmanFilter(lgssm_3d)
+    res_j = _kalman_filter(kalman_j, y_traj, joseph=True)
+    res_s = _kalman_filter(kalman_s, y_traj, joseph=False)
 
     m_j = res_j["m_filt"][0]   # [T, dx]
     m_s = res_s["m_filt"][0]
