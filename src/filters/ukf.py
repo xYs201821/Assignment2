@@ -5,17 +5,37 @@ from src.utility import block_diag, cholesky_solve, quadratic_matmul, tf_cond, w
 
 
 class UnscentedKalmanFilter(GaussianFilter):
-    def __init__(self, ssm, alpha=1e-3, beta=2.0, kappa=0.0, debug=False, print=False):
-        super().__init__(ssm, debug=debug, print=print)
+    def __init__(
+        self,
+        ssm,
+        alpha=1e-3,
+        beta=2.0,
+        kappa=0.0,
+        joseph=True,
+        jitter=1e-6,
+        debug=False,
+        print=False,
+    ):
+        super().__init__(ssm, joseph=joseph, debug=debug, print=print)
         self.state_dim = self.ssm.state_dim
         self.obs_dim = self.ssm.obs_dim
 
         self.alpha = float(alpha)
         self.beta = float(beta)
         self.kappa = float(kappa)
+        self.jitter = float(jitter)
+        if self.jitter < 0.0:
+            raise ValueError("jitter must be non-negative")
 
         self.Wm, self.Wc, self.lamb = self._build_ukf_weights(self.state_dim)
         self._maybe_print()
+
+    def _stabilize_cov(self, cov: tf.Tensor) -> tf.Tensor:
+        cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
+        if self.jitter == 0.0:
+            return cov
+        eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
+        return cov + eye * tf.cast(self.jitter, cov.dtype)
 
     def _build_ukf_weights(self, n: tf.Tensor):
         alpha = self.alpha
@@ -46,6 +66,7 @@ class UnscentedKalmanFilter(GaussianFilter):
         )
         scale = tf.cast(n_f + lamb, P.dtype)
         P_scaled = P * scale
+        P_scaled = self._stabilize_cov(P_scaled)
 
         P_sqrt = tf.linalg.cholesky(P_scaled)
         P_sqrt = tf.linalg.matrix_transpose(P_sqrt)
@@ -71,10 +92,11 @@ class UnscentedKalmanFilter(GaussianFilter):
 
         Y_c = residual_fn(Y, y_mean)
         cov = tf.einsum("...i,...ij,...ik->...jk", Wc, Y_c, Y_c)
+        cov = self._stabilize_cov(cov)
 
         return y_mean, cov, X, Y, Wm, Wc
 
-    @tf.function(reduce_retracing=True)
+    @tf.function
     def predict(self, m_prev, P_prev):
         q0 = tf.zeros(tf.concat([tf.shape(m_prev)[:-1], [self.q_dim]], axis=0), dtype=tf.float32)
         m_aug = tf.concat([m_prev, q0], axis=-1)
@@ -90,8 +112,8 @@ class UnscentedKalmanFilter(GaussianFilter):
         )
         return m_pred, P_pred
 
-    @tf.function(reduce_retracing=True)
-    def update(self, m_pred, P_pred, y, joseph=True):
+    @tf.function
+    def update_joseph(self, m_pred, P_pred, y):
         r0 = tf.zeros(tf.concat([tf.shape(m_pred)[:-1], [self.r_dim]], axis=0), dtype=tf.float32)
         m_aug = tf.concat([m_pred, r0], axis=-1)
         P_aug = block_diag(P_pred, self.cov_eps_y)
@@ -121,10 +143,10 @@ class UnscentedKalmanFilter(GaussianFilter):
 
         KSK_T = quadratic_matmul(K, S, K)
         P_filt = P_pred - KSK_T
-        if joseph:
-            P_filt = 0.5 * (P_filt + tf.linalg.matrix_transpose(P_filt))
+        P_filt = self._stabilize_cov(P_filt)
 
-        cond_P = tf_cond(P_filt)
-        cond_S = tf_cond(S)
+        return m_filt, P_filt
 
-        return m_filt, P_filt, cond_P, cond_S
+    @tf.function
+    def update_naive(self, m_pred, P_pred, y):
+        return self.update_joseph(m_pred, P_pred, y)

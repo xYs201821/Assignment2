@@ -27,32 +27,25 @@ class MotionModel(tf.Module):
 
 class ConstantVelocityMotionModel(MotionModel):
 
-    def __init__(self, v, dt, cov_eps, seed=42, jitter=1e-12):
+    def __init__(self, dt, cov_eps, seed=42, jitter=1e-12):
         super().__init__(seed)
         self.dt = tf.convert_to_tensor(dt, dtype=tf.float32)
-        self.v = tf.convert_to_tensor(v, dtype=tf.float32)
         self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
-        self.A = tf.stack(
-            [
-                tf.stack([1.0, 0.0, self.dt, 0.0]),
-                tf.stack([0.0, 1.0, 0.0, self.dt]),
-                tf.stack([0.0, 0.0, 1.0, 0.0]),
-                tf.stack([0.0, 0.0, 0.0, 1.0]),
-            ],
-            axis=0,
-        )
-        if cov_eps.shape[0] == 2 * v.shape[-1]:
-            self.cov_eps = cov_eps
-        elif cov_eps.shape[0] == v.shape[-1]:
-            Q_v = cov_eps  # only velocity noise
-            zeros = tf.zeros((tf.shape(self.v)[-1], tf.shape(self.v)[-1]), tf.float32)
-            self.cov_eps = tf.concat([
-                tf.concat([self.jitter * tf.eye(tf.shape(self.v)[-1], dtype=tf.float32), zeros], axis=1),
-                tf.concat([zeros, Q_v], axis=1)
-            ], axis=0)
-        else:
-            raise ValueError("cov_eps must be [2*dim,2*dim] or [dim,dim] for ConstantVelocityMotionModel")
-        self.cov_eps = self.cov_eps + self.jitter * tf.eye(self.state_dim, dtype=tf.float32)
+        cov_eps = tf.convert_to_tensor(cov_eps, dtype=tf.float32)
+        if cov_eps.shape.rank != 2 or cov_eps.shape[-1] != cov_eps.shape[-2]:
+            raise ValueError("cov_eps must be a square [2*dim,2*dim] matrix for ConstantVelocityMotionModel")
+        if cov_eps.shape[-1] is not None and cov_eps.shape[-1] % 2 != 0:
+            raise ValueError("cov_eps must be [2*dim,2*dim] for ConstantVelocityMotionModel")
+
+        state_dim = tf.shape(cov_eps)[0]
+        dim = state_dim // 2
+        eye = tf.eye(dim, dtype=tf.float32)
+        zeros = tf.zeros(tf.stack([dim, dim]), dtype=tf.float32)
+        top = tf.concat([eye, self.dt * eye], axis=1)
+        bot = tf.concat([zeros, eye], axis=1)
+        self.A = tf.concat([top, bot], axis=0)
+
+        self.cov_eps = cov_eps + self.jitter * tf.eye(state_dim, dtype=tf.float32)
         self.Lq = tf.linalg.cholesky(self.cov_eps)
         
     @property

@@ -4,7 +4,7 @@ import numpy as np
 import tensorflow_probability as tfp
 
 
-def tf_cond(M, jitter=1e-12): # find condition number of M in tensorflow, [batch, n, n] -> [batch]
+def tf_cond(M, jitter=1e-6): # find condition number of M in tensorflow, [batch, n, n] -> [batch]
     M = tf.convert_to_tensor(M)
     tf.debugging.assert_all_finite(M, "tf_cond received NaN/Inf in input matrix")
     M_sym = (M + tf.linalg.matrix_transpose(M)) / 2.0
@@ -23,7 +23,7 @@ def quadratic_matmul(A, B, C):
     AB = tf.linalg.matmul(A, B)
     return tf.linalg.matmul(AB, C, transpose_b=True)
 
-def cholesky_solve(A, B, jitter=1e-12):
+def cholesky_solve(A, B, jitter=1e-6):
     """
     Solves AX = B using Cholesky decomposition.
     """
