@@ -1,9 +1,9 @@
 experiment:
   output_root: results/exp1_linear_gaussian
   T: 20
-  batch_size: 10
+  batch_size: 100
   seeds: [42, ]
-  dims: [4, 16, 64,]
+  dims: [4, 16, 64]
   dy_ratio: 0.25
   plot_kflow_marginals: true
   plot_kflow_seed0_only: true
@@ -30,7 +30,7 @@ model:
   sigma_z: [0.5]
   p0_scale: 1.0
 filters:
-  methods: [kf, ekf, ukf, pf, edh, ledh, kflow_diag, kflow_scalar]
+  methods: [kf, ekf, ukf, pf, edh, edh(pfpf), ledh, ledh(pfpf), kflow_diag, kflow_scalar]
   ukf:
     alpha: 1e-1
     beta: 2.0
@@ -50,7 +50,7 @@ filters:
     optimizer_eps: [1e-6]
     optimizer_beta_1: [0.9]
     optimizer_beta_2: [0.999]
-    num_particles: [250]
+    num_particles: [500]
     num_lambda: [100]
     alpha: [0.1]
     ll_grad_mode: [dist]

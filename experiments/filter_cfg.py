@@ -19,6 +19,15 @@ def _is_kflow_method(method: str) -> bool:
     return method.startswith("kflow") or method.startswith("kernel")
 
 
+def _flow_pfpf_base(method: str) -> str | None:
+    method = str(method).lower()
+    if method in ("edh(pfpf)", "edh_pfpf", "edh-pfpf"):
+        return "edh"
+    if method in ("ledh(pfpf)", "ledh_pfpf", "ledh-pfpf"):
+        return "ledh"
+    return None
+
+
 def _kflow_param_grid(
     kflow_cfg: Dict[str, Any],
     num_particles_flow: int,
@@ -144,6 +153,14 @@ def build_filter_cfg(
 
     methods_list = [str(m).lower() for m in methods]
     if kflow_cfg is None:
+        for method in methods_list:
+            base = _flow_pfpf_base(method)
+            if base is None:
+                continue
+            base_cfg = dict(filter_cfg.get(base, {}))
+            base_cfg["reweight"] = "always"
+            base_cfg["resample"] = "auto"
+            filter_cfg[method] = base_cfg
         return methods_list, filter_cfg
 
     kflow_grid = _kflow_param_grid(kflow_cfg, num_particles_flow, num_lambda_flow)
@@ -169,4 +186,12 @@ def build_filter_cfg(
             )
             method_cfg.update(kflow_base)
             filter_cfg[method_name] = method_cfg
+    for method in methods_list:
+        base = _flow_pfpf_base(method)
+        if base is None:
+            continue
+        base_cfg = dict(filter_cfg.get(base, {}))
+        base_cfg["reweight"] = "always"
+        base_cfg["resample"] = "auto"
+        filter_cfg[method] = base_cfg
     return methods_list, filter_cfg

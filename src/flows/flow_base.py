@@ -14,6 +14,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         num_particles=100,
         ess_threshold=0.5,
         reweight="never",
+        resample="never",
         init_from_particles="sample",
         debug=False,
         jitter=1e-12,
@@ -21,6 +22,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         super().__init__(ssm, num_particles=num_particles, ess_threshold=ess_threshold)
         self.num_lambda = int(num_lambda)
         self.default_reweight = reweight
+        self.default_resample = resample
         self.init_from_particles = init_from_particles
         self.debug = bool(debug)
         self.jitter = jitter
@@ -54,7 +56,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         x_next, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P)
         return x_next, log_q0 - log_det, m_pred, P_pred
 
-    def warmup(self, batch_size=1, reweight="auto"):
+    def warmup(self, batch_size=1, reweight="auto", resample="never"):
         x_spec = tf.TensorSpec(
             shape=[None, self.num_particles, self.ssm.state_dim],
             dtype=tf.float32,
@@ -65,18 +67,22 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             reweight = self.default_reweight
         if reweight is None:
             reweight = self.default_reweight
+        if resample is None:
+            resample = self.default_resample
         reweight = self._normalize_reweight(reweight)
+        resample = self._normalize_reweight(resample)
         _ = self.step.get_concrete_function(
             x_spec,
             log_w_spec,
             y_spec,
             reweight=reweight,
+            resample=resample,
         )
 
         x = tf.zeros([batch_size, self.num_particles, self.ssm.state_dim], dtype=tf.float32)
         log_w = tf.zeros([batch_size, self.num_particles], dtype=tf.float32)
         y = tf.zeros([batch_size, self.ssm.obs_dim], dtype=tf.float32)
-        _ = self.step(x, log_w, y, reweight=reweight)
+        _ = self.step(x, log_w, y, reweight=reweight, resample=resample)
 
     @tf.function
     def step(
@@ -85,10 +91,13 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         log_w_prev,
         y_t,
         reweight="auto",
+        resample="never",
         **kwargs,
     ):
         if reweight is None:
             reweight = self.default_reweight
+        if resample is None:
+            resample = self.default_resample
 
         mu_tilde = self.ssm.sample_transition(x_prev, seed=self.ssm._tfp_seed())
         trans_dist = self.ssm.transition_dist(x_prev)
@@ -127,12 +136,36 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
         log_w_norm, w, _ = self._log_normalize(log_w)
 
-        batch_shape_out = tf.shape(x_t)[:-2]
-        parent_indices = tf.broadcast_to(
-            tf.range(self.num_particles, dtype=tf.int32),
-            tf.concat([batch_shape_out, [self.num_particles]], axis=0),
-        )
-        return mu_tilde, x_t, log_w_norm, w, parent_indices, m_pred, P_pred
+        if resample in (1, 2):
+            ess = self.ess(w)
+            N_float = tf.cast(self.num_particles, tf.float32)
+            if resample == 2:
+                mask_do_rs = tf.ones_like(ess, dtype=tf.bool)
+            else:
+                mask_do_rs = ess < (self.ess_threshold * N_float)
+
+            rs_indices = self.systematic_resample(w, self.ssm.rng)
+            batch_shape_out = tf.shape(x_t)[:-2]
+            no_rs_indices = tf.broadcast_to(
+                tf.range(self.num_particles, dtype=tf.int32),
+                tf.concat([batch_shape_out, [self.num_particles]], axis=0),
+            )
+            mask_do_rs = mask_do_rs[..., tf.newaxis]
+            parent_indices = tf.where(mask_do_rs, rs_indices, no_rs_indices)
+
+            x_t = self.resample_particles(x_t, parent_indices)
+            log_w_reset = -tf.math.log(N_float) * tf.ones_like(log_w_norm)
+            log_w_final = tf.where(mask_do_rs, log_w_reset, log_w_norm)
+            w_final = tf.exp(log_w_final)
+        else:
+            batch_shape_out = tf.shape(x_t)[:-2]
+            parent_indices = tf.broadcast_to(
+                tf.range(self.num_particles, dtype=tf.int32),
+                tf.concat([batch_shape_out, [self.num_particles]], axis=0),
+            )
+            log_w_final = log_w_norm
+            w_final = w
+        return mu_tilde, x_t, log_w_final, w_final, parent_indices, m_pred, P_pred
 
     def filter(
         self,
@@ -140,6 +173,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         num_particles=None,
         ess_threshold=None,
         reweight="auto",
+        resample="never",
         init_dist=None,
         init_seed=None,
         init_particles=None,
@@ -147,7 +181,12 @@ class FlowBase(ParticleFilter, LinearizationMixin):
     ):
         self.update_params(num_particles, ess_threshold)
         y = self._normalize_y(y)
+        if reweight is None:
+            reweight = self.default_reweight
+        if resample is None:
+            resample = self.default_resample
         reweight = self._normalize_reweight(reweight)
+        resample = self._normalize_reweight(resample)
 
         T = int(y.shape[1])
         x_prev, log_w, parent_indices = self._init_particles(
@@ -174,6 +213,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
                 log_w,
                 y_t,
                 reweight=reweight,
+                resample=resample,
             )
             x_prev = x
             x_pred_ta = x_pred_ta.write(t, x_pred)

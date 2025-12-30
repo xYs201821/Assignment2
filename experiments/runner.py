@@ -30,6 +30,27 @@ def _uniform_weights(batch: tf.Tensor, T: tf.Tensor, n: int) -> tf.Tensor:
     return tf.ones(shape, dtype=tf.float32) / n_f
 
 
+def _flow_kind(method: str) -> Optional[str]:
+    method = str(method).lower()
+    if method.startswith("edh"):
+        return "edh"
+    if method.startswith("ledh"):
+        return "ledh"
+    return None
+
+
+def _flow_reweight_default(method: str, fallback: str) -> str:
+    if "pfpf" in str(method).lower():
+        return "always"
+    return fallback
+
+
+def _flow_resample_default(method: str, fallback: str) -> str:
+    if "pfpf" in str(method).lower():
+        return "auto"
+    return fallback
+
+
 def _particles_to_stats(ssm, x: tf.Tensor, w: Optional[tf.Tensor]) -> Dict[str, tf.Tensor]:
     if w is None:
         w = tf.ones(tf.shape(x)[:-1], dtype=tf.float32)
@@ -184,20 +205,29 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
         out.update(_runtime_and_memory(diagnostics))
         return out
 
-    if method == "edh":
+    flow_kind = _flow_kind(method)
+
+    if flow_kind == "edh":
         print("Running EDH flow...")
+        reweight = cfg.get("reweight")
+        if reweight is None:
+            reweight = _flow_reweight_default(method, "never")
+        resample = cfg.get("resample")
+        if resample is None:
+            resample = _flow_resample_default(method, "never")
         filt = EDHFlow(
             ssm,
             num_lambda=int(cfg.get("num_lambda", 20)),
             num_particles=int(cfg.get("num_particles", 100)),
             ess_threshold=float(cfg.get("ess_threshold", 0.5)),
-            reweight=cfg.get("reweight", "never"),
+            reweight=reweight,
         )
-        filt.warmup(batch_size=tf.shape(y_obs)[0], reweight=cfg.get("reweight", "never"))
+        filt.warmup(batch_size=tf.shape(y_obs)[0], reweight=reweight, resample=resample)
         x, w, diagnostics, parents = filt.filter(
             y_obs,
             init_dist=cfg.get("init_dist"),
-            reweight=cfg.get("reweight", "never"),
+            reweight=reweight,
+            resample=resample,
             init_seed=cfg.get("init_seed"),
             init_particles=init_particles,
             memory_sampler=mem_fn,
@@ -215,20 +245,27 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
         out.update(_runtime_and_memory(diagnostics))
         return out
 
-    if method == "ledh":
+    if flow_kind == "ledh":
         print("Running LEDH flow...")
+        reweight = cfg.get("reweight")
+        if reweight is None:
+            reweight = _flow_reweight_default(method, "never")
+        resample = cfg.get("resample")
+        if resample is None:
+            resample = _flow_resample_default(method, "never")
         filt = LEDHFlow(
             ssm,
             num_lambda=int(cfg.get("num_lambda", 20)),
             num_particles=int(cfg.get("num_particles", 100)),
             ess_threshold=float(cfg.get("ess_threshold", 0.5)),
-            reweight=cfg.get("reweight", "never"),
+            reweight=reweight,
         )
-        filt.warmup(batch_size=tf.shape(y_obs)[0], reweight=cfg.get("reweight", "never"))
+        filt.warmup(batch_size=tf.shape(y_obs)[0], reweight=reweight, resample=resample)
         x, w, diagnostics, parents = filt.filter(
             y_obs,
             init_dist=cfg.get("init_dist"),
-            reweight=cfg.get("reweight", "never"),
+            reweight=reweight,
+            resample=resample,
             init_seed=cfg.get("init_seed"),
             init_particles=init_particles,
             memory_sampler=mem_fn,
