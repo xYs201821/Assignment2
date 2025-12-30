@@ -1,8 +1,8 @@
 experiment:
   output_root: results/exp2b_range_bearing
-  T: 100
+  T: 60
   batch_size: 10
-  seeds: [123, ]
+  seeds: [42, ]
   pair_particles: true
   save_particles_seed0: false
   plot_state: true
@@ -10,6 +10,13 @@ experiment:
   show_plots: true
   plot_interactive: true
   plot_time_gap: 5
+  plot_pf_ess: true
+  plot_pf_ess_seed0_only: true
+  plot_pf_ess_show: false
+  plot_pf_degeneracy: true
+  plot_pf_degeneracy_seed0_only: true
+  plot_pf_degeneracy_show: false
+  plot_pf_degeneracy_time: null
 model:
   dt: 0.1
   cov_eps:
@@ -43,13 +50,13 @@ filters:
     optimizer_beta_1: [0.9]
     optimizer_beta_2: [0.999]
     num_particles: [100]
-    num_lambda: [40]
+    num_lambda: [20]
     alpha: [median]
     ll_grad_mode: [dist]
-    alpha_update_every: [2]
-    ds_init: [0.01]
+    alpha_update_every: [1]
+    ds_init: [0.05]
     max_flow_norm: [5.0]
-    localization_radius: [4.0]
+    localization_radius: [null]
 init:
   x0: [1., .9, -.1, -.1]
   m0_offset: [-.5, .5, 0.0, 0.0]

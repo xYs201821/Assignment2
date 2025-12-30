@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from itertools import product
+from itertools import permutations, product
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,6 +45,166 @@ def extract_positions(x: np.ndarray, num_targets: int) -> np.ndarray:
         x = x[np.newaxis, ...]
     x = x.reshape(x.shape[0], x.shape[1], num_targets, 4)
     return x[..., 0:2]
+
+
+def _assignment_min_cost(cost: np.ndarray) -> Tuple[float, Tuple[int, ...]]:
+    n, m = cost.shape
+    if n == 0 or m == 0:
+        return 0.0, tuple()
+    if n == m and n <= 8:
+        best = None
+        best_perm = None
+        for perm in permutations(range(m)):
+            val = cost[np.arange(n), perm].sum()
+            if best is None or val < best:
+                best = val
+                best_perm = perm
+        return float(best), tuple(best_perm)
+    used = set()
+    total = 0.0
+    perm = [-1] * n
+    for i in range(n):
+        j = int(np.argmin(cost[i]))
+        if j in used:
+            candidates = [
+                c if k not in used else np.inf for k, c in enumerate(cost[i])
+            ]
+            j = int(np.argmin(candidates))
+        used.add(j)
+        perm[i] = j
+        total += cost[i, j]
+    return float(total), tuple(perm)
+
+
+def _target_permutations(x_true: Any, mean: Any, num_targets: int) -> np.ndarray:
+    if num_targets <= 1:
+        return np.zeros((1, 1, num_targets), dtype=np.int32)
+    x_true_np = np.asarray(x_true)
+    mean_np = np.asarray(mean)
+    if x_true_np.ndim == 2:
+        x_true_np = x_true_np[np.newaxis, ...]
+    if mean_np.ndim == 2:
+        mean_np = mean_np[np.newaxis, ...]
+    if x_true_np.shape[:2] != mean_np.shape[:2]:
+        batch = mean_np.shape[0]
+        steps = mean_np.shape[1]
+        return np.tile(np.arange(num_targets, dtype=np.int32), (batch, steps, 1))
+    if x_true_np.shape[-1] != 4 * num_targets or mean_np.shape[-1] != 4 * num_targets:
+        batch = mean_np.shape[0]
+        steps = mean_np.shape[1]
+        return np.tile(np.arange(num_targets, dtype=np.int32), (batch, steps, 1))
+
+    pos_true = extract_positions(x_true_np, num_targets)
+    pos_est = extract_positions(mean_np, num_targets)
+    batch, steps, _, _ = pos_true.shape
+    perms = np.empty((batch, steps, num_targets), dtype=np.int32)
+    for b in range(batch):
+        for t in range(steps):
+            cost = np.linalg.norm(
+                pos_true[b, t, :, None, :] - pos_est[b, t, None, :, :],
+                axis=-1,
+            )
+            if not np.isfinite(cost).all():
+                perms[b, t] = np.arange(num_targets, dtype=np.int32)
+                continue
+            _, perm = _assignment_min_cost(cost)
+            if len(perm) != num_targets:
+                perms[b, t] = np.arange(num_targets, dtype=np.int32)
+            else:
+                perms[b, t] = np.asarray(perm, dtype=np.int32)
+    return perms
+
+
+def _state_indices_from_perm(perms: np.ndarray, num_targets: int, block_dim: int = 4) -> np.ndarray:
+    perms = np.asarray(perms)
+    batch, steps, _ = perms.shape
+    idx = np.empty((batch, steps, num_targets * block_dim), dtype=np.int32)
+    base = np.arange(block_dim, dtype=np.int32)
+    for b in range(batch):
+        for t in range(steps):
+            perm = perms[b, t]
+            idx[b, t] = np.concatenate([perm_i * block_dim + base for perm_i in perm])
+    return idx
+
+
+def _permute_state(x: Any, perms: np.ndarray, num_targets: int) -> Any:
+    if x is None or num_targets <= 1:
+        return x
+    x_t = tf.convert_to_tensor(x)
+    rank = x_t.shape.rank
+    squeeze_batch = False
+    if rank == 2:
+        x_t = x_t[tf.newaxis, ...]
+        rank = 3
+        squeeze_batch = True
+    if rank not in (3, 4):
+        return x
+    state_dim = 4 * num_targets
+    if x_t.shape[-1] is not None and x_t.shape[-1] != state_dim:
+        return x
+    perm_t = tf.convert_to_tensor(perms, dtype=tf.int32)
+    if rank == 3:
+        shape = tf.shape(x_t)
+        x_r = tf.reshape(x_t, tf.concat([shape[:-1], [num_targets, 4]], axis=0))
+        x_p = tf.gather(x_r, perm_t, axis=2, batch_dims=2)
+        x_out = tf.reshape(x_p, shape)
+    else:
+        shape = tf.shape(x_t)
+        x_r = tf.reshape(x_t, tf.concat([shape[:-1], [num_targets, 4]], axis=0))
+        x_p = tf.gather(x_r, perm_t, axis=3, batch_dims=2)
+        x_out = tf.reshape(x_p, shape)
+    if squeeze_batch:
+        x_out = x_out[0]
+    return x_out
+
+
+def _permute_cov(cov: Any, perms: np.ndarray, num_targets: int) -> Any:
+    if cov is None or num_targets <= 1:
+        return cov
+    cov_t = tf.convert_to_tensor(cov)
+    rank = cov_t.shape.rank
+    squeeze_batch = False
+    if rank == 3:
+        cov_t = cov_t[tf.newaxis, ...]
+        rank = 4
+        squeeze_batch = True
+    if rank != 4:
+        return cov
+    state_dim = 4 * num_targets
+    if cov_t.shape[-1] is not None and cov_t.shape[-1] != state_dim:
+        return cov
+    idx = _state_indices_from_perm(perms, num_targets)
+    idx_t = tf.convert_to_tensor(idx, dtype=tf.int32)
+    cov_r = tf.gather(cov_t, idx_t, axis=2, batch_dims=2)
+    cov_p = tf.gather(cov_r, idx_t, axis=3, batch_dims=2)
+    if squeeze_batch:
+        cov_p = cov_p[0]
+    return cov_p
+
+
+def _align_output_to_targets(x_true: Any, out: Dict[str, Any], num_targets: int) -> Dict[str, Any]:
+    mean = out.get("mean")
+    if mean is None or num_targets <= 1:
+        return out
+    perms = _target_permutations(x_true, mean, num_targets)
+    out["mean"] = _permute_state(mean, perms, num_targets)
+    out["x_particles"] = _permute_state(out.get("x_particles"), perms, num_targets)
+    out["cov"] = _permute_cov(out.get("cov"), perms, num_targets)
+    if "m_pred" in out:
+        out["m_pred"] = _permute_state(out["m_pred"], perms, num_targets)
+    if "P_pred" in out:
+        out["P_pred"] = _permute_cov(out["P_pred"], perms, num_targets)
+    if "x_pred" in out:
+        out["x_pred"] = _permute_state(out["x_pred"], perms, num_targets)
+    diag = out.get("diagnostics")
+    if isinstance(diag, dict):
+        if "m_pred" in diag:
+            diag["m_pred"] = _permute_state(diag["m_pred"], perms, num_targets)
+        if "P_pred" in diag:
+            diag["P_pred"] = _permute_cov(diag["P_pred"], perms, num_targets)
+        if "x_pred" in diag:
+            diag["x_pred"] = _permute_state(diag["x_pred"], perms, num_targets)
+    return out
 
 
 def build_ssm(
@@ -358,6 +518,12 @@ def main() -> None:
         ]
 
     cov_eps_x = _parse_cov_eps_x(model_cfg.get("cov_eps_x"))
+    cov_eps_x_sim = _parse_cov_eps_x(model_cfg.get("cov_eps_x_sim"))
+    cov_eps_x_filter = _parse_cov_eps_x(model_cfg.get("cov_eps_x_filter"))
+    if cov_eps_x_sim is None:
+        cov_eps_x_sim = cov_eps_x
+    if cov_eps_x_filter is None:
+        cov_eps_x_filter = cov_eps_x
     init_targets_cfg = model_cfg.get("init_targets")
     m0_cfg = model_cfg.get("m0")
     P0_cfg = model_cfg.get("P0")
@@ -455,7 +621,7 @@ def main() -> None:
                             dt=dt,
                             Psi=Psi,
                             d0=d0,
-                            cov_eps_x=cov_eps_x,
+                            cov_eps_x=cov_eps_x_sim,
                             m0=m0,
                             P0=P0,
                             seed=seed,
@@ -485,7 +651,7 @@ def main() -> None:
                                 dt=dt,
                                 Psi=Psi,
                                 d0=d0,
-                                cov_eps_x=cov_eps_x,
+                                cov_eps_x=cov_eps_x_filter,
                                 m0=m0,
                                 P0=P0,
                                 seed=seed,
@@ -500,6 +666,7 @@ def main() -> None:
                                 method_cfg["init_dist"] = init_dist
                             method_cfg["init_seed"] = seed
                             out = run_filter(method_ssm, y_obs, method, **method_cfg)
+                            out = _align_output_to_targets(x_true, out, M)
                             outputs[method] = out
 
                         metrics_by_method: Dict[str, Dict[str, Any]] = {}

@@ -70,6 +70,7 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
 
     m0 = cfg.get("m0")
     P0 = cfg.get("P0")
+    init_particles = cfg.get("init_particles")
 
     if method in ("kf", "kalman"):
         print("Running Kalman filter...")
@@ -167,6 +168,7 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             resample=cfg.get("reweight", "auto"),
             init_dist=cfg.get("init_dist"),
             init_seed=cfg.get("init_seed"),
+            init_particles=init_particles,
             memory_sampler=mem_fn,
         )
         stats = _particles_to_stats(ssm, x, w)
@@ -197,6 +199,7 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             init_dist=cfg.get("init_dist"),
             reweight=cfg.get("reweight", "never"),
             init_seed=cfg.get("init_seed"),
+            init_particles=init_particles,
             memory_sampler=mem_fn,
         )
         stats = _particles_to_stats(ssm, x, w)
@@ -227,6 +230,7 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             init_dist=cfg.get("init_dist"),
             reweight=cfg.get("reweight", "never"),
             init_seed=cfg.get("init_seed"),
+            init_particles=init_particles,
             memory_sampler=mem_fn,
         )
         stats = _particles_to_stats(ssm, x, w)
@@ -276,6 +280,7 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             init_dist=cfg.get("init_dist"),
             reweight=reweight,
             init_seed=cfg.get("init_seed"),
+            init_particles=init_particles,
             memory_sampler=mem_fn,
         )
         stats = _particles_to_stats(ssm, x, w)

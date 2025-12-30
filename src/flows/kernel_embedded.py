@@ -443,7 +443,7 @@ class KernelParticleFlow(FlowBase):
             dist_flat = tf.reshape(dist, tf.stack([batch, num_particles * num_particles]))
             dist_pairs = tf.boolean_mask(dist_flat, mask, axis=1)
             med = self._median_midpoint(dist_pairs)
-            return tf.square(med) / tf.math.log(tf.cast(self.ssm.state_dim, tf.float32))
+            return tf.square(med)
 
         def _empty():
             return tf.zeros([batch], dtype=tf.float32)
@@ -472,7 +472,7 @@ class KernelParticleFlow(FlowBase):
         diagB = tf.maximum(diagB, tf.cast(self.jitter, tf.float32))
         
         if self._median_alpha:
-            alpha = None
+            alpha = self._compute_alpha(x=x)
         elif self.alpha is None:
             alpha = tf.cast(1.0, tf.float32) / tf.cast(num_particles, tf.float32)
         else:
@@ -502,15 +502,12 @@ class KernelParticleFlow(FlowBase):
                 grad_ll = self._grad_log_likelihood_linearized(x, y)
             grad_prior = self._grad_log_prior_gaussian(x, x_mean, B) # [..., n, dx]
             g = grad_prior + grad_ll
-            alpha_step = alpha
-            if self._median_alpha and (i % self.alpha_update_every != 0):
-                alpha_step = None
             if self.kernel_type == "scalar":
-                K, grad_K = self._scalar_kernel_and_grad(x, band_inv, alpha_step)
+                K, grad_K = self._scalar_kernel_and_grad(x, band_inv, alpha)
                 # K: [..., n, n], grad_K: [..., n, n, dx], g: [..., n, dx]
                 term1 = K[..., tf.newaxis] * g[..., tf.newaxis, :, :]
             else:
-                K, grad_K = self._kernel_and_grad(x, diagB, alpha_step)
+                K, grad_K = self._kernel_and_grad(x, diagB, alpha)
                 # K: [..., n, n, dx], grad_K: [..., n, n, dx], g: [..., n, dx]
                 term1 = K * g[..., tf.newaxis, :, :]
             weighted = w[..., tf.newaxis, :, tf.newaxis] * (term1 + grad_K)

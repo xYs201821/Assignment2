@@ -43,11 +43,33 @@ class ParticleFilter(BaseFilter):
             return tf.stack([seed, tf.constant(0, dtype=seed.dtype)])
         seed = tf.reshape(seed, [-1])
         return tf.stack([seed[0], tf.constant(0, dtype=seed.dtype)])
-    def _init_particles(self, y, init_dist, init_seed=None):
+    def _init_particles(self, y, init_dist, init_seed=None, init_particles=None):
         batch_shape = tf.shape(y)[:-2]
         N = self.num_particles
         seed = self._normalize_init_seed(init_seed)
-        if init_dist is None:
+        if init_particles is not None:
+            x = tf.convert_to_tensor(init_particles, dtype=tf.float32)
+            if x.shape.rank == 2:
+                x = x[tf.newaxis, ...]
+            if x.shape.rank != 3:
+                raise ValueError("init_particles must have shape [N, dx] or [batch, N, dx]")
+            if x.shape[-2] is not None and int(x.shape[-2]) != N:
+                raise ValueError("init_particles size must match num_particles")
+            if x.shape[-1] is not None and int(x.shape[-1]) != int(self.ssm.state_dim):
+                raise ValueError("init_particles state dimension mismatch")
+            batch_size = tf.shape(y)[0]
+            x_batch = tf.shape(x)[0]
+            x = tf.cond(
+                tf.equal(x_batch, 1),
+                lambda: tf.tile(x, tf.stack([batch_size, 1, 1])),
+                lambda: x,
+            )
+            tf.debugging.assert_equal(
+                tf.shape(x)[0],
+                batch_size,
+                message="init_particles batch size mismatch",
+            )
+        elif init_dist is None:
             shape = tf.concat([batch_shape, [N]], axis=0)
             if seed is None:
                 x = self.ssm.sample_initial_state(shape, return_log_prob=False)
@@ -97,6 +119,9 @@ class ParticleFilter(BaseFilter):
         if isinstance(reweight, bool):
             return 1 if reweight else 0
         if isinstance(reweight, str):
+            reweight = reweight.strip().lower()
+            if reweight in ("true", "false"):
+                return 1 if reweight == "true" else 0
             mode_map = {"never": 0, "auto": 1, "always": 2}
             if reweight not in mode_map:
                 raise ValueError("reweight must be True/False or one of 'auto', 'never', 'always'")

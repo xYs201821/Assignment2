@@ -142,6 +142,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         reweight="auto",
         init_dist=None,
         init_seed=None,
+        init_particles=None,
         memory_sampler=None,
     ):
         self.update_params(num_particles, ess_threshold)
@@ -149,7 +150,12 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         reweight = self._normalize_reweight(reweight)
 
         T = int(y.shape[1])
-        x_prev, log_w, parent_indices = self._init_particles(y, init_dist, init_seed=init_seed)
+        x_prev, log_w, parent_indices = self._init_particles(
+            y,
+            init_dist,
+            init_seed=init_seed,
+            init_particles=init_particles,
+        )
 
         x_ta = tf.TensorArray(tf.float32, size=T)
         x_pred_ta = tf.TensorArray(tf.float32, size=T)

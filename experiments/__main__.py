@@ -11,6 +11,7 @@ _EXPERIMENTS = {
     "exp2b": "experiments.exp2b_range_bearing",
     "exp3": "experiments.exp3_multitarget_acoustic",
     "exp4": "experiments.exp4_lorenz96",
+    "exp4_sim": "experiments.exp4_lorenz96_sim",
 }
 
 

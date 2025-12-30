@@ -167,6 +167,178 @@ def _plot_state_trajectory(
     plt.close(fig)
 
 
+def _ess_from_weights(w: np.ndarray) -> Optional[np.ndarray]:
+    w_np = np.asarray(w, dtype=np.float64)
+    if w_np.ndim == 2:
+        w_np = w_np[np.newaxis, ...]
+    if w_np.ndim != 3:
+        return None
+    w_sum = np.sum(w_np, axis=-1, keepdims=True)
+    w_norm = np.divide(w_np, w_sum, out=np.zeros_like(w_np), where=w_sum > 0)
+    ess_t = 1.0 / np.sum(np.square(w_norm), axis=-1)
+    return ess_t
+
+
+def _impoverishment_from_parents(parents: np.ndarray) -> Optional[np.ndarray]:
+    parents_np = np.asarray(parents)
+    if parents_np.ndim == 2:
+        parents_np = parents_np[np.newaxis, ...]
+    if parents_np.ndim != 3:
+        return None
+    batch, T, N = parents_np.shape
+    if N == 0 or T == 0:
+        return None
+    unique_frac = np.zeros((batch, T), dtype=np.float32)
+    for b in range(batch):
+        for t in range(T):
+            unique_frac[b, t] = np.unique(parents_np[b, t]).size / float(N)
+    return 1.0 - unique_frac
+
+
+def _plot_ess_over_time(
+    path: Path,
+    w: np.ndarray,
+    ess_threshold: Optional[float] = None,
+    show: bool = False,
+    title: Optional[str] = None,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    ess_t = _ess_from_weights(w)
+    if ess_t is None:
+        return
+    T = ess_t.shape[1]
+    t = np.arange(T)
+    ess_mean = np.mean(ess_t, axis=0)
+    ess_min = np.min(ess_t, axis=0)
+    ess_max = np.max(ess_t, axis=0)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
+    ax.plot(t, ess_mean, color="C0", linewidth=1.6, label="ESS mean")
+    if ess_t.shape[0] > 1:
+        ax.fill_between(t, ess_min, ess_max, color="C0", alpha=0.2, label="ESS range")
+    if ess_threshold is not None:
+        N = np.asarray(w).shape[-1]
+        ax.axhline(
+            ess_threshold * float(N),
+            color="C3",
+            linestyle="--",
+            linewidth=1.0,
+            label="ESS threshold",
+        )
+    ax.set_xlabel("time")
+    ax.set_ylabel("ESS")
+    ax.grid(True, linestyle=":")
+    ax.legend(fontsize=8, loc="best")
+
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def _plot_pf_degeneracy(
+    path: Path,
+    pf_out: Dict[str, Any],
+    x_true: np.ndarray,
+    t_index: int,
+    show: bool = False,
+    title: Optional[str] = None,
+    dims: Tuple[int, int] = (0, 1),
+) -> None:
+    import matplotlib.pyplot as plt
+
+    x_particles = pf_out.get("x_particles")
+    w = pf_out.get("w")
+    if x_particles is None or w is None:
+        return
+    x_np = np.asarray(x_particles)
+    w_np = np.asarray(w)
+    if x_np.ndim < 4:
+        return
+    if w_np.ndim == 2:
+        w_np = w_np[np.newaxis, ...]
+    if w_np.ndim != 3:
+        return
+    t = min(t_index, x_np.shape[1] - 1)
+    b = 0
+    if x_np.shape[0] == 0:
+        return
+    post = x_np[b, t]
+    w_t = w_np[b, t]
+    w_sum = np.sum(w_t)
+    if w_sum > 0:
+        w_t = w_t / w_sum
+
+    idx0, idx1 = dims
+    if post.shape[-1] <= max(idx0, idx1):
+        return
+    post_xy = post[:, [idx0, idx1]]
+
+    w_max = np.max(w_t) if w_t.size > 0 else 0.0
+    size_scale = w_t / (w_max + 1e-12)
+    sizes = 12.0 + 80.0 * size_scale
+
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4), sharey=False)
+    sc = axes[0].scatter(
+        post_xy[:, 0],
+        post_xy[:, 1],
+        s=sizes,
+        c=w_t,
+        cmap="viridis",
+        alpha=0.85,
+        edgecolors="none",
+    )
+    mean = pf_out.get("mean")
+    if mean is not None:
+        mean_np = np.asarray(mean)
+        if mean_np.ndim >= 3:
+            mean_xy = mean_np[b, t, [idx0, idx1]]
+            axes[0].scatter(
+                mean_xy[0],
+                mean_xy[1],
+                s=70,
+                c="red",
+                marker="x",
+                linewidths=1.5,
+            )
+    x_true_np = np.asarray(x_true)
+    if x_true_np.ndim >= 3:
+        true_xy = x_true_np[b, t, [idx0, idx1]]
+        axes[0].scatter(
+            true_xy[0],
+            true_xy[1],
+            s=70,
+            c="black",
+            marker="+",
+            linewidths=1.5,
+        )
+    axes[0].set_xlabel(f"x{idx0}")
+    axes[0].set_ylabel(f"x{idx1}")
+    axes[0].grid(True, linestyle=":")
+    fig.colorbar(sc, ax=axes[0], label="weight")
+
+    w_sorted = np.sort(w_t)[::-1]
+    axes[1].plot(w_sorted, color="C1", linewidth=1.4)
+    axes[1].set_xlabel("particle (sorted)")
+    axes[1].set_ylabel("weight")
+    axes[1].grid(True, linestyle=":")
+    if w_sum > 0:
+        ess_val = 1.0 / np.sum(np.square(w_t))
+        axes[1].set_title(f"ESS={ess_val:.1f}")
+
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 def _as_list(value: Any) -> List[Any]:
     if value is None:
         return []
@@ -275,6 +447,17 @@ def main() -> None:
         plot_time_gap = int(plot_time_gap)
         if plot_time_gap <= 0:
             plot_time_gap = None
+    plot_pf_ess = bool(exp_cfg.get("plot_pf_ess", False))
+    plot_pf_ess_seed0_only = bool(exp_cfg.get("plot_pf_ess_seed0_only", True))
+    plot_pf_ess_show = bool(exp_cfg.get("plot_pf_ess_show", False))
+    plot_pf_degeneracy = bool(exp_cfg.get("plot_pf_degeneracy", False))
+    plot_pf_degeneracy_seed0_only = bool(exp_cfg.get("plot_pf_degeneracy_seed0_only", True))
+    plot_pf_degeneracy_show = bool(exp_cfg.get("plot_pf_degeneracy_show", False))
+    plot_pf_degeneracy_time = exp_cfg.get("plot_pf_degeneracy_time")
+    if plot_pf_degeneracy_time is None:
+        plot_pf_degeneracy_time = min(T - 1, 19)
+    plot_pf_degeneracy_time = int(plot_pf_degeneracy_time)
+    plot_pf_degeneracy_time = max(0, min(plot_pf_degeneracy_time, T - 1))
 
     distances = [float(d) for d in _as_list(model_cfg.get("distances", [0.5, 2.0, 10.0]))]
     sigma_thetas = [float(s) for s in _as_list(model_cfg.get("sigma_thetas", [1.0, 5.0, 15.0]))]
@@ -416,6 +599,33 @@ def main() -> None:
                             metrics_by_method[method] = metrics
                             metrics_across_seeds[method].append(metrics)
 
+                            if method.startswith("pf"):
+                                if plot_pf_ess and (
+                                    not plot_pf_ess_seed0_only or seed == seeds[0]
+                                ):
+                                    w = out.get("w")
+                                    if w is not None:
+                                        plot_path = method_dir / "pf_ess_over_time.png"
+                                        _plot_ess_over_time(
+                                            plot_path,
+                                            w,
+                                            ess_threshold=pf_ess_threshold,
+                                            show=plot_pf_ess_show,
+                                        )
+                                if plot_pf_degeneracy and (
+                                    not plot_pf_degeneracy_seed0_only or seed == seeds[0]
+                                ):
+                                    plot_path = method_dir / (
+                                        f"pf_degeneracy_t{plot_pf_degeneracy_time}.png"
+                                    )
+                                    _plot_pf_degeneracy(
+                                        plot_path,
+                                        pf_out=out,
+                                        x_true=x_true,
+                                        t_index=plot_pf_degeneracy_time,
+                                        show=plot_pf_degeneracy_show,
+                                    )
+
                             diag = {
                                 k: v
                                 for k, v in out.get("diagnostics", {}).items()
@@ -425,6 +635,16 @@ def main() -> None:
                             diag["cov"] = out["cov"]
                             diff = x_true - out["mean"]
                             diag["rmse_t"] = tf.norm(diff, axis=-1)
+                            w = out.get("w")
+                            if w is not None and not out.get("is_gaussian", False):
+                                ess_t = _ess_from_weights(np.asarray(w))
+                                if ess_t is not None:
+                                    diag["ess_t"] = ess_t
+                                parents = out.get("parents")
+                                if parents is not None:
+                                    impoverishment_t = _impoverishment_from_parents(parents)
+                                    if impoverishment_t is not None:
+                                        diag["impoverishment_t"] = impoverishment_t
                             if save_particles_seed0 and seed == seeds[0]:
                                 diag["x_particles"] = out["x_particles"]
                                 diag["w"] = out["w"]

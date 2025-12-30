@@ -21,6 +21,10 @@ SUMMARY_KEYS = (
     "nees",
     "nis",
     "ess_mean",
+    "ess_min",
+    "ess_final",
+    "impoverishment_mean",
+    "impoverishment_final",
     "runtime.total_s",
     "memory.peak_rss_mb",
 )

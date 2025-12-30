@@ -168,9 +168,9 @@ class SSM(tf.Module):
 
 
 class LinearGaussianSSM(SSM):
-    def __init__(self, A, B, C, D, m0, P0, seed=42):
+    def __init__(self, A, B, C, D, m0, P0, jitter=1e-6, seed=42):
         super().__init__(seed)
-
+        self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
         self.A = tf.convert_to_tensor(A, dtype=tf.float32)
         self.B = tf.convert_to_tensor(B, dtype=tf.float32)
         self.C = tf.convert_to_tensor(C, dtype=tf.float32)
@@ -179,9 +179,11 @@ class LinearGaussianSSM(SSM):
         self.m0 = tf.convert_to_tensor(m0, dtype=tf.float32)
         self.P0 = tf.convert_to_tensor(P0, dtype=tf.float32)
 
-        self.cov_eps_x = tf.linalg.matmul(self.B, self.B, adjoint_b=True)
-        self.cov_eps_y = tf.linalg.matmul(self.D, self.D, adjoint_b=True)
-        self.L0 = tf.linalg.cholesky(self.P0)
+        self.cov_eps_x = tf.linalg.matmul(self.B, self.B, adjoint_b=True) 
+        self.cov_eps_x = self.cov_eps_x + self.jitter * tf.eye(self.state_dim, dtype=tf.float32)
+        self.cov_eps_y = tf.linalg.matmul(self.D, self.D, adjoint_b=True) 
+        self.cov_eps_y = self.cov_eps_y + self.jitter * tf.eye(self.obs_dim, dtype=tf.float32)
+        self.L0 = tf.linalg.cholesky(self.P0 + self.jitter * tf.eye(self.state_dim, dtype=tf.float32))
         self.Lq = tf.linalg.cholesky(self.cov_eps_x)
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 

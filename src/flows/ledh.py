@@ -12,7 +12,7 @@ class LEDHFlow(FlowBase):
         ess_threshold=0.5,
         reweight="auto",
         debug=False,
-        jitter=1e-6,
+        jitter=1e-5,
     ):
         super().__init__(
             ssm,

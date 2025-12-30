@@ -44,6 +44,22 @@ def ess(w: Any, axis: int = -1) -> tf.Tensor:
     return 1.0 / tf.reduce_sum(tf.square(w), axis=axis)
 
 
+def _unique_parent_fraction(parents: Any) -> Optional[np.ndarray]:
+    parents = np.asarray(parents)
+    if parents.ndim == 2:
+        parents = parents[np.newaxis, ...]
+    if parents.ndim != 3:
+        return None
+    batch, T, N = parents.shape
+    if N == 0 or T == 0:
+        return None
+    out = np.zeros((batch, T), dtype=np.float32)
+    for b in range(batch):
+        for t in range(T):
+            out[b, t] = np.unique(parents[b, t]).size / float(N)
+    return out
+
+
 def nees(x_true: Any, mean: Any, cov: Any) -> tf.Tensor:
     x_true = _to_tensor(x_true)
     mean = _to_tensor(mean)
@@ -312,6 +328,7 @@ def default_metrics_config() -> Dict[str, Any]:
         "nees": True,
         "nis": True,
         "ess": True,
+        "impoverishment": True,
         "coverage_sigmas": (1.0, 2.0),
         "rank_hist": True,
     }
@@ -335,6 +352,7 @@ def evaluate(
     cov = outputs.get("cov")
     x_particles = outputs.get("x_particles")
     w = outputs.get("w")
+    parents = outputs.get("parents")
     is_gaussian = bool(outputs.get("is_gaussian", False))
 
     if cfg.get("rmse"):
@@ -382,6 +400,15 @@ def evaluate(
     if cfg.get("ess") and w is not None and not is_gaussian:
         ess_t = ess(w)
         metrics["ess_mean"] = float(tf.reduce_mean(ess_t).numpy())
+        metrics["ess_min"] = float(tf.reduce_min(ess_t).numpy())
+        metrics["ess_final"] = float(tf.reduce_mean(ess_t[..., -1]).numpy())
+
+    if cfg.get("impoverishment") and parents is not None and not is_gaussian:
+        unique_frac = _unique_parent_fraction(parents)
+        if unique_frac is not None:
+            impoverishment = 1.0 - unique_frac
+            metrics["impoverishment_mean"] = float(np.mean(impoverishment))
+            metrics["impoverishment_final"] = float(np.mean(impoverishment[:, -1]))
 
     sigmas = cfg.get("coverage_sigmas")
     if sigmas:

@@ -1,13 +1,34 @@
 experiment:
   output_root: results/exp1_linear_gaussian
-  T: 40
+  T: 20
   batch_size: 10
   seeds: [42, ]
-  dims: [4, 8, 16, 32]
+  dims: [4, 16, 64,]
   dy_ratio: 0.25
+  plot_kflow_marginals: true
+  plot_kflow_seed0_only: true
+  plot_kflow_show: true
+  plot_kflow_time: 1
+  plot_kflow_contour_method: kf
+  plot_kflow_prior: true
+  plot_kflow_obs_index: null
+  plot_kflow_unobs_index: null
+  plot_pf_degeneracy: false
+  plot_pf_degeneracy_seed0_only: true
+  plot_pf_degeneracy_show: false
+  plot_pf_degeneracy_time: null
+  plot_pf_ess: false
+  plot_pf_ess_seed0_only: true
+  plot_pf_ess_show: false
+  plot_pf_obs_index: null
+  plot_pf_unobs_index: null
 model:
-  q_scale: 0.5
-  r_scale: 0.3
+  alpha: 0.9
+  alpha0: 1.0
+  alpha1: 1.0
+  beta: 20.0
+  sigma_z: [0.5]
+  p0_scale: 1.0
 filters:
   methods: [kf, ekf, ukf, pf, edh, ledh, kflow_diag, kflow_scalar]
   ukf:
@@ -21,19 +42,19 @@ filters:
     reweight: always
   flow:
     num_particles: [1000]
-    num_lambda: 20
+    num_lambda: 100
     ess_threshold: 0.5
     reweight: never
   kflow:
-    optimizer: [none]
+    optimizer: [adam]
     optimizer_eps: [1e-6]
     optimizer_beta_1: [0.9]
     optimizer_beta_2: [0.999]
-    num_particles: [100]
-    num_lambda: [20]
-    alpha: [median]
-    ll_grad_mode: [linearized]
-    alpha_update_every: [10]
-    ds_init: [0.05]
+    num_particles: [250]
+    num_lambda: [100]
+    alpha: [0.1]
+    ll_grad_mode: [dist]
+    alpha_update_every: [1]
+    ds_init: [0.1]
     max_flow_norm: [null]
     localization_radius: [null]
