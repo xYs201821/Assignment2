@@ -371,11 +371,10 @@ class KernelParticleFlow(FlowBase):
         tf.print(msg, summarize=8)
 
     def _flow_transport(self, mu_tilde, y, m0, P, w=None):
-        x_next = self._pff_update(mu_tilde, y, w, x_mean=m0, B=P)
+        x_next, diagnostics = self._pff_update(mu_tilde, y, w, x_mean=m0, B=P)
         # Kernel flow does not track Jacobian; treat log_det as zero.
         log_det = tf.zeros(tf.shape(mu_tilde)[:-1], dtype=tf.float32)
-        flow_norm_max = tf.zeros(tf.shape(mu_tilde)[:-2], dtype=tf.float32)
-        return x_next, log_det, flow_norm_max
+        return x_next, log_det, diagnostics
 
     @staticmethod
     def _median_midpoint(x):
@@ -477,6 +476,8 @@ class KernelParticleFlow(FlowBase):
             alpha = tf.cast(1.0, tf.float32) / tf.cast(num_particles, tf.float32)
         else:
             alpha = tf.cast(self.alpha, tf.float32)
+        alpha = tf.convert_to_tensor(alpha, dtype=tf.float32)
+        alpha = tf.broadcast_to(alpha, batch_shape)
         
         if self.kernel_type == "scalar":
             state_dim = tf.shape(x)[-1]
@@ -494,6 +495,16 @@ class KernelParticleFlow(FlowBase):
             diagB_mean = tf.reduce_mean(diagB, axis=-1)
         flow_tol = None if self.flow_tol is None else tf.cast(self.flow_tol, tf.float32)
         max_flow_norm = None if self.max_flow_norm is None else tf.cast(self.max_flow_norm, tf.float32)
+        jitter_val = tf.cast(self.jitter, tf.float32)
+        eps_float = 1e-12 if self.jitter is None or self.jitter <= 0.0 else float(self.jitter)
+        eps_val = tf.cast(eps_float, tf.float32)
+        dx_p95_max = tf.zeros(batch_shape, dtype=tf.float32)
+        condK_log10_max = tf.zeros(batch_shape, dtype=tf.float32)
+        flow_norm_mean_max = tf.zeros(batch_shape, dtype=tf.float32)
+        max_flow_frac = (
+            tf.zeros(batch_shape, dtype=tf.float32) if max_flow_norm is not None else None
+        )
+        log10_base = tf.math.log(tf.cast(10.0, tf.float32))
         stopped = tf.zeros(batch_shape, dtype=tf.bool)
         for i in range(self.num_lambda):
             if self.ll_grad_mode == "dist":
@@ -515,10 +526,16 @@ class KernelParticleFlow(FlowBase):
             flow = tf.einsum("...ij,...nj->...ni", B, flow) # preconditioning with B
             flow_norm_particles = update_norm(flow)
             flow_norm = tf.reduce_mean(flow_norm_particles, axis=-1)
+            flow_norm_mean_max = tf.maximum(flow_norm_mean_max, flow_norm)
             if max_flow_norm is not None:
+                clipped_frac = tf.reduce_mean(
+                    tf.cast(flow_norm_particles > max_flow_norm, tf.float32),
+                    axis=-1,
+                )
+                max_flow_frac = tf.maximum(max_flow_frac, clipped_frac)
                 flow_scale = tf.math.divide_no_nan(
                     max_flow_norm,
-                    flow_norm + tf.cast(self.jitter, tf.float32),
+                    flow_norm + jitter_val,
                 )
                 flow_scale = tf.minimum(flow_scale, 1.0)
                 flow = flow * flow_scale[..., tf.newaxis, tf.newaxis]
@@ -544,8 +561,64 @@ class KernelParticleFlow(FlowBase):
                 stopped,
                 flow_tol,
             )
+            dx_norm = update_norm(update_eff)
+            dx_p95 = self._percentile(dx_norm, 95.0)
+            dx_p95_max = tf.maximum(dx_p95_max, dx_p95)
+            if self.kernel_type == "scalar":
+                K_for_cond = K
+                K_sym = 0.5 * (K_for_cond + tf.linalg.matrix_transpose(K_for_cond))
+                eye_k = tf.eye(
+                    tf.shape(K_sym)[-1],
+                    batch_shape=tf.shape(K_sym)[:-2],
+                    dtype=K_sym.dtype,
+                )
+                K_sym = K_sym + jitter_val * eye_k
+                condK = self._cond_from_matrix(K_sym, eps_val)
+            else:
+                K_for_cond = K
+                rank = tf.rank(K_for_cond)
+                perm_swap = tf.concat(
+                    [
+                        tf.range(rank - 3),
+                        tf.stack([rank - 2, rank - 3, rank - 1]),
+                    ],
+                    axis=0,
+                )
+                K_t = tf.transpose(K_for_cond, perm=perm_swap)
+                K_sym = 0.5 * (K_for_cond + K_t)
+                perm_dx = tf.concat(
+                    [
+                        tf.range(rank - 3),
+                        tf.stack([rank - 1, rank - 3, rank - 2]),
+                    ],
+                    axis=0,
+                )
+                K_sym_dx = tf.transpose(K_sym, perm=perm_dx)
+                eye_k = tf.eye(
+                    tf.shape(K_sym_dx)[-1],
+                    batch_shape=tf.shape(K_sym_dx)[:-2],
+                    dtype=K_sym_dx.dtype,
+                )
+                K_sym_dx = K_sym_dx + jitter_val * eye_k
+                cond_per_dim = self._cond_from_matrix(K_sym_dx, eps_val)
+                condK = tf.reduce_max(cond_per_dim, axis=-1)
+            condK_log10 = tf.math.log(condK + eps_val) / log10_base
+            condK_log10_max = tf.maximum(condK_log10_max, condK_log10)
             x = x + update_eff
-        return x
+        cov = self._cov_from_particles(x, eps_float)
+        cond_cov = self._cond_from_matrix(cov, eps_val)
+        cond_cov_log10 = tf.math.log(cond_cov + eps_val) / log10_base
+        logdet_cov = self._logdet_cov_from_particles(x, eps_float)
+        diagnostics = {
+            "dx_p95_max": dx_p95_max,
+            "condK_log10_max": condK_log10_max,
+            "flow_norm_mean_max": flow_norm_mean_max,
+            "condCov_log10": cond_cov_log10,
+            "logdet_cov": logdet_cov,
+        }
+        if max_flow_frac is not None:
+            diagnostics["max_flow_frac"] = max_flow_frac
+        return x, diagnostics
 
     @tf.function
     def step(
@@ -569,7 +642,7 @@ class KernelParticleFlow(FlowBase):
         P_pred = self.ssm.state_cov(mu_tilde, w_prev)
 
         m, P = self._prior_from_sample(mu_tilde, w_prev)
-        x_t, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
+        x_t, log_det, flow_diag = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
 
         loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
 
@@ -582,13 +655,15 @@ class KernelParticleFlow(FlowBase):
             log_w = log_w_prev
 
         log_w_norm, w, _ = self._log_normalize(log_w)
+        x_pre = x_t
+        w_pre = w
 
         batch_shape_out = tf.shape(x_t)[:-2]
         parent_indices = tf.broadcast_to(
             tf.range(self.num_particles, dtype=tf.int32),
             tf.concat([batch_shape_out, [self.num_particles]], axis=0),
         )
-        return mu_tilde, x_t, log_w_norm, w, parent_indices, m_pred, P_pred
+        return mu_tilde, x_t, log_w_norm, w, parent_indices, m_pred, P_pred, x_pre, w_pre, flow_diag
 
     def sample(self, x_prev, y_t, w=None, seed=None):
         mu_tilde, log_q0 = self._propagate_particles(x_prev, seed=seed)

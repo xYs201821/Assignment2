@@ -51,7 +51,7 @@ def test_kernel_flow_step_outputs(lgssm_2d):
     x_prev, log_w_prev, _ = flow._init_particles(y_traj, init_dist=None)
     y_t = y_traj[:, 0, :]
 
-    x_pred, x, log_w, w, parent_indices, m_pred, P_pred = flow.step(
+    x_pred, x, log_w, w, parent_indices, m_pred, P_pred, x_pre, w_pre, flow_diag = flow.step(
         x_prev,
         log_w_prev,
         y_t,
@@ -67,8 +67,11 @@ def test_kernel_flow_step_outputs(lgssm_2d):
     assert parent_indices.shape == (batch_size, N)
     assert m_pred.shape == (batch_size, dx)
     assert P_pred.shape == (batch_size, dx, dx)
+    assert x_pre.shape == (batch_size, N, dx)
+    assert w_pre.shape == (batch_size, N)
+    assert isinstance(flow_diag, dict)
 
-    assert_all_finite(x_pred, x, w, m_pred, P_pred)
+    assert_all_finite(x_pred, x, w, m_pred, P_pred, x_pre, w_pre)
     tf.debugging.assert_near(
         tf.reduce_sum(w, axis=-1),
         tf.ones([batch_size], dtype=w.dtype),

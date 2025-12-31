@@ -39,6 +39,7 @@ class BootstrapParticleFilter(ParticleFilter):
         log_w = log_w_prev + tf.cast(loglik, tf.float32)
 
         log_w_norm, w, _ = self._log_normalize(log_w)
+        w_pre = w
         ess = self.ess(w)
 
         if resample in (1, 2):
@@ -70,7 +71,7 @@ class BootstrapParticleFilter(ParticleFilter):
             x_t = x_pred
 
         w_final = tf.exp(log_w_final)
-        return x_pred, x_t, log_w_final, w_final, parent_indices, m_pred, P_pred
+        return x_pred, x_t, log_w_final, w_final, parent_indices, m_pred, P_pred, w_pre
 
     def filter(
         self,
@@ -98,6 +99,7 @@ class BootstrapParticleFilter(ParticleFilter):
         x_ta = tf.TensorArray(tf.float32, size=T)
         x_pred_ta = tf.TensorArray(tf.float32, size=T)
         w_ta = tf.TensorArray(tf.float32, size=T)
+        w_pre_ta = tf.TensorArray(tf.float32, size=T)
         m_pred_ta = tf.TensorArray(tf.float32, size=T)
         P_pred_ta = tf.TensorArray(tf.float32, size=T)
         parent_ta = tf.TensorArray(tf.int32, size=T)
@@ -108,7 +110,7 @@ class BootstrapParticleFilter(ParticleFilter):
         for t in range(T):
             t_start = tf.timestamp()
             y_t = y[:, t, :]
-            x_pred, x, log_w, w, parent_indices, m_pred, P_pred = self.step(
+            x_pred, x, log_w, w, parent_indices, m_pred, P_pred, w_pre = self.step(
                 x_prev,
                 log_w,
                 y_t,
@@ -118,6 +120,7 @@ class BootstrapParticleFilter(ParticleFilter):
             x_pred_ta = x_pred_ta.write(t, x_pred)
             x_ta = x_ta.write(t, x)
             w_ta = w_ta.write(t, w)
+            w_pre_ta = w_pre_ta.write(t, w_pre)
             m_pred_ta = m_pred_ta.write(t, m_pred)
             P_pred_ta = P_pred_ta.write(t, P_pred)
             parent_ta = parent_ta.write(t, parent_indices)
@@ -153,6 +156,7 @@ class BootstrapParticleFilter(ParticleFilter):
             "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
             "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
             "x_pred": self._stack_and_permute(x_pred_ta, tail_dims=2),
+            "w_pre": self._stack_and_permute(w_pre_ta, tail_dims=1),
         }
         if mem_rss_ta is not None:
             diagnostics["memory_rss"] = self._stack_and_permute(mem_rss_ta, tail_dims=0)

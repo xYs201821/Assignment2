@@ -429,6 +429,73 @@ def _plot_ess_over_time(
     plt.close(fig)
 
 
+def _plot_stability_series(
+    path: Path,
+    values: np.ndarray,
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+    title: Optional[str] = None,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    arr = np.asarray(values)
+    if arr.ndim == 1:
+        mean = arr
+        lo = hi = None
+    else:
+        flat = arr.reshape(-1, arr.shape[-1])
+        mean = np.mean(flat, axis=0)
+        if band_percentiles is None:
+            lo = hi = None
+        else:
+            p_lo, p_hi = band_percentiles
+            lo = np.percentile(flat, p_lo, axis=0)
+            hi = np.percentile(flat, p_hi, axis=0)
+
+    t = np.arange(mean.shape[0])
+    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
+    ax.plot(t, mean, color="C0", linewidth=1.6)
+    if lo is not None and hi is not None:
+        ax.fill_between(t, lo, hi, color="C0", alpha=0.25, linewidth=0)
+    ax.set_xlabel("time")
+    ax.grid(True, linestyle=":")
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def _plot_stability_over_time(
+    output_dir: Path,
+    diagnostics: Dict[str, Any],
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+) -> None:
+    key_specs = [
+        ("logdet_cov", "logdet_cov"),
+        ("condH_log10_max", "condH_log10"),
+        ("condJ_log10_max", "condJ_log10"),
+        ("condK_log10_max", "condK_log10"),
+        ("flow_norm_mean_max", "flow_norm_mean"),
+    ]
+    for key, label in key_specs:
+        val = diagnostics.get(key)
+        if val is None:
+            continue
+        title = f"stability_{label}"
+        path = output_dir / f"{title}.png"
+        _plot_stability_series(
+            path,
+            np.asarray(val),
+            band_percentiles=band_percentiles,
+            show=show,
+            title=title,
+        )
+
+
 def _as_list(value: Any) -> List[Any]:
     if value is None:
         return []
@@ -539,6 +606,22 @@ def main() -> None:
     plot_pf_ess_show = bool(exp_cfg.get("plot_pf_ess_show", False))
     plot_pf_obs_index = exp_cfg.get("plot_pf_obs_index")
     plot_pf_unobs_index = exp_cfg.get("plot_pf_unobs_index")
+    plot_stability = bool(exp_cfg.get("plot_stability", False))
+    plot_stability_seed0_only = bool(exp_cfg.get("plot_stability_seed0_only", True))
+    plot_stability_show = bool(exp_cfg.get("plot_stability_show", False))
+    plot_stability_percentiles = exp_cfg.get("plot_stability_percentiles")
+    if plot_stability_percentiles is None:
+        plot_stability_percentiles = (25.0, 75.0)
+    else:
+        vals = (
+            list(plot_stability_percentiles)
+            if isinstance(plot_stability_percentiles, (list, tuple))
+            else []
+        )
+        if len(vals) >= 2:
+            plot_stability_percentiles = (float(vals[0]), float(vals[1]))
+        else:
+            plot_stability_percentiles = (25.0, 75.0)
     if plot_kflow_time is None:
         plot_kflow_time = min(T - 1, 19)
     plot_kflow_time = int(plot_kflow_time)
@@ -766,6 +849,17 @@ def main() -> None:
                                     if ess_t is not None:
                                         diag["ess_t"] = ess_t
                                 save_npz(method_dir / "diagnostics.npz", **diag)
+                                if plot_stability and (
+                                    not plot_stability_seed0_only or seed == seeds[0]
+                                ):
+                                    diag_src = out.get("diagnostics", {})
+                                    if isinstance(diag_src, dict):
+                                        _plot_stability_over_time(
+                                            method_dir,
+                                            diag_src,
+                                            band_percentiles=plot_stability_percentiles,
+                                            show=plot_stability_show,
+                                        )
 
                             print_separator(f"exp1_linear_gaussian {cfg_tag} seed{seed} summary")
                             print_method_summary_table(metrics_by_method, method_order=tuple(methods))

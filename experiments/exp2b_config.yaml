@@ -1,35 +1,39 @@
 experiment:
   output_root: results/exp2b_range_bearing
-  T: 60
-  batch_size: 10
+  T: 30
+  batch_size: 100
   seeds: [42, ]
   pair_particles: true
-  save_particles_seed0: false
+  save_particles_seed0: true
   plot_state: true
   plot_seed0_only: true
   show_plots: true
   plot_interactive: true
   plot_time_gap: 5
-  plot_pf_ess: true
+  plot_pf_ess: false
   plot_pf_ess_seed0_only: true
   plot_pf_ess_show: false
-  plot_pf_degeneracy: true
+  plot_pf_degeneracy: false
   plot_pf_degeneracy_seed0_only: true
   plot_pf_degeneracy_show: false
   plot_pf_degeneracy_time: null
+  plot_stability: true
+  plot_stability_seed0_only: true
+  plot_stability_show: false
+  plot_stability_percentiles: [25, 75]
 model:
   dt: 0.1
   cov_eps:
     - [0.01, 0.0, 0.0, 0.0]
     - [0.0, 0.01, 0.0, 0.0]
-    - [0.0, 0.0, 0.01, 0.0]
+    - [0.0, 0.0, 0.01, 0.0] 
     - [0.0, 0.0, 0.0, 0.01]
   jitter: 1e-6
   distances: [0.5]
-  sigma_thetas: [3.0]
-  sigma_rs: [0.1]
+  sigma_thetas: [30.0]
+  sigma_rs: [.5]
 filters:
-  methods: [ekf, ukf, pf, edh, ledh, kflow_diag, kflow_scalar]
+  methods: [ekf, ukf, pf, edh]
   ukf:
     alpha: 5e-1
     beta: 2.0
@@ -38,10 +42,10 @@ filters:
   pf:
     num_particles: [10000]
     ess_threshold: 0.5
-    reweight: always
+    reweight: auto
   flow:
     num_particles: [200]
-    num_lambda: 20
+    num_lambda: 100
     ess_threshold: 0.5
     reweight: never
   kflow:
@@ -50,14 +54,14 @@ filters:
     optimizer_beta_1: [0.9]
     optimizer_beta_2: [0.999]
     num_particles: [100]
-    num_lambda: [20]
-    alpha: [median]
+    num_lambda: [100]
+    alpha: [0.1]
     ll_grad_mode: [dist]
     alpha_update_every: [1]
     ds_init: [0.05]
     max_flow_norm: [5.0]
     localization_radius: [null]
 init:
-  x0: [1., .9, -.1, -.1]
+  x0: [1., -.9, .1, -.1]
   m0_offset: [-.5, .5, 0.0, 0.0]
   P0_diag: [1.0, 1.0, .5, .5]

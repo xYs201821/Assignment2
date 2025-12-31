@@ -1,3 +1,5 @@
+from typing import Dict
+
 import tensorflow as tf
 
 from src.filters.particle import ParticleFilter
@@ -26,6 +28,51 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         self.init_from_particles = init_from_particles
         self.debug = bool(debug)
         self.jitter = jitter
+
+    @staticmethod
+    def _percentile(values: tf.Tensor, q: float) -> tf.Tensor:
+        values = tf.sort(values, axis=-1)
+        n = tf.shape(values)[-1]
+        q = tf.cast(q, values.dtype) / tf.cast(100.0, values.dtype)
+        idx = tf.cast(tf.floor(q * tf.cast(n - 1, values.dtype)), tf.int32)
+        idx = tf.clip_by_value(idx, 0, tf.maximum(n - 1, 0))
+        return tf.gather(values, idx, axis=-1)
+
+    @staticmethod
+    def _cond_from_matrix(mat: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
+        mat = 0.5 * (mat + tf.linalg.matrix_transpose(mat))
+        eigvals = tf.linalg.eigvalsh(mat)
+        eig_min = tf.reduce_min(eigvals, axis=-1)
+        eig_max = tf.reduce_max(eigvals, axis=-1)
+        eig_min = tf.maximum(eig_min, eps)
+        return eig_max / (eig_min + eps)
+
+    @staticmethod
+    def _cond_from_rect(mat: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
+        s = tf.linalg.svd(mat, compute_uv=False)
+        s_max = tf.reduce_max(s, axis=-1)
+        s_min = tf.reduce_min(s, axis=-1)
+        return s_max / (s_min + eps)
+
+    @staticmethod
+    def _cov_from_particles(x: tf.Tensor, eps: float) -> tf.Tensor:
+        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        mean = tf.reduce_mean(x, axis=-2)
+        resid = x - mean[..., tf.newaxis, :]
+        n = tf.cast(tf.shape(x)[-2], x.dtype)
+        denom = tf.maximum(n - 1.0, 1.0)
+        cov = tf.einsum("...ni,...nj->...ij", resid, resid) / denom
+        cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
+        eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
+        cov = cov + eye * tf.cast(eps, cov.dtype)
+        return cov
+
+    @staticmethod
+    def _logdet_cov_from_particles(x: tf.Tensor, eps: float) -> tf.Tensor:
+        cov = FlowBase._cov_from_particles(x, eps)
+        eigvals = tf.linalg.eigvalsh(cov)
+        eigvals = tf.maximum(eigvals, tf.cast(eps, eigvals.dtype))
+        return tf.reduce_sum(tf.math.log(eigvals), axis=-1)
 
     # --- Prior builders (can be overridden by subclasses) ---
     def _prior_from_sample(self, mu_tilde, w, batch_shape, state_dim):
@@ -111,7 +158,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         batch_shape = tf.shape(mu_tilde)[:-2]
         state_dim = tf.shape(mu_tilde)[-1]
         m, P = self._prior_from_sample(mu_tilde, w_prev, batch_shape, state_dim)
-        x_t, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P)
+        x_t, log_det, flow_diag = self._flow_transport(mu_tilde, y_t, m, P)
 
         loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
 
@@ -135,6 +182,8 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             log_w = log_w_prev
 
         log_w_norm, w, _ = self._log_normalize(log_w)
+        x_pre = x_t
+        w_pre = w
 
         if resample in (1, 2):
             ess = self.ess(w)
@@ -165,7 +214,18 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             )
             log_w_final = log_w_norm
             w_final = w
-        return mu_tilde, x_t, log_w_final, w_final, parent_indices, m_pred, P_pred
+        return (
+            mu_tilde,
+            x_t,
+            log_w_final,
+            w_final,
+            parent_indices,
+            m_pred,
+            P_pred,
+            x_pre,
+            w_pre,
+            flow_diag,
+        )
 
     def filter(
         self,
@@ -199,16 +259,30 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         x_ta = tf.TensorArray(tf.float32, size=T)
         x_pred_ta = tf.TensorArray(tf.float32, size=T)
         w_ta = tf.TensorArray(tf.float32, size=T)
+        w_pre_ta = tf.TensorArray(tf.float32, size=T)
         m_pred_ta = tf.TensorArray(tf.float32, size=T)
         P_pred_ta = tf.TensorArray(tf.float32, size=T)
         parent_ta = tf.TensorArray(tf.int32, size=T)
         step_time_ta = tf.TensorArray(tf.float32, size=T)
+        x_pre_ta = tf.TensorArray(tf.float32, size=T)
+        flow_diag_ta: Dict[str, tf.TensorArray] = {}
         mem_rss_ta = tf.TensorArray(tf.float32, size=T) if memory_sampler is not None else None
         mem_gpu_ta = tf.TensorArray(tf.float32, size=T) if memory_sampler is not None else None
         for t in range(T):
             t_start = tf.timestamp()
             y_t = y[..., t, :]
-            x_pred, x, log_w, w, parent_indices, m_pred, P_pred = self.step(
+            (
+                x_pred,
+                x,
+                log_w,
+                w,
+                parent_indices,
+                m_pred,
+                P_pred,
+                x_pre,
+                w_pre,
+                flow_diag,
+            ) = self.step(
                 x_prev,
                 log_w,
                 y_t,
@@ -219,9 +293,18 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             x_pred_ta = x_pred_ta.write(t, x_pred)
             x_ta = x_ta.write(t, x)
             w_ta = w_ta.write(t, w)
+            w_pre_ta = w_pre_ta.write(t, w_pre)
             m_pred_ta = m_pred_ta.write(t, m_pred)
             P_pred_ta = P_pred_ta.write(t, P_pred)
             parent_ta = parent_ta.write(t, parent_indices)
+            x_pre_ta = x_pre_ta.write(t, x_pre)
+            if isinstance(flow_diag, dict):
+                for key, value in flow_diag.items():
+                    if value is None:
+                        continue
+                    if key not in flow_diag_ta:
+                        flow_diag_ta[key] = tf.TensorArray(tf.float32, size=T)
+                    flow_diag_ta[key] = flow_diag_ta[key].write(t, tf.cast(value, tf.float32))
             step_time = tf.cast(tf.timestamp() - t_start, tf.float32)
             step_time_ta = step_time_ta.write(t, step_time)
             if memory_sampler is not None:
@@ -253,7 +336,11 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
             "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
             "x_pred": self._stack_and_permute(x_pred_ta, tail_dims=2),
+            "x_pre": self._stack_and_permute(x_pre_ta, tail_dims=2),
+            "w_pre": self._stack_and_permute(w_pre_ta, tail_dims=1),
         }
+        for key, ta in flow_diag_ta.items():
+            diagnostics[key] = self._stack_and_permute(ta, tail_dims=0)
         if mem_rss_ta is not None:
             diagnostics["memory_rss"] = self._stack_and_permute(mem_rss_ta, tail_dims=0)
         if mem_gpu_ta is not None:

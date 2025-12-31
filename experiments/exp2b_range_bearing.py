@@ -75,6 +75,21 @@ def build_initial_cov(init_cfg: Dict[str, Any]) -> np.ndarray:
     return np.diag(diag)
 
 
+def build_init_particles(
+    m0: np.ndarray,
+    P0: np.ndarray,
+    num_particles: int,
+    batch_size: int,
+    seed: int,
+) -> np.ndarray:
+    rng = np.random.default_rng(int(seed))
+    dx = int(m0.shape[0])
+    z = rng.standard_normal((batch_size, num_particles, dx)).astype(np.float32)
+    z = z - z.mean(axis=1, keepdims=True)
+    L = np.linalg.cholesky(P0).astype(np.float32)
+    return m0.astype(np.float32) + np.matmul(z, L.T)
+
+
 def _plot_state_trajectory(
     path: Path,
     x_true: tf.Tensor,
@@ -86,36 +101,11 @@ def _plot_state_trajectory(
     time_gap: Optional[int] = None,
 ) -> None:
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import CheckButtons
 
     x_true_np = np.asarray(x_true)[0]
     markevery = max(1, int(len(x_true_np) / 12))
     fig, ax = plt.subplots(figsize=(5, 5))
-    lines = []
-    labels = []
-    annotations: Dict[str, List[Any]] = {}
-
-    def _annotate_series(label: str, xs: np.ndarray, ys: np.ndarray, color: Any) -> None:
-        if time_gap is None or time_gap <= 0:
-            return
-        texts: List[Any] = []
-        for t in range(0, len(xs), time_gap):
-            texts.append(
-                ax.annotate(
-                    str(t),
-                    (xs[t], ys[t]),
-                    textcoords="offset points",
-                    xytext=(3, 3),
-                    fontsize=7,
-                    color=color,
-                    alpha=0.8,
-                )
-            )
-        annotations[label] = texts
     line_true, = ax.plot(x_true_np[:, 0], x_true_np[:, 1], color="k", label="true", linestyle="-")
-    lines.append(line_true)
-    labels.append("true")
-    _annotate_series("true", x_true_np[:, 0], x_true_np[:, 1], line_true.get_color())
     style_cycle = cycle(["-", "--", "-.", ":", (0, (3, 1, 1, 1))])
     marker_cycle = cycle(["o", "s", "^", "v", "D", "x", "P", "*"])
     for method in method_order:
@@ -132,35 +122,12 @@ def _plot_state_trajectory(
             markevery=markevery,
             markersize=4,
         )
-        lines.append(line)
-        labels.append(method)
-        _annotate_series(method, mean_np[:, 0], mean_np[:, 1], line.get_color())
-    if title:
-        ax.set_title(title)
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_aspect("equal", adjustable="box")
     ax.grid(True, linestyle=":")
     ax.legend(fontsize=8)
-    if interactive and show:
-        fig.tight_layout(rect=(0.0, 0.0, 0.75, 1.0))
-        selector_ax = fig.add_axes([0.78, 0.2, 0.2, 0.6])
-        selector_ax.set_title("Trajectories", fontsize=9)
-        visibility = [line.get_visible() for line in lines]
-        check = CheckButtons(selector_ax, labels, visibility)
-
-        def _toggle(label):
-            idx = labels.index(label)
-            line = lines[idx]
-            new_vis = not line.get_visible()
-            line.set_visible(new_vis)
-            for text in annotations.get(label, []):
-                text.set_visible(new_vis)
-            fig.canvas.draw_idle()
-
-        check.on_clicked(_toggle)
-    else:
-        fig.tight_layout()
+    fig.tight_layout()
     fig.savefig(path, dpi=150)
     if show:
         plt.show()
@@ -199,6 +166,7 @@ def _plot_ess_over_time(
     path: Path,
     w: np.ndarray,
     ess_threshold: Optional[float] = None,
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
     show: bool = False,
     title: Optional[str] = None,
 ) -> None:
@@ -209,14 +177,22 @@ def _plot_ess_over_time(
         return
     T = ess_t.shape[1]
     t = np.arange(T)
-    ess_mean = np.mean(ess_t, axis=0)
-    ess_min = np.min(ess_t, axis=0)
-    ess_max = np.max(ess_t, axis=0)
 
     fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
+    ess_mean = np.mean(ess_t, axis=0)
     ax.plot(t, ess_mean, color="C0", linewidth=1.6, label="ESS mean")
-    if ess_t.shape[0] > 1:
-        ax.fill_between(t, ess_min, ess_max, color="C0", alpha=0.2, label="ESS range")
+    if ess_t.shape[0] > 1 and band_percentiles is not None:
+        p_lo, p_hi = band_percentiles
+        ess_lo = np.percentile(ess_t, p_lo, axis=0)
+        ess_hi = np.percentile(ess_t, p_hi, axis=0)
+        ax.fill_between(
+            t,
+            ess_lo,
+            ess_hi,
+            color="C0",
+            alpha=0.2,
+            label=f"ESS p{int(p_lo)}-p{int(p_hi)}",
+        )
     if ess_threshold is not None:
         N = np.asarray(w).shape[-1]
         ax.axhline(
@@ -240,95 +216,154 @@ def _plot_ess_over_time(
     plt.close(fig)
 
 
-def _plot_pf_degeneracy(
+def _plot_stability_series(
     path: Path,
-    pf_out: Dict[str, Any],
+    values: np.ndarray,
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+    title: Optional[str] = None,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    arr = np.asarray(values)
+    if arr.ndim == 1:
+        mean = arr
+        lo = hi = None
+    else:
+        flat = arr.reshape(-1, arr.shape[-1])
+        mean = np.mean(flat, axis=0)
+        if band_percentiles is None:
+            lo = hi = None
+        else:
+            p_lo, p_hi = band_percentiles
+            lo = np.percentile(flat, p_lo, axis=0)
+            hi = np.percentile(flat, p_hi, axis=0)
+
+    t = np.arange(mean.shape[0])
+    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
+    ax.plot(t, mean, color="C0", linewidth=1.6)
+    if lo is not None and hi is not None:
+        ax.fill_between(t, lo, hi, color="C0", alpha=0.25, linewidth=0)
+    ax.set_xlabel("time")
+    ax.grid(True, linestyle=":")
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def _plot_stability_over_time(
+    output_dir: Path,
+    diagnostics: Dict[str, Any],
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+) -> None:
+    key_specs = [
+        ("logdet_cov", "logdet_cov"),
+        ("condH_log10_max", "condH_log10"),
+        ("condJ_log10_max", "condJ_log10"),
+        ("condK_log10_max", "condK_log10"),
+        ("flow_norm_mean_max", "flow_norm_mean"),
+    ]
+    for key, label in key_specs:
+        val = diagnostics.get(key)
+        if val is None:
+            continue
+        title = f"stability_{label}"
+        path = output_dir / f"{title}.png"
+        _plot_stability_series(
+            path,
+            np.asarray(val),
+            band_percentiles=band_percentiles,
+            show=show,
+            title=title,
+        )
+
+
+def _plot_particle_cloud(
+    path: Path,
+    x_particles: np.ndarray,
+    w: np.ndarray,
     x_true: np.ndarray,
-    t_index: int,
+    time_indices: List[int],
     show: bool = False,
     title: Optional[str] = None,
     dims: Tuple[int, int] = (0, 1),
 ) -> None:
     import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
 
-    x_particles = pf_out.get("x_particles")
-    w = pf_out.get("w")
-    if x_particles is None or w is None:
-        return
     x_np = np.asarray(x_particles)
     w_np = np.asarray(w)
-    if x_np.ndim < 4:
-        return
+    x_true_np = np.asarray(x_true)
+    if x_np.ndim == 3:
+        x_np = x_np[np.newaxis, ...]
     if w_np.ndim == 2:
         w_np = w_np[np.newaxis, ...]
-    if w_np.ndim != 3:
+    if x_np.ndim != 4 or w_np.ndim != 3 or x_true_np.ndim < 3:
         return
-    t = min(t_index, x_np.shape[1] - 1)
+    T = min(x_np.shape[1], w_np.shape[1], x_true_np.shape[1])
+    times = [t for t in time_indices if 0 <= t < T]
+    if not times:
+        return
     b = 0
     if x_np.shape[0] == 0:
         return
-    post = x_np[b, t]
-    w_t = w_np[b, t]
-    w_sum = np.sum(w_t)
-    if w_sum > 0:
-        w_t = w_t / w_sum
 
     idx0, idx1 = dims
-    if post.shape[-1] <= max(idx0, idx1):
+    if x_np.shape[-1] <= max(idx0, idx1):
         return
-    post_xy = post[:, [idx0, idx1]]
 
-    w_max = np.max(w_t) if w_t.size > 0 else 0.0
-    size_scale = w_t / (w_max + 1e-12)
-    sizes = 12.0 + 80.0 * size_scale
+    weights: List[np.ndarray] = []
+    w_max = 0.0
+    for t in times:
+        w_t = w_np[b, t]
+        w_sum = np.sum(w_t)
+        if w_sum > 0:
+            w_t = w_t / w_sum
+        weights.append(w_t)
+        if w_t.size > 0:
+            w_max = max(w_max, float(np.max(w_t)))
+    if w_max <= 0:
+        w_max = 1.0
 
-    fig, axes = plt.subplots(1, 2, figsize=(9, 4), sharey=False)
-    sc = axes[0].scatter(
-        post_xy[:, 0],
-        post_xy[:, 1],
-        s=sizes,
-        c=w_t,
-        cmap="viridis",
-        alpha=0.85,
-        edgecolors="none",
+    cmap = plt.get_cmap("viridis")
+    norm = Normalize(vmin=0.0, vmax=w_max)
+    markers = ["o", "^", "s"]
+
+    fig, ax = plt.subplots(figsize=(5.5, 5.0))
+    ax.plot(
+        x_true_np[b, :, idx0],
+        x_true_np[b, :, idx1],
+        color="k",
+        linewidth=1.2,
+        label="true",
     )
-    mean = pf_out.get("mean")
-    if mean is not None:
-        mean_np = np.asarray(mean)
-        if mean_np.ndim >= 3:
-            mean_xy = mean_np[b, t, [idx0, idx1]]
-            axes[0].scatter(
-                mean_xy[0],
-                mean_xy[1],
-                s=70,
-                c="red",
-                marker="x",
-                linewidths=1.5,
-            )
-    x_true_np = np.asarray(x_true)
-    if x_true_np.ndim >= 3:
-        true_xy = x_true_np[b, t, [idx0, idx1]]
-        axes[0].scatter(
-            true_xy[0],
-            true_xy[1],
-            s=70,
-            c="black",
-            marker="+",
-            linewidths=1.5,
+    for i, t in enumerate(times):
+        post = x_np[b, t][:, [idx0, idx1]]
+        ax.scatter(
+            post[:, 0],
+            post[:, 1],
+            s=8.0,
+            c=weights[i],
+            cmap=cmap,
+            norm=norm,
+            alpha=0.8,
+            edgecolors="none",
+            marker=markers[i % len(markers)],
+            label=f"t={t}",
         )
-    axes[0].set_xlabel(f"x{idx0}")
-    axes[0].set_ylabel(f"x{idx1}")
-    axes[0].grid(True, linestyle=":")
-    fig.colorbar(sc, ax=axes[0], label="weight")
-
-    w_sorted = np.sort(w_t)[::-1]
-    axes[1].plot(w_sorted, color="C1", linewidth=1.4)
-    axes[1].set_xlabel("particle (sorted)")
-    axes[1].set_ylabel("weight")
-    axes[1].grid(True, linestyle=":")
-    if w_sum > 0:
-        ess_val = 1.0 / np.sum(np.square(w_t))
-        axes[1].set_title(f"ESS={ess_val:.1f}")
+    ax.set_xlabel(f"x{idx0}")
+    ax.set_ylabel(f"x{idx1}")
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, linestyle=":")
+    ax.legend(fontsize=8, loc="best")
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    fig.colorbar(sm, ax=ax, label="weight")
 
     if title:
         fig.suptitle(title)
@@ -337,6 +372,34 @@ def _plot_pf_degeneracy(
     if show:
         plt.show()
     plt.close(fig)
+
+
+def _is_pf_method(method: str) -> bool:
+    method = str(method).lower()
+    return method in ("pf", "bootstrap") or method.startswith("pf")
+
+
+def _is_pfpf_flow_method(method: str) -> bool:
+    method = str(method).lower()
+    return "pfpf" in method and (method.startswith("edh") or method.startswith("ledh"))
+
+
+def _select_pre_resample_particles(out: Dict[str, Any]) -> Optional[np.ndarray]:
+    diagnostics = out.get("diagnostics", {}) if isinstance(out, dict) else {}
+    x_pre = diagnostics.get("x_pre")
+    if x_pre is None:
+        x_pre = diagnostics.get("x_pred")
+    if x_pre is None:
+        x_pre = out.get("x_particles") if isinstance(out, dict) else None
+    return x_pre
+
+
+def _select_pre_resample_weights(out: Dict[str, Any]) -> Optional[np.ndarray]:
+    diagnostics = out.get("diagnostics", {}) if isinstance(out, dict) else {}
+    w_pre = diagnostics.get("w_pre")
+    if w_pre is None:
+        w_pre = out.get("w") if isinstance(out, dict) else None
+    return w_pre
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -453,11 +516,20 @@ def main() -> None:
     plot_pf_degeneracy = bool(exp_cfg.get("plot_pf_degeneracy", False))
     plot_pf_degeneracy_seed0_only = bool(exp_cfg.get("plot_pf_degeneracy_seed0_only", True))
     plot_pf_degeneracy_show = bool(exp_cfg.get("plot_pf_degeneracy_show", False))
-    plot_pf_degeneracy_time = exp_cfg.get("plot_pf_degeneracy_time")
-    if plot_pf_degeneracy_time is None:
-        plot_pf_degeneracy_time = min(T - 1, 19)
-    plot_pf_degeneracy_time = int(plot_pf_degeneracy_time)
-    plot_pf_degeneracy_time = max(0, min(plot_pf_degeneracy_time, T - 1))
+    plot_pf_degeneracy_times = [0, 9, 29]
+    plot_pf_degeneracy_times = [t for t in plot_pf_degeneracy_times if 0 <= t < T]
+    plot_stability = bool(exp_cfg.get("plot_stability", False))
+    plot_stability_seed0_only = bool(exp_cfg.get("plot_stability_seed0_only", True))
+    plot_stability_show = bool(exp_cfg.get("plot_stability_show", False))
+    plot_stability_percentiles = exp_cfg.get("plot_stability_percentiles")
+    if plot_stability_percentiles is None:
+        plot_stability_percentiles = (25.0, 75.0)
+    else:
+        vals = list(plot_stability_percentiles) if isinstance(plot_stability_percentiles, (list, tuple)) else []
+        if len(vals) >= 2:
+            plot_stability_percentiles = (float(vals[0]), float(vals[1]))
+        else:
+            plot_stability_percentiles = (25.0, 75.0)
 
     distances = [float(d) for d in _as_list(model_cfg.get("distances", [0.5, 2.0, 10.0]))]
     sigma_thetas = [float(s) for s in _as_list(model_cfg.get("sigma_thetas", [1.0, 5.0, 15.0]))]
@@ -480,7 +552,17 @@ def main() -> None:
         for m in _as_list(
             filters_cfg.get(
                 "methods",
-                ["ekf", "ukf", "pf", "edh", "ledh", "kflow_scalar", "kflow_diag"],
+                [
+                    "ekf",
+                    "ukf",
+                    "pf",
+                    "edh",
+                    "edh(pfpf)",
+                    "ledh",
+                    "ledh(pfpf)",
+                    "kflow_scalar",
+                    "kflow_diag",
+                ],
             )
         )
     ]
@@ -538,6 +620,16 @@ def main() -> None:
                     }
                     for seed in seeds:
                         set_seed(seed)
+                        particle_counts = {
+                            int(filter_cfg.get(method, {}).get("num_particles"))
+                            for method in methods
+                            if method not in ("kf", "kalman", "ekf", "ukf")
+                            and filter_cfg.get(method, {}).get("num_particles") is not None
+                        }
+                        init_particles_by_n = {
+                            n: build_init_particles(m0, P0, n, batch_size, seed)
+                            for n in particle_counts
+                        }
                         sim_ssm = build_ssm(
                             sigma_r=sigma_r,
                             sigma_theta=np.deg2rad(sigma_theta),
@@ -568,6 +660,11 @@ def main() -> None:
                                 method_cfg["P0"] = P0
                             else:
                                 method_cfg["init_dist"] = init_dist
+                                num_particles = method_cfg.get("num_particles")
+                                if num_particles is not None:
+                                    init_particles = init_particles_by_n.get(int(num_particles))
+                                    if init_particles is not None:
+                                        method_cfg["init_particles"] = init_particles
                             method_cfg["init_seed"] = seed
                             out = run_filter(
                                 method_ssm,
@@ -599,32 +696,39 @@ def main() -> None:
                             metrics_by_method[method] = metrics
                             metrics_across_seeds[method].append(metrics)
 
-                            if method.startswith("pf"):
+                            if _is_pf_method(method) or _is_pfpf_flow_method(method):
                                 if plot_pf_ess and (
                                     not plot_pf_ess_seed0_only or seed == seeds[0]
                                 ):
-                                    w = out.get("w")
-                                    if w is not None:
+                                    w_pre = _select_pre_resample_weights(out)
+                                    if w_pre is not None:
+                                        ess_threshold = (
+                                            pf_ess_threshold
+                                            if _is_pf_method(method)
+                                            else flow_ess_threshold
+                                        )
                                         plot_path = method_dir / "pf_ess_over_time.png"
                                         _plot_ess_over_time(
                                             plot_path,
-                                            w,
-                                            ess_threshold=pf_ess_threshold,
+                                            w_pre,
+                                            ess_threshold=ess_threshold,
                                             show=plot_pf_ess_show,
                                         )
                                 if plot_pf_degeneracy and (
                                     not plot_pf_degeneracy_seed0_only or seed == seeds[0]
                                 ):
-                                    plot_path = method_dir / (
-                                        f"pf_degeneracy_t{plot_pf_degeneracy_time}.png"
-                                    )
-                                    _plot_pf_degeneracy(
-                                        plot_path,
-                                        pf_out=out,
-                                        x_true=x_true,
-                                        t_index=plot_pf_degeneracy_time,
-                                        show=plot_pf_degeneracy_show,
-                                    )
+                                    x_pre = _select_pre_resample_particles(out)
+                                    w_pre = _select_pre_resample_weights(out)
+                                    if x_pre is not None and w_pre is not None:
+                                        plot_path = method_dir / "pf_particles_t0_9_29.png"
+                                        _plot_particle_cloud(
+                                            plot_path,
+                                            x_particles=x_pre,
+                                            w=w_pre,
+                                            x_true=x_true,
+                                            time_indices=plot_pf_degeneracy_times,
+                                            show=plot_pf_degeneracy_show,
+                                        )
 
                             diag = {
                                 k: v
@@ -635,9 +739,11 @@ def main() -> None:
                             diag["cov"] = out["cov"]
                             diff = x_true - out["mean"]
                             diag["rmse_t"] = tf.norm(diff, axis=-1)
-                            w = out.get("w")
-                            if w is not None and not out.get("is_gaussian", False):
-                                ess_t = _ess_from_weights(np.asarray(w))
+                            w_pre = _select_pre_resample_weights(out)
+                            if w_pre is None:
+                                w_pre = out.get("w")
+                            if w_pre is not None and not out.get("is_gaussian", False):
+                                ess_t = _ess_from_weights(np.asarray(w_pre))
                                 if ess_t is not None:
                                     diag["ess_t"] = ess_t
                                 parents = out.get("parents")
@@ -649,6 +755,17 @@ def main() -> None:
                                 diag["x_particles"] = out["x_particles"]
                                 diag["w"] = out["w"]
                             save_npz(method_dir / "diagnostics.npz", **diag)
+                            if plot_stability and (
+                                not plot_stability_seed0_only or seed == seeds[0]
+                            ):
+                                diag_src = out.get("diagnostics", {})
+                                if isinstance(diag_src, dict):
+                                    _plot_stability_over_time(
+                                        method_dir,
+                                        diag_src,
+                                        band_percentiles=plot_stability_percentiles,
+                                        show=plot_stability_show,
+                                    )
 
                         print_separator(f"exp2b_range_bearing {cfg_tag} seed{seed} summary")
                         print_method_summary_table(metrics_by_method, method_order=tuple(methods))

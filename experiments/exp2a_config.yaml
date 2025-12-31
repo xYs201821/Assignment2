@@ -1,7 +1,7 @@
 experiment:
   output_root: results/exp2a_stochastic_vol
   T: 60
-  batch_size: 10
+  batch_size: 100
   seeds: [42, ]
   pair_particles: true
   calc_ekf_jacobian_error: false
@@ -10,6 +10,14 @@ experiment:
   show_plots: true
   plot_interactive: true
   plot_time_gap: 5
+  plot_pf_ess: true
+  plot_pf_ess_seed0_only: true
+  plot_pf_ess_show: true
+  plot_pf_ess_percentiles: [10, 90]
+  plot_stability: true
+  plot_stability_seed0_only: true
+  plot_stability_show: false
+  plot_stability_percentiles: [25, 75]
 model:
   alpha: 0.99
   mu: 0.1
@@ -19,7 +27,7 @@ model:
   sigmas: [0.6]
   obs_modes: [logy2, ]
 filters:
-  methods: [ekf, ukf, pf, edh, ledh, kflow_diag, kflow_scalar]
+  methods: [ekf, ukf, pf, edh, ledh, edh(pfpf), edh(pfpf), kflow_diag, kflow_scalar]
   ukf:
     alpha: 1e-1
     beta: 2.0
@@ -28,10 +36,10 @@ filters:
   pf:
     num_particles: [1000]
     ess_threshold: 0.5
-    reweight: always
+    reweight: auto
   flow:
     num_particles: [200]
-    num_lambda: 20
+    num_lambda: 100
     ess_threshold: 0.5
     reweight: never
   kflow:
@@ -40,11 +48,11 @@ filters:
     optimizer_beta_1: [0.9]
     optimizer_beta_2: [0.999]
     num_particles: [50]
-    num_lambda: [40]
-    alpha: [0.05]
+    num_lambda: [100]
+    alpha: [0.1]
     ll_grad_mode: [dist]
     alpha_update_every: [40]
-    ds_init: [0.1]
+    ds_init: [0.05]
     max_flow_norm: [5.0]
     localization_radius: [null]
 init:

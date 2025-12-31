@@ -1,16 +1,16 @@
 experiment:
   output_root: results/exp1_linear_gaussian
   T: 20
-  batch_size: 100
+  batch_size: 50
   seeds: [42, ]
-  dims: [4, 16, 64]
+  dims: [64,]
   dy_ratio: 0.25
-  plot_kflow_marginals: true
-  plot_kflow_seed0_only: true
-  plot_kflow_show: true
+  plot_kflow_marginals: false
+  plot_kflow_seed0_only: false
+  plot_kflow_show: false
   plot_kflow_time: 1
   plot_kflow_contour_method: kf
-  plot_kflow_prior: true
+  plot_kflow_prior: false
   plot_kflow_obs_index: null
   plot_kflow_unobs_index: null
   plot_pf_degeneracy: false
@@ -22,6 +22,10 @@ experiment:
   plot_pf_ess_show: false
   plot_pf_obs_index: null
   plot_pf_unobs_index: null
+  plot_stability: true
+  plot_stability_seed0_only: true
+  plot_stability_show: false
+  plot_stability_percentiles: [25, 75]
 model:
   alpha: 0.9
   alpha0: 1.0
@@ -30,7 +34,7 @@ model:
   sigma_z: [0.5]
   p0_scale: 1.0
 filters:
-  methods: [kf, ekf, ukf, pf, edh, edh(pfpf), ledh, ledh(pfpf), kflow_diag, kflow_scalar]
+  methods: [kf, pf, edh(pfpf), ledh(pfpf)]
   ukf:
     alpha: 1e-1
     beta: 2.0
@@ -41,7 +45,7 @@ filters:
     ess_threshold: 0.5
     reweight: always
   flow:
-    num_particles: [1000]
+    num_particles: [500]
     num_lambda: 100
     ess_threshold: 0.5
     reweight: never
@@ -50,7 +54,7 @@ filters:
     optimizer_eps: [1e-6]
     optimizer_beta_1: [0.9]
     optimizer_beta_2: [0.999]
-    num_particles: [500]
+    num_particles: [250]
     num_lambda: [100]
     alpha: [0.1]
     ll_grad_mode: [dist]

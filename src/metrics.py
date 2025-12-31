@@ -65,7 +65,7 @@ def nees(x_true: Any, mean: Any, cov: Any) -> tf.Tensor:
     mean = _to_tensor(mean)
     cov = _stabilize_cov(_to_tensor(cov))
     err = (mean - x_true)[..., tf.newaxis]
-    sol = cholesky_solve(cov, err)
+    sol = cholesky_solve(cov, err, jitter=1e-6)
     val = tf.reduce_sum(err * sol, axis=(-2, -1))
     return val
 
@@ -75,7 +75,7 @@ def nis(innovation: Any, S: Any) -> tf.Tensor:
     S = _to_tensor(S)
     S = _stabilize_cov(S)
     v = innovation[..., tf.newaxis]
-    sol = cholesky_solve(S, v)
+    sol = cholesky_solve(S, v, jitter=1e-6)
     return tf.reduce_sum(v * sol, axis=(-2, -1))
 
 
@@ -89,7 +89,7 @@ def _stabilize_cov(cov: tf.Tensor, jitter: float = 1e-5) -> tf.Tensor:
 def gaussian_log_prob_from_error(error: Any, cov: Any, jitter: float = 1e-6) -> tf.Tensor:
     error = _to_tensor(error)
     cov = _stabilize_cov(_to_tensor(cov), jitter=jitter)
-    chol = tf.linalg.cholesky(cov)
+    chol = tf.linalg.cholesky(cov + jitter * tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype))
     sol = tf.linalg.triangular_solve(chol, error[..., tf.newaxis], lower=True)
     maha = tf.reduce_sum(tf.square(sol), axis=(-2, -1))
     dim = tf.cast(tf.shape(error)[-1], tf.float32)
@@ -331,7 +331,34 @@ def default_metrics_config() -> Dict[str, Any]:
         "impoverishment": True,
         "coverage_sigmas": (1.0, 2.0),
         "rank_hist": True,
+        "flow_diagnostics": True,
     }
+
+
+def _diag_array(diagnostics: Dict[str, Any], key: str) -> Optional[np.ndarray]:
+    if not diagnostics:
+        return None
+    val = diagnostics.get(key)
+    if val is None:
+        return None
+    return np.asarray(val)
+
+
+def _flow_diagnostics_metrics(diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {}
+    dx_p95 = _diag_array(diagnostics, "dx_p95_max")
+    if dx_p95 is not None:
+        metrics["dx_p95_max_max"] = float(np.nanmax(dx_p95))
+    condS = _diag_array(diagnostics, "condS_log10_max")
+    if condS is not None:
+        metrics["condS_log10_max_max"] = float(np.nanmax(condS))
+    condK = _diag_array(diagnostics, "condK_log10_max")
+    if condK is not None:
+        metrics["condK_log10_max_max"] = float(np.nanmax(condK))
+    logdet_cov = _diag_array(diagnostics, "logdet_cov")
+    if logdet_cov is not None:
+        metrics["logdet_cov_min"] = float(np.nanmin(logdet_cov))
+    return metrics
 
 
 def evaluate(
@@ -352,6 +379,11 @@ def evaluate(
     cov = outputs.get("cov")
     x_particles = outputs.get("x_particles")
     w = outputs.get("w")
+    w_pre = outputs.get("w_pre")
+    if w_pre is None:
+        diagnostics = outputs.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            w_pre = diagnostics.get("w_pre")
     parents = outputs.get("parents")
     is_gaussian = bool(outputs.get("is_gaussian", False))
 
@@ -397,10 +429,13 @@ def evaluate(
         nis_t = nis(v, S)
         metrics["nis"] = float(tf.reduce_mean(nis_t).numpy())
 
-    if cfg.get("ess") and w is not None and not is_gaussian:
-        ess_t = ess(w)
+    w_for_ess = w_pre if w_pre is not None else w
+    if cfg.get("ess") and w_for_ess is not None and not is_gaussian:
+        ess_t = ess(w_for_ess)
         metrics["ess_mean"] = float(tf.reduce_mean(ess_t).numpy())
-        metrics["ess_min"] = float(tf.reduce_min(ess_t).numpy())
+        ess_len = tf.shape(ess_t)[-1]
+        ess_min_source = tf.cond(ess_len > 1, lambda: ess_t[..., 1:], lambda: ess_t)
+        metrics["ess_min"] = float(tf.reduce_min(ess_min_source).numpy())
         metrics["ess_final"] = float(tf.reduce_mean(ess_t[..., -1]).numpy())
 
     if cfg.get("impoverishment") and parents is not None and not is_gaussian:
@@ -426,5 +461,9 @@ def evaluate(
         metrics["rank_hist"] = rank_histogram(
             np.asarray(x_true), np.asarray(x_particles)
         ).tolist()
+
+    diagnostics = outputs.get("diagnostics")
+    if cfg.get("flow_diagnostics") and isinstance(diagnostics, dict):
+        metrics.update(_flow_diagnostics_metrics(diagnostics))
 
     return metrics

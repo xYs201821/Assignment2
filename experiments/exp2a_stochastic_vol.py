@@ -85,37 +85,12 @@ def _plot_state_trajectory(
     time_gap: Optional[int] = None,
 ) -> None:
     import matplotlib.pyplot as plt
-    from matplotlib.widgets import CheckButtons
 
     x_true_np = np.asarray(x_true)[0, :, 0]
     t_axis = np.arange(len(x_true_np))
     markevery = max(1, int(len(x_true_np) / 12))
     fig, ax = plt.subplots(figsize=(8, 3))
-    lines = []
-    labels = []
-    annotations: Dict[str, List[Any]] = {}
-
-    def _annotate_series(label: str, xs: np.ndarray, ys: np.ndarray, color: Any) -> None:
-        if time_gap is None or time_gap <= 0:
-            return
-        texts: List[Any] = []
-        for t in range(0, len(xs), time_gap):
-            texts.append(
-                ax.annotate(
-                    str(t),
-                    (xs[t], ys[t]),
-                    textcoords="offset points",
-                    xytext=(3, 3),
-                    fontsize=7,
-                    color=color,
-                    alpha=0.8,
-                )
-            )
-        annotations[label] = texts
     line_true, = ax.plot(x_true_np, color="k", label="true", linestyle="-")
-    lines.append(line_true)
-    labels.append("true")
-    _annotate_series("true", t_axis, x_true_np, line_true.get_color())
     style_cycle = cycle(["-", "--", "-.", ":", (0, (3, 1, 1, 1))])
     marker_cycle = cycle(["o", "s", "^", "v", "D", "x", "P", "*"])
     for method in method_order:
@@ -130,41 +105,177 @@ def _plot_state_trajectory(
             markevery=markevery,
             markersize=4,
         )
-        lines.append(line)
-        labels.append(method)
-        mean_np = np.asarray(mean)[0, :, 0]
-        _annotate_series(method, t_axis, mean_np, line.get_color())
-    if title:
-        ax.set_title(title)
     ax.set_xlabel("t")
     ax.set_ylabel("x_t")
     ax.grid(True, linestyle=":")
     ax.legend(fontsize=8)
-    if interactive and show:
-        fig.tight_layout(rect=(0.0, 0.0, 0.75, 1.0))
-        selector_ax = fig.add_axes([0.78, 0.2, 0.2, 0.6])
-        selector_ax.set_title("Trajectories", fontsize=9)
-        visibility = [line.get_visible() for line in lines]
-        check = CheckButtons(selector_ax, labels, visibility)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
 
-        def _toggle(label):
-            idx = labels.index(label)
-            line = lines[idx]
-            new_vis = not line.get_visible()
-            line.set_visible(new_vis)
-            for text in annotations.get(label, []):
-                text.set_visible(new_vis)
-            fig.canvas.draw_idle()
+def _ess_from_weights(w: np.ndarray) -> Optional[np.ndarray]:
+    w_np = np.asarray(w, dtype=np.float64)
+    if w_np.ndim == 2:
+        w_np = w_np[np.newaxis, ...]
+    if w_np.ndim != 3:
+        return None
+    w_sum = np.sum(w_np, axis=-1, keepdims=True)
+    w_norm = np.divide(w_np, w_sum, out=np.zeros_like(w_np), where=w_sum > 0)
+    ess_t = 1.0 / np.sum(np.square(w_norm), axis=-1)
+    return ess_t
 
-        check.on_clicked(_toggle)
-    else:
-        fig.tight_layout()
+
+def _select_pre_resample_weights(out: Dict[str, Any]) -> Optional[np.ndarray]:
+    diagnostics = out.get("diagnostics", {}) if isinstance(out, dict) else {}
+    w_pre = diagnostics.get("w_pre")
+    if w_pre is None:
+        w_pre = out.get("w") if isinstance(out, dict) else None
+    return w_pre
+
+
+def _is_pf_method(method: str) -> bool:
+    method = str(method).lower()
+    return method in ("pf", "bootstrap") or method.startswith("pf")
+
+
+def _is_pfpf_flow_method(method: str) -> bool:
+    method = str(method).lower()
+    return "pfpf" in method and (method.startswith("edh") or method.startswith("ledh"))
+
+
+def _ess_threshold_for_method(
+    method: str,
+    pf_threshold: float,
+    flow_threshold: float,
+) -> Optional[float]:
+    if _is_pf_method(method):
+        return pf_threshold
+    if _is_pfpf_flow_method(method):
+        return flow_threshold
+    return None
+
+
+def _plot_ess_over_time(
+    path: Path,
+    w: np.ndarray,
+    ess_threshold: Optional[float] = None,
+    band_percentiles: Optional[Tuple[float, float]] = (10.0, 90.0),
+    show: bool = False,
+    title: Optional[str] = None,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    ess_t = _ess_from_weights(w)
+    if ess_t is None:
+        return
+    T = ess_t.shape[1]
+    t = np.arange(T)
+    ess_mean = np.mean(ess_t, axis=0)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
+    ax.plot(t, ess_mean, color="C0", linewidth=1.6, label="ESS mean")
+    if ess_t.shape[0] > 1 and band_percentiles is not None:
+        p_lo, p_hi = band_percentiles
+        ess_lo = np.percentile(ess_t, p_lo, axis=0)
+        ess_hi = np.percentile(ess_t, p_hi, axis=0)
+        ax.fill_between(
+            t,
+            ess_lo,
+            ess_hi,
+            color="C0",
+            alpha=0.2,
+            label=f"ESS p{int(p_lo)}-p{int(p_hi)}",
+        )
+    if ess_threshold is not None:
+        N = np.asarray(w).shape[-1]
+        ax.axhline(
+            ess_threshold * float(N),
+            color="C3",
+            linestyle="--",
+            linewidth=1.0,
+            label="ESS threshold",
+        )
+    ax.set_xlabel("time")
+    ax.set_ylabel("ESS")
+    ax.grid(True, linestyle=":")
+    ax.legend(fontsize=8, loc="best")
+
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
     fig.savefig(path, dpi=150)
     if show:
         plt.show()
     plt.close(fig)
 
 
+def _plot_stability_series(
+    path: Path,
+    values: np.ndarray,
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+    title: Optional[str] = None,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    arr = np.asarray(values)
+    if arr.ndim == 1:
+        mean = arr
+        lo = hi = None
+    else:
+        flat = arr.reshape(-1, arr.shape[-1])
+        mean = np.mean(flat, axis=0)
+        if band_percentiles is None:
+            lo = hi = None
+        else:
+            p_lo, p_hi = band_percentiles
+            lo = np.percentile(flat, p_lo, axis=0)
+            hi = np.percentile(flat, p_hi, axis=0)
+
+    t = np.arange(mean.shape[0])
+    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
+    ax.plot(t, mean, color="C0", linewidth=1.6)
+    if lo is not None and hi is not None:
+        ax.fill_between(t, lo, hi, color="C0", alpha=0.25, linewidth=0)
+    ax.set_xlabel("time")
+    ax.grid(True, linestyle=":")
+    if title:
+        ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def _plot_stability_over_time(
+    output_dir: Path,
+    diagnostics: Dict[str, Any],
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+) -> None:
+    key_specs = [
+        ("logdet_cov", "logdet_cov"),
+        ("condH_log10_max", "condH_log10"),
+        ("condJ_log10_max", "condJ_log10"),
+        ("condK_log10_max", "condK_log10"),
+        ("flow_norm_mean_max", "flow_norm_mean"),
+    ]
+    for key, label in key_specs:
+        val = diagnostics.get(key)
+        if val is None:
+            continue
+        title = f"stability_{label}"
+        path = output_dir / f"{title}.png"
+        _plot_stability_series(
+            path,
+            np.asarray(val),
+            band_percentiles=band_percentiles,
+            show=show,
+            title=title,
+        )
 
 
 def _as_list(value: Any) -> List[Any]:
@@ -275,6 +386,30 @@ def main() -> None:
         plot_time_gap = int(plot_time_gap)
         if plot_time_gap <= 0:
             plot_time_gap = None
+    plot_pf_ess = bool(exp_cfg.get("plot_pf_ess", False))
+    plot_pf_ess_seed0_only = bool(exp_cfg.get("plot_pf_ess_seed0_only", True))
+    plot_pf_ess_show = bool(exp_cfg.get("plot_pf_ess_show", False))
+    plot_pf_ess_percentiles = exp_cfg.get("plot_pf_ess_percentiles")
+    if plot_pf_ess_percentiles is None:
+        plot_pf_ess_percentiles = (10.0, 90.0)
+    else:
+        vals = list(plot_pf_ess_percentiles) if isinstance(plot_pf_ess_percentiles, (list, tuple)) else []
+        if len(vals) >= 2:
+            plot_pf_ess_percentiles = (float(vals[0]), float(vals[1]))
+        else:
+            plot_pf_ess_percentiles = (10.0, 90.0)
+    plot_stability = bool(exp_cfg.get("plot_stability", False))
+    plot_stability_seed0_only = bool(exp_cfg.get("plot_stability_seed0_only", True))
+    plot_stability_show = bool(exp_cfg.get("plot_stability_show", False))
+    plot_stability_percentiles = exp_cfg.get("plot_stability_percentiles")
+    if plot_stability_percentiles is None:
+        plot_stability_percentiles = (25.0, 75.0)
+    else:
+        vals = list(plot_stability_percentiles) if isinstance(plot_stability_percentiles, (list, tuple)) else []
+        if len(vals) >= 2:
+            plot_stability_percentiles = (float(vals[0]), float(vals[1]))
+        else:
+            plot_stability_percentiles = (25.0, 75.0)
     metrics_cfg_override = cfg.get("metrics", {})
 
     alpha = float(model_cfg.get("alpha", 0.99))
@@ -439,6 +574,26 @@ def main() -> None:
                             metrics_by_method[method] = metrics
                             metrics_across_seeds[method].append(metrics)
 
+                            if plot_pf_ess and (not plot_pf_ess_seed0_only or seed == seeds[0]):
+                                if (_is_pf_method(method) or _is_pfpf_flow_method(method)) and not out.get(
+                                    "is_gaussian", False
+                                ):
+                                    w_pre = _select_pre_resample_weights(out)
+                                    if w_pre is not None:
+                                        ess_threshold = _ess_threshold_for_method(
+                                            method,
+                                            pf_ess_threshold,
+                                            flow_ess_threshold,
+                                        )
+                                        plot_path = method_dir / "pf_ess_over_time.png"
+                                        _plot_ess_over_time(
+                                            plot_path,
+                                            w_pre,
+                                            ess_threshold=ess_threshold,
+                                            band_percentiles=plot_pf_ess_percentiles,
+                                            show=plot_pf_ess_show,
+                                        )
+
                             diag = {
                                 k: v
                                 for k, v in out.get("diagnostics", {}).items()
@@ -449,6 +604,17 @@ def main() -> None:
                             diff = x_true - out["mean"]
                             diag["rmse_t"] = tf.norm(diff, axis=-1)
                             save_npz(method_dir / "diagnostics.npz", **diag)
+                            if plot_stability and (
+                                not plot_stability_seed0_only or seed == seeds[0]
+                            ):
+                                diag_src = out.get("diagnostics", {})
+                                if isinstance(diag_src, dict):
+                                    _plot_stability_over_time(
+                                        method_dir,
+                                        diag_src,
+                                        band_percentiles=plot_stability_percentiles,
+                                        show=plot_stability_show,
+                                    )
 
                         print_separator(f"exp2a_stochastic_vol {cfg_tag} seed{seed} summary")
                         print_method_summary_table(
