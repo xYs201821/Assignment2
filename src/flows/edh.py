@@ -1,9 +1,14 @@
+"""Exact Daum-Huang (EDH) particle flow implementation."""
+
 import tensorflow as tf
+
 from src.flows.flow_base import FlowBase
 from src.utility import cholesky_solve, quadratic_matmul
 
 
 class EDHFlow(FlowBase):
+    """EDH flow using global linearization of the observation model."""
+
     def __init__(
         self,
         ssm,
@@ -14,6 +19,7 @@ class EDHFlow(FlowBase):
         debug=False,
         jitter=1e-5,
     ):
+        """Initialize EDH flow parameters."""
         super().__init__(
             ssm,
             num_lambda=num_lambda,
@@ -27,6 +33,20 @@ class EDHFlow(FlowBase):
 
     @staticmethod
     def _edh_flow_solution(lam, H, P, R, y_tilde, m0, jitter):
+        """Compute EDH linear flow parameters A and b at pseudo-time lam.
+
+        Shapes:
+          H: [B, dy, dx]
+          P: [B, dx, dx]
+          R: [B, dy, dy]
+          y_tilde: [B, dy]
+          m0: [B, dx]
+        Returns:
+          A: [B, dx, dx]
+          b: [B, dx]
+          S: [B, dy, dy]
+        """
+        # S = lam * H P H^T + R and K = P H^T S^{-1}.
         HPH = quadratic_matmul(H, P, H)
         S = lam * HPH + R
         jitter_val = float(jitter) if jitter is not None else 0.0
@@ -37,6 +57,7 @@ class EDHFlow(FlowBase):
         K_T = cholesky_solve(S, RHS, jitter=jitter_val)
         K = tf.linalg.matrix_transpose(K_T)
 
+        # Linear flow: dx/dlambda = A x + b.
         A = -0.5 * tf.linalg.matmul(K, H)
         I = tf.eye(tf.shape(A)[-1], batch_shape=tf.shape(A)[:-2], dtype=A.dtype)
         b = tf.einsum("...ij,...jk,...k->...i", I + lam * A, K, y_tilde)
@@ -45,6 +66,18 @@ class EDHFlow(FlowBase):
         return A, b, S
 
     def _flow_transport(self, mu_tilde, y, m0, P):
+        """Integrate the EDH flow over pseudo-time to transport particles.
+
+        Shapes:
+          mu_tilde: [B, N, dx]
+          y: [B, dy]
+          m0: [B, dx]
+          P: [B, dx, dx]
+        Returns:
+          mu: [B, N, dx]
+          logdet: [B]
+          diagnostics: dict of per-step metrics
+        """
         mu = mu_tilde
         m_bar = tf.identity(m0)
         R = self.ssm.cov_eps_y
@@ -92,6 +125,7 @@ class EDHFlow(FlowBase):
             R_eff = quadratic_matmul(H_r, R, H_r)
             A, b, S = self._edh_flow_solution(lam, H, P, R_eff, y_tilde, m0, self.jitter)
             Am = tf.einsum("...ij,...j->...i", A, m_bar)
+            # Euler update for mean flow ODE: m_bar += delta * (A m_bar + b).
             m_bar = m_bar + delta * (Am + b)
             J = I + delta * A
             if self.jitter and self.jitter > 0.0:
@@ -113,6 +147,7 @@ class EDHFlow(FlowBase):
             flow = tf.where(bad[..., tf.newaxis, tf.newaxis], tf.zeros_like(flow), flow)
             flow_norm_mean = tf.reduce_mean(tf.norm(flow, axis=-1), axis=-1)
             flow_norm_mean_max = tf.maximum(flow_norm_mean_max, flow_norm_mean)
+            # Particle transport with Euler discretization.
             dx = delta_t * flow
             dx_norm = tf.norm(dx, axis=-1)
             dx_p95 = self._percentile(dx_norm, 95.0)

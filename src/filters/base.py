@@ -1,3 +1,5 @@
+"""Base filter classes and common helper routines."""
+
 import tensorflow as tf
 
 from src.utility import cholesky_solve, quadratic_matmul, tf_cond
@@ -35,7 +37,10 @@ FILTER_PRINT_INFO = {
 
 
 class BaseFilter(tf.Module):
+    """Base class for filters"""
+
     def __init__(self, ssm, debug=False, print=False, **kwargs):
+        """Initialize with an SSM and debug/print flags."""
         super().__init__()
         self.ssm = ssm
         self.state_dim = ssm.state_dim
@@ -46,15 +51,24 @@ class BaseFilter(tf.Module):
         self.print = bool(print)
         if type(self) is BaseFilter:
             self._maybe_print()
-        
+
     def filter(self, y, **kwargs):
+        """Run the filter over observations y.
+
+        Shapes:
+          y: [T, dy] or [B, T, dy]
+        Returns:
+          implementation-specific outputs per time step.
+        """
         raise NotImplementedError
 
     def _maybe_print(self):
+        """Print filter metadata when requested."""
         if self.print:
             self._print_debug_info()
 
     def _print_debug_info(self):
+        """Emit a structured debug line with key configuration fields."""
         info = FILTER_PRINT_INFO.get(type(self).__name__)
         if not info:
             return
@@ -69,6 +83,13 @@ class BaseFilter(tf.Module):
 
     @staticmethod
     def _stack_and_permute(ta, tail_dims=1):
+        """Stack a TensorArray and move time to the first non-batch axis.
+
+        Shapes:
+          ta.element: [B, ...] with tail_dims trailing dimensions
+        Returns:
+          stacked: [B, T, ...]
+        """
         seq = ta.stack()
         rank = tf.rank(seq)
         batch_rank = rank - (1 + tail_dims)
@@ -78,7 +99,10 @@ class BaseFilter(tf.Module):
 
 
 class GaussianFilter(BaseFilter):
+    """Base class for Gaussian filters with predict/update structure."""
+
     def __init__(self, ssm, joseph=True, debug=False, print=False):
+        """Initialize Gaussian filter with process/observation noise covariances."""
         super().__init__(ssm, debug=debug, print=print)
         self.cov_eps_x = tf.convert_to_tensor(ssm.cov_eps_x, dtype=tf.float32)
         self.cov_eps_y = tf.convert_to_tensor(ssm.cov_eps_y, dtype=tf.float32)
@@ -87,6 +111,7 @@ class GaussianFilter(BaseFilter):
             self._maybe_print()
 
     def warmup(self, batch_size=1):
+        """Trace and compile the step function to avoid first-call overhead."""
         dx = int(self.ssm.state_dim)
         dy = int(self.ssm.obs_dim)
         dtype = tf.float32
@@ -106,23 +131,78 @@ class GaussianFilter(BaseFilter):
 
     @tf.function
     def predict(self, m_prev, P_prev):
+        """Predict next-step mean/covariance.
+
+        Shapes:
+          m_prev: [B, dx]
+          P_prev: [B, dx, dx]
+        Returns:
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+        """
         raise NotImplementedError
 
     @tf.function
     def update_joseph(self, m_pred, P_pred, y):
+        """Measurement update using Joseph stabilized covariance update.
+
+        Shapes:
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+          y: [B, dy]
+        Returns:
+          m_filt: [B, dx]
+          P_filt: [B, dx, dx]
+        """
         raise NotImplementedError
 
     @tf.function
     def update_naive(self, m_pred, P_pred, y):
+        """Measurement update using the naive covariance formula.
+
+        Shapes:
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+          y: [B, dy]
+        Returns:
+          m_filt: [B, dx]
+          P_filt: [B, dx, dx]
+        """
         raise NotImplementedError
 
     @tf.function
     def step(self, m_prev, P_prev, y):
+        """Apply update then predict to advance one time step.
+
+        Shapes:
+          m_prev: [B, dx]
+          P_prev: [B, dx, dx]
+          y: [B, dy]
+        Returns:
+          m_filt: [B, dx]
+          P_filt: [B, dx, dx]
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+        """
         m_filt, P_filt = self.update(m_prev, P_prev, y)
         m_pred, P_pred = self.predict(m_filt, P_filt)
         return m_filt, P_filt, m_pred, P_pred
 
     def filter(self, y, m0=None, P0=None, memory_sampler=None):
+        """Filter a full observation sequence and return diagnostics.
+
+        Shapes:
+          y: [T, dy] or [B, T, dy]
+          m0: [dx] or [B, dx]
+          P0: [dx, dx] or [B, dx, dx]
+        Returns:
+          m_filt: [B, T, dx]
+          P_filt: [B, T, dx, dx]
+          m_pred: [B, T, dx]
+          P_pred: [B, T, dx, dx]
+          cond_P: [B, T]
+          step_time_s: [B, T]
+        """
         y = tf.convert_to_tensor(y, dtype=tf.float32)
         if len(y.shape) == 2:
             y = y[tf.newaxis, :]
@@ -196,6 +276,17 @@ class GaussianFilter(BaseFilter):
 
     @staticmethod
     def _kalman_gain(C, P, R):
+        """Compute Kalman gain and innovation covariance.
+
+        Shapes:
+          C: [..., dy, dx]
+          P: [..., dx, dx]
+          R: [..., dy, dy]
+        Returns:
+          K: [..., dx, dy]
+          S: [..., dy, dy]
+        """
+        # S = C P C^T + R and K = P C^T S^{-1}.
         S = quadratic_matmul(C, P, C) + R
         RHS = tf.linalg.matmul(C, P, transpose_b=True)
         K_transpose = cholesky_solve(S, RHS)
@@ -204,6 +295,16 @@ class GaussianFilter(BaseFilter):
 
     @staticmethod
     def _joseph_update(C, P, K, R):
+        """Joseph-form covariance update for symmetry and PSD stability.
+
+        Shapes:
+          C: [..., dy, dx]
+          P: [..., dx, dx]
+          K: [..., dx, dy]
+          R: [..., dy, dy]
+        Returns:
+          P_new: [..., dx, dx]
+        """
         I = tf.eye(tf.shape(P)[-1], batch_shape=tf.shape(P)[:-2], dtype=P.dtype)
         I_KC = I - tf.linalg.matmul(K, C)
         return quadratic_matmul(I_KC, P, I_KC) + quadratic_matmul(K, R, K)

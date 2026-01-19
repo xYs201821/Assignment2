@@ -1,10 +1,19 @@
+"""Utility math helpers and plotting routines."""
+
 import tensorflow as tf
 from matplotlib import pyplot as plt
 import numpy as np
 import tensorflow_probability as tfp
 
 
-def tf_cond(M, jitter=1e-6): # find condition number of M in tensorflow, [batch, n, n] -> [batch]
+def tf_cond(M, jitter=1e-6):
+    """Estimate condition number for symmetric matrices.
+
+    Shapes:
+      M: [..., n, n]
+    Returns:
+      cond: [...]
+    """
     M = tf.convert_to_tensor(M)
     tf.debugging.assert_all_finite(M, "tf_cond received NaN/Inf in input matrix")
     M_sym = (M + tf.linalg.matrix_transpose(M)) / 2.0
@@ -74,6 +83,7 @@ def block_diag(A, B):
     return tf.concat([top, bot], axis=1)
 
 def plot_ssm_trajectory(ssm, T=200, seed=None, title=None):
+    """Simulate and plot one trajectory for a state-space model."""
     # ---- simulate ----
     x_traj, y_traj = ssm.simulate(T=T, batch_size=1, seed=seed)
 
@@ -115,12 +125,24 @@ def plot_ssm_trajectory(ssm, T=200, seed=None, title=None):
     plt.show()
 
 def max_asym(P):
-    # check the degree of asymmetry of P, [batch, n, n] -> [batch]
+    """Return the maximum absolute skew-symmetric entry.
+
+    Shapes:
+      P: [..., n, n]
+    Returns:
+      max_asym: [...]
+    """
     skew = P - tf.linalg.matrix_transpose(P)
     return tf.reduce_max(tf.abs(skew))
 
 def is_psd(P, tol=1e-7):
-    # check the minimum eigenvalue of P
+    """Check if a symmetric matrix is positive semidefinite.
+
+    Shapes:
+      P: [..., n, n]
+    Returns:
+      is_psd: bool
+    """
     eigvals = tf.linalg.eigvalsh(P)
     return tf.reduce_min(eigvals) >= -tol
 
@@ -145,7 +167,7 @@ def tfp_lgssm(observations, ssm, mode="filter"):
         )
     )
     if mode == "smooth":
-        # Kalman smoother: p(x_t | y_1:T)
+        # smoother: p(x_t | y_1:T)
         means, covs = lgssm.posterior_marginals(observations)
         return means, covs
 
@@ -162,6 +184,7 @@ def tfp_lgssm(observations, ssm, mode="filter"):
 
 
 def weighted_mean(X, W=None, axis=-2, normalize=True):
+    """Compute weighted mean."""
     X = tf.convert_to_tensor(X)
     if W is None:
         return tf.reduce_mean(X, axis=axis)
@@ -195,4 +218,3 @@ def weighted_mean(X, W=None, axis=-2, normalize=True):
 
     den = tf.reduce_sum(Wb, axis=axis_)
     return tf.math.divide_no_nan(num, den)
-

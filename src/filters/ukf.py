@@ -1,3 +1,5 @@
+"""Unscented Kalman filter implementation."""
+
 import tensorflow as tf
 
 from src.filters.base import GaussianFilter
@@ -5,6 +7,8 @@ from src.utility import block_diag, cholesky_solve, quadratic_matmul, tf_cond, w
 
 
 class UnscentedKalmanFilter(GaussianFilter):
+    """Unscented Kalman filter with scaled sigma points."""
+
     def __init__(
         self,
         ssm,
@@ -16,6 +20,7 @@ class UnscentedKalmanFilter(GaussianFilter):
         debug=False,
         print=False,
     ):
+        """Initialize UKF hyperparameters and precompute weights."""
         super().__init__(ssm, joseph=joseph, debug=debug, print=print)
         self.state_dim = self.ssm.state_dim
         self.obs_dim = self.ssm.obs_dim
@@ -31,6 +36,7 @@ class UnscentedKalmanFilter(GaussianFilter):
         self._maybe_print()
 
     def _stabilize_cov(self, cov: tf.Tensor) -> tf.Tensor:
+        """Symmetrize covariance and add jitter if configured."""
         cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
         if self.jitter == 0.0:
             return cov
@@ -38,6 +44,7 @@ class UnscentedKalmanFilter(GaussianFilter):
         return cov + eye * tf.cast(self.jitter, cov.dtype)
 
     def _build_ukf_weights(self, n: tf.Tensor):
+        """Build scaled sigma-point weights for a given dimension."""
         alpha = self.alpha
         beta = self.beta
         kappa = self.kappa
@@ -53,6 +60,16 @@ class UnscentedKalmanFilter(GaussianFilter):
         return Wm, Wc, lamb
 
     def generate_sigma_points(self, m, P):
+        """Generate sigma points and corresponding mean/covariance weights.
+
+        Shapes:
+          m: [B, dx]
+          P: [B, dx, dx]
+        Returns:
+          X: [B, 2*dx+1, dx]
+          W_m: [2*dx+1]
+          W_c: [2*dx+1]
+        """
         n = tf.shape(P)[-1]
         n_f = tf.cast(n, tf.float32)
         lamb = self.alpha ** 2 * (n_f + self.kappa) - n_f
@@ -68,6 +85,7 @@ class UnscentedKalmanFilter(GaussianFilter):
         P_scaled = P * scale
         P_scaled = self._stabilize_cov(P_scaled)
 
+        # Sigma points are mean plus/minus scaled Cholesky factors.
         P_sqrt = tf.linalg.cholesky(P_scaled)
         P_sqrt = tf.linalg.matrix_transpose(P_sqrt)
         m_exp = m[..., tf.newaxis, :]
@@ -78,9 +96,21 @@ class UnscentedKalmanFilter(GaussianFilter):
         return X, tf.convert_to_tensor(W_m, dtype=tf.float32), tf.convert_to_tensor(W_c, dtype=tf.float32)
     
     def propagate_sigma_points(self, func, X):
+        """Apply nonlinear function to sigma points."""
         return func(X)
 
     def unscented_transform(self, func, m, P, mean_fn=None, residual_fn=None):
+        """Compute mean/covariance after passing sigma points through func.
+
+        Shapes:
+          m: [B, dx]
+          P: [B, dx, dx]
+        Returns:
+          y_mean: [B, dy]
+          cov: [B, dy, dy]
+          X: [B, 2*dx+1, dx]
+          Y: [B, 2*dx+1, dy]
+        """
         if mean_fn is None:
             mean_fn = lambda y, W: weighted_mean(y, W, axis=1)
         if residual_fn is None:
@@ -91,6 +121,7 @@ class UnscentedKalmanFilter(GaussianFilter):
         y_mean = mean_fn(Y, Wm)
 
         Y_c = residual_fn(Y, y_mean)
+        # Covariance from weighted outer products of residuals.
         cov = tf.einsum("...i,...ij,...ik->...jk", Wc, Y_c, Y_c)
         cov = self._stabilize_cov(cov)
 
@@ -98,6 +129,15 @@ class UnscentedKalmanFilter(GaussianFilter):
 
     @tf.function
     def predict(self, m_prev, P_prev):
+        """UKF prediction using augmented state with process noise.
+
+        Shapes:
+          m_prev: [B, dx]
+          P_prev: [B, dx, dx]
+        Returns:
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+        """
         q0 = tf.zeros(tf.concat([tf.shape(m_prev)[:-1], [self.q_dim]], axis=0), dtype=tf.float32)
         m_aug = tf.concat([m_prev, q0], axis=-1)
         P_aug = block_diag(P_prev, self.cov_eps_x)
@@ -114,6 +154,16 @@ class UnscentedKalmanFilter(GaussianFilter):
 
     @tf.function
     def update_joseph(self, m_pred, P_pred, y):
+        """UKF update using sigma-point linearization.
+
+        Shapes:
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+          y: [B, dy]
+        Returns:
+          m_filt: [B, dx]
+          P_filt: [B, dx, dx]
+        """
         r0 = tf.zeros(tf.concat([tf.shape(m_pred)[:-1], [self.r_dim]], axis=0), dtype=tf.float32)
         m_aug = tf.concat([m_pred, r0], axis=-1)
         P_aug = block_diag(P_pred, self.cov_eps_y)
@@ -133,6 +183,7 @@ class UnscentedKalmanFilter(GaussianFilter):
         X_c = self.ssm.state_residual(X_x, m_pred)
         Y_c = self.ssm.measurement_residual(Y, y_pred)
 
+        # Cross-covariance between state and measurement.
         C_xy = tf.einsum("...i,...ij,...ik->...jk", Wc, X_c, Y_c)
 
         RHS_T = tf.linalg.matrix_transpose(C_xy)
@@ -149,4 +200,5 @@ class UnscentedKalmanFilter(GaussianFilter):
 
     @tf.function
     def update_naive(self, m_pred, P_pred, y):
+        """Alias for Joseph update (UKF covariance remains symmetric)."""
         return self.update_joseph(m_pred, P_pred, y)

@@ -1,20 +1,35 @@
+"""Particle filter base class and resampling utilities."""
+
 import tensorflow as tf
 
 from src.filters.base import BaseFilter
 
 
 class ParticleFilter(BaseFilter):
+    """Base class for particle filters."""
+
     def __init__(self, ssm, num_particles=100, ess_threshold=0.5, debug=False, print=False):
+        """Initialize particle count and ESS threshold."""
         super().__init__(ssm, debug=debug, print=print)
         self.num_particles = int(num_particles)
         self.ess_threshold = tf.convert_to_tensor(ess_threshold, tf.float32)
         self._maybe_print()
 
     def sample(self, ssm, x_prev, y_t, seed=None, **kwargs):
+        """Sample proposal distribution for particles."""
         raise NotImplementedError
         
     @staticmethod
     def _log_normalize(log_w):
+        """Normalize log-weights using log-sum-exp.
+
+        Shapes:
+          log_w: [B, N]
+        Returns:
+          log_w_norm: [B, N]
+          w: [B, N]
+          logZ: [B]
+        """
         logZ = tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
         log_w_norm = log_w - logZ
         w = tf.exp(log_w_norm)
@@ -22,9 +37,11 @@ class ParticleFilter(BaseFilter):
 
     @staticmethod
     def ess(w):
+        """Effective sample size for normalized weights."""
         return 1.0 / tf.reduce_sum(tf.square(w), axis=-1)
 
     def update_params(self, num_particles=None, ess_threshold=None):
+        """Update particle count or ESS threshold."""
         if num_particles is not None:
             self.num_particles = int(num_particles)
         if ess_threshold is not None:
@@ -32,6 +49,7 @@ class ParticleFilter(BaseFilter):
 
     @staticmethod
     def _normalize_init_seed(seed):
+        """Normalize seed formats into TFP-compatible 2-int seeds."""
         if seed is None:
             return None
         if isinstance(seed, (tuple, list)) and len(seed) == 2:
@@ -43,7 +61,17 @@ class ParticleFilter(BaseFilter):
             return tf.stack([seed, tf.constant(0, dtype=seed.dtype)])
         seed = tf.reshape(seed, [-1])
         return tf.stack([seed[0], tf.constant(0, dtype=seed.dtype)])
+
     def _init_particles(self, y, init_dist, init_seed=None, init_particles=None):
+        """Initialize particle set and uniform weights.
+
+        Shapes:
+          y: [B, T, dy]
+        Returns:
+          x: [B, N, dx]
+          log_w: [B, N]
+          parent_indices: [B, N]
+        """
         batch_shape = tf.shape(y)[:-2]
         N = self.num_particles
         seed = self._normalize_init_seed(init_seed)
@@ -91,6 +119,13 @@ class ParticleFilter(BaseFilter):
 
     @staticmethod
     def systematic_resample(w, rng):
+        """Systematic resampling based on cumulative weights.
+
+        Shapes:
+          w: [B, N]
+        Returns:
+          idx: [B, N]
+        """
         shape = tf.shape(w)
         N = shape[-1]
         B = tf.reduce_prod(shape[:-1])
@@ -107,6 +142,14 @@ class ParticleFilter(BaseFilter):
 
     @staticmethod
     def resample_particles(x, idx):
+        """Gather particles by resampling indices.
+
+        Shapes:
+          x: [B, N, dx]
+          idx: [B, N]
+        Returns:
+          x_resampled: [B, N, dx]
+        """
         shape = tf.shape(x)
         B = tf.reduce_prod(shape[:-2])
         x_flatten = tf.reshape(x, [B, shape[-2], shape[-1]])
@@ -116,6 +159,7 @@ class ParticleFilter(BaseFilter):
 
     @staticmethod
     def _normalize_reweight(reweight):
+        """Normalize reweight mode into integer flag."""
         if isinstance(reweight, bool):
             return 1 if reweight else 0
         if isinstance(reweight, str):
@@ -133,13 +177,34 @@ class ParticleFilter(BaseFilter):
         raise ValueError("reweight must be bool, int, or one of 'auto', 'never', 'always'")
 
     def _normalize_y(self, y):
+        """Ensure observations include batch dimension.
+
+        Shapes:
+          y: [T, dy] or [B, T, dy]
+        Returns:
+          y: [B, T, dy]
+        """
         y = tf.convert_to_tensor(y, tf.float32)
         if y.shape.rank == 2:
             y = y[tf.newaxis, ...]
         return y
 
     def step(self, x_prev, log_w_prev, y_t, resample="auto"):
+        """Advance particle set one step (to be implemented by subclasses).
+
+        Shapes:
+          x_prev: [B, N, dx]
+          log_w_prev: [B, N]
+          y_t: [B, dy]
+        """
         raise NotImplementedError
     
     def filter(self, y, num_particles=None, ess_threshold=None, resample="auto", init_dist=None, memory_sampler=None):
+        """Run particle filter over a full observation sequence.
+
+        Shapes:
+          y: [T, dy] or [B, T, dy]
+        Returns:
+          implementation-specific particle outputs over time.
+        """
         raise NotImplementedError

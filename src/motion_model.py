@@ -53,6 +53,13 @@ class ConstantVelocityMotionModel(MotionModel):
         return int(self.cov_eps.shape[0])
 
     def f(self, x):
+        """Transition function.
+
+        Shapes:
+          x: [B, 2*dim]
+        Returns:
+          x_next: [B, 2*dim]
+        """
         return tf.einsum("ij,...j->...i", self.A, x)
 
 
@@ -88,6 +95,13 @@ class ConstantTurnRateMotionModel(MotionModel):
         return 5
 
     def f(self, x):
+        """Transition function.
+
+        Shapes:
+          x: [B, 5]
+        Returns:
+          x_next: [B, 5]
+        """
         px = x[..., 0]
         py = x[..., 1]
         v = x[..., 2]

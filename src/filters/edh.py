@@ -1,3 +1,5 @@
+"""Compatibility import for EDHFlow."""
+
 from __future__ import annotations
 
 from src.flows.edh import EDHFlow

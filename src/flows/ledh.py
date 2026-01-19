@@ -1,9 +1,14 @@
+"""Localized Exact Daum-Huang (LEDH) particle flow implementation."""
+
 import tensorflow as tf
+
 from src.flows.flow_base import FlowBase
 from src.utility import cholesky_solve, quadratic_matmul
 
 
 class LEDHFlow(FlowBase):
+    """LEDH flow using per-particle linearization."""
+
     def __init__(
         self,
         ssm,
@@ -14,6 +19,7 @@ class LEDHFlow(FlowBase):
         debug=False,
         jitter=1e-5,
     ):
+        """Initialize LEDH flow parameters."""
         super().__init__(
             ssm,
             num_lambda=num_lambda,
@@ -27,6 +33,19 @@ class LEDHFlow(FlowBase):
 
     @staticmethod
     def _ledh_flow_solution(lam, H, P, R, y_tilde, m0, jitter):
+        """Compute LEDH linear flow parameters A and b at pseudo-time lam.
+
+        Shapes:
+          H: [B, N, dy, dx]
+          P: [B, dx, dx] or [B, N, dx, dx]
+          R: [B, N, dy, dy]
+          y_tilde: [B, N, dy]
+          m0: [B, N, dx]
+        Returns:
+          A: [B, N, dx, dx]
+          b: [B, N, dx]
+        """
+        # S = lam * H P H^T + R and K = P H^T S^{-1}.
         HPH = quadratic_matmul(H, P, H)
         S = lam * HPH + R
         jitter_val = float(jitter) if jitter is not None else 0.0
@@ -37,6 +56,7 @@ class LEDHFlow(FlowBase):
         K_T = cholesky_solve(S, tf.linalg.matrix_transpose(PHt), jitter=jitter_val)
         K = tf.linalg.matrix_transpose(K_T)
 
+        # Linear flow: dx/dlambda = A x + b (per particle).
         A = -0.5 * tf.linalg.matmul(K, H)
         I = tf.eye(tf.shape(A)[-1], batch_shape=tf.shape(A)[:-2], dtype=A.dtype)
         b = tf.einsum("...nij,...njk,...nk->...ni", I + lam * A, K, y_tilde)
@@ -45,6 +65,18 @@ class LEDHFlow(FlowBase):
         return A, b
 
     def _flow_transport(self, mu_tilde, y, m0, P):
+        """Integrate the LEDH flow over lambda to transport particles.
+
+        Shapes:
+          mu_tilde: [B, N, dx]
+          y: [B, dy]
+          m0: [B, dx]
+          P: [B, dx, dx]
+        Returns:
+          mu: [B, N, dx]
+          logdet: [B, N]
+          diagnostics: dict of per-step metrics
+        """
         mu = mu_tilde
         batch_shape = tf.shape(mu)[:-2]
         batch_size = tf.reduce_prod(batch_shape)
@@ -156,6 +188,7 @@ class LEDHFlow(FlowBase):
             flow = tf.where(bad[..., tf.newaxis], tf.zeros_like(flow), flow)
             flow_norm_mean = tf.reduce_mean(tf.norm(flow, axis=-1), axis=-1)
             flow_norm_mean_max = tf.maximum(flow_norm_mean_max, flow_norm_mean)
+            # Particle transport with Euler discretization.
             dx = delta_t * flow
             dx_norm = tf.norm(dx, axis=-1)
             dx_p95 = self._percentile(dx_norm, 95.0)

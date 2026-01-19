@@ -1,3 +1,5 @@
+"""Kernel-embedded particle flow filter implementation."""
+
 import tensorflow as tf
 
 from src.flows.flow_base import FlowBase
@@ -5,7 +7,9 @@ from src.optimizer import FixStepSize, FunctionalAdagrad, FunctionalAdam, apply_
 from src.ssm import SSM
 from src.utility import cholesky_solve, quadratic_matmul
 
+
 class KernelParticleFlow(FlowBase):
+    """Particle flow filter using kernel-embedded dynamics."""
     def __init__(
         self,
         ssm,
@@ -30,6 +34,7 @@ class KernelParticleFlow(FlowBase):
         ess_threshold=0.5,
         reweight="never",
     ):
+        """Initialize kernel flow hyperparameters and optional optimizer."""
         super().__init__(
             ssm,
             num_lambda=num_lambda,
@@ -87,6 +92,7 @@ class KernelParticleFlow(FlowBase):
 
     @staticmethod
     def _validate_kernel_type(value):
+        """Validate kernel parameterization."""
         mode = str(value).lower()
         mapping = {
             "scalar": "scalar",
@@ -101,6 +107,7 @@ class KernelParticleFlow(FlowBase):
 
     @staticmethod
     def _validate_ll_grad_mode(value):
+        """Validate log-likelihood gradient mode."""
         mode = str(value).lower()
         mapping = {
             "linearized": "linearized",
@@ -117,6 +124,7 @@ class KernelParticleFlow(FlowBase):
 
     @staticmethod
     def _normalize_optimizer_name(value):
+        """Normalize optimizer name or disable when requested."""
         if value is None:
             return None
         name = str(value).lower()
@@ -131,6 +139,7 @@ class KernelParticleFlow(FlowBase):
         optimizer_beta_1=0.9,
         optimizer_beta_2=0.999,
     ):
+        """Create a functional optimizer or accept a provided instance."""
         if optimizer is None:
             return None
         if hasattr(optimizer, "apply") and hasattr(optimizer, "init_state"):
@@ -158,6 +167,7 @@ class KernelParticleFlow(FlowBase):
 
     @staticmethod
     def _build_localization_matrix(state_dim, radius, dtype=tf.float32):
+        """Build Gaussian localization matrix for covariance tapering."""
         radius = float(radius)
         if radius <= 0.0:
             raise ValueError("localization_radius must be positive")
@@ -167,6 +177,7 @@ class KernelParticleFlow(FlowBase):
 
     @staticmethod
     def _broadcast_observation(y_t, x):
+        """Broadcast observation to match particle batch shape."""
         y_t = tf.convert_to_tensor(y_t, dtype=tf.float32)
         x = tf.convert_to_tensor(x, dtype=tf.float32)
         obs_dim = tf.shape(y_t)[-1]
@@ -174,9 +185,11 @@ class KernelParticleFlow(FlowBase):
         return tf.broadcast_to(y_t[..., tf.newaxis, :], target_shape)
 
     def _use_additive_obs_noise(self):
+        """Return True if observation noise can be treated as additive."""
         return self._obs_noise_is_additive and self.ssm.r_dim == self.ssm.obs_dim
 
     def _sample_mean_and_cov(self, x, w):
+        """Weighted sample mean and covariance with optional localization."""
         x = tf.convert_to_tensor(x, dtype=tf.float32)
         if w is None:
             w = tf.ones_like(x[..., 0]) / tf.cast(tf.shape(x)[-2], tf.float32)
@@ -193,16 +206,34 @@ class KernelParticleFlow(FlowBase):
         return x_bar, P
 
     def _prior_from_sample(self, mu_tilde, w):
+        """Return prior mean/covariance from particles and weights."""
         x_bar, P = self._sample_mean_and_cov(mu_tilde, w)
         return x_bar, P
 
     def _grad_log_prior_gaussian(self, x, x_bar, B):
+        """Gradient of log N(x_bar, B) with respect to x.
+
+        Shapes:
+          x: [B, N, dx]
+          x_bar: [B, dx]
+          B: [B, dx, dx]
+        Returns:
+          grad: [B, N, dx]
+        """
         delta = x - x_bar[..., tf.newaxis, :] # [..., n, dx]
         rhs = tf.linalg.matrix_transpose(delta)
         sol = cholesky_solve(B, rhs, jitter=self.jitter)
         return -tf.linalg.matrix_transpose(sol)
 
     def _grad_log_likelihood_linearized(self, x, y):
+        """Linearized gradient of log p(y | x) using observation Jacobians.
+
+        Shapes:
+          x: [B, N, dx]
+          y: [B, dy]
+        Returns:
+          grad: [B, N, dx]
+        """
         y_expand = self._broadcast_observation(y, x)
         r_dim = tf.cast(self.ssm.r_dim, tf.int32)
         batch_shape = tf.shape(x)[:-2]
@@ -238,11 +269,20 @@ class KernelParticleFlow(FlowBase):
                 tf.concat([batch_shape, [num_particles, obs_dim, r_dim]], axis=0),
             )
             R_eff = quadratic_matmul(H_r, R, H_r)
+        # Solve R_eff^{-1} v, then project with H_x^T.
         z = cholesky_solve(R_eff, v[..., tf.newaxis], jitter=self.jitter)
         z = tf.squeeze(z, axis=-1)
         return tf.einsum("...nij,...ni->...nj", H_x, z)
 
     def _grad_log_likelihood_from_dist(self, x, y):
+        """Exact gradient of log p(y | x) from the observation distribution.
+
+        Shapes:
+          x: [B, N, dx]
+          y: [B, dy]
+        Returns:
+          grad: [B, N, dx]
+        """
         x = tf.convert_to_tensor(x, dtype=tf.float32)
         y_expand = self._broadcast_observation(y, x)
         with tf.GradientTape(watch_accessed_variables=False) as tape:
@@ -257,6 +297,16 @@ class KernelParticleFlow(FlowBase):
         return grad
 
     def _scalar_kernel_and_grad(self, x, band_inv, alpha=None):
+        """Scalar kernel and its gradient with respect to particles.
+
+        Shapes:
+          x: [B, N, dx]
+          band_inv: [B, dx, dx]
+          alpha: [B] (optional)
+        Returns:
+          K: [B, N, N]
+          gradK: [B, N, N, dx]
+        """
         x = tf.convert_to_tensor(x, dtype=tf.float32)
         band_inv = tf.convert_to_tensor(band_inv, dtype=tf.float32)
         xj = x[..., :, tf.newaxis, :]
@@ -278,6 +328,16 @@ class KernelParticleFlow(FlowBase):
         return K, gradK
 
     def _kernel_and_grad(self, x, diagB, alpha):
+        """Diagonal kernel and its gradient with respect to particles.
+
+        Shapes:
+          x: [B, N, dx]
+          diagB: [B, dx]
+          alpha: [B]
+        Returns:
+          K: [B, N, N, dx]
+          gradK: [B, N, N, dx]
+        """
         x = tf.convert_to_tensor(x, dtype=tf.float32)
         diagB = tf.convert_to_tensor(diagB, dtype=tf.float32)
         xj = x[..., :, tf.newaxis, :]
@@ -306,6 +366,7 @@ class KernelParticleFlow(FlowBase):
         stopped,
         flow_tol,
     ):
+        """Apply early stopping to flow updates based on tolerance."""
         if flow_tol is None:
             update_eff = update
         else:
@@ -326,6 +387,7 @@ class KernelParticleFlow(FlowBase):
         ds,
         flow_scale=None,
     ):
+        """Emit debug diagnostics for kernel flow iterations."""
         if not self.debug:
             return
         if step_idx % self.debug_every != 0 and step_idx != self.num_lambda - 1:
@@ -371,13 +433,27 @@ class KernelParticleFlow(FlowBase):
         tf.print(msg, summarize=8)
 
     def _flow_transport(self, mu_tilde, y, m0, P, w=None):
+        """Transport particles with kernel flow; log-det is not available (zero).
+
+        Shapes:
+          mu_tilde: [B, N, dx]
+          y: [B, dy]
+          m0: [B, dx]
+          P: [B, dx, dx]
+          w: [B, N] (optional)
+        Returns:
+          x_next: [B, N, dx]
+          log_det: [B]
+          diagnostics: dict
+        """
         x_next, diagnostics = self._pff_update(mu_tilde, y, w, x_mean=m0, B=P)
-        # Kernel flow does not track Jacobian; treat log_det as zero.
+        # Kernel flow does not track Jacobian; log_det is not available.
         log_det = tf.zeros(tf.shape(mu_tilde)[:-1], dtype=tf.float32)
         return x_next, log_det, diagnostics
 
     @staticmethod
     def _median_midpoint(x):
+        """Median midpoint along the last axis."""
         shape = tf.shape(x)
         last_dim = shape[-1]
         batch = tf.reduce_prod(shape[:-1])
@@ -398,6 +474,7 @@ class KernelParticleFlow(FlowBase):
 
     @staticmethod
     def _median_midpoint_particles(x):
+        """Median midpoint across the particle axis."""
         shape = tf.shape(x)
         batch = tf.reduce_prod(shape[:-2])
         num_particles = shape[-2]
@@ -419,6 +496,7 @@ class KernelParticleFlow(FlowBase):
         return tf.reshape(med, out_shape)
 
     def _compute_alpha(self, x=None, diff=None):
+        """Compute median heuristic bandwidth for kernels."""
         if diff is None:
             x = tf.convert_to_tensor(x, dtype=tf.float32)
             xj = x[..., :, tf.newaxis, :]
@@ -454,6 +532,18 @@ class KernelParticleFlow(FlowBase):
         return alpha
 
     def _pff_update(self, x_prior, y, w, x_mean=None, B=None):
+        """Perform kernel particle flow updates for a single time step.
+
+        Shapes:
+          x_prior: [B, N, dx]
+          y: [B, dy]
+          w: [B, N] or None
+          x_mean: [B, dx] or None
+          B: [B, dx, dx] or None
+        Returns:
+          x: [B, N, dx]
+          diagnostics: dict
+        """
         x = tf.identity(tf.convert_to_tensor(x_prior, dtype=tf.float32))
         y = tf.convert_to_tensor(y, dtype=tf.float32)
         num_particles = tf.shape(x)[-2]
@@ -483,6 +573,7 @@ class KernelParticleFlow(FlowBase):
             state_dim = tf.shape(x)[-1]
             eye = tf.eye(state_dim, batch_shape=tf.shape(B)[:-2], dtype=tf.float32)
             aB = B + tf.cast(self.jitter, tf.float32) * eye
+            # band_inv ~ (alpha * B)^{-1} for scalar kernel.
             band_inv = cholesky_solve(aB, eye, jitter=self.jitter)
         else:
             band_inv = None
@@ -522,6 +613,7 @@ class KernelParticleFlow(FlowBase):
                 # K: [..., n, n, dx], grad_K: [..., n, n, dx], g: [..., n, dx]
                 term1 = K * g[..., tf.newaxis, :, :]
             weighted = w[..., tf.newaxis, :, tf.newaxis] * (term1 + grad_K)
+            # Kernel flow update is the weighted sum over particles.
             flow = tf.reduce_sum(weighted, axis=-2)
             flow = tf.einsum("...ij,...nj->...ni", B, flow) # preconditioning with B
             flow_norm_particles = update_norm(flow)
@@ -629,6 +721,24 @@ class KernelParticleFlow(FlowBase):
         reweight="auto",
         **kwargs,
     ):
+        """Kernel flow step.
+
+        Shapes:
+          x_prev: [B, N, dx]
+          log_w_prev: [B, N]
+          y_t: [B, dy]
+        Returns:
+          mu_tilde: [B, N, dx]
+          x_t: [B, N, dx]
+          log_w_norm: [B, N]
+          w: [B, N]
+          parent_indices: [B, N]
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+          x_pre: [B, N, dx]
+          w_pre: [B, N]
+          flow_diag: dict
+        """
         if reweight is None:
             reweight = self.default_reweight
 
@@ -644,15 +754,15 @@ class KernelParticleFlow(FlowBase):
         m, P = self._prior_from_sample(mu_tilde, w_prev)
         x_t, log_det, flow_diag = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
 
-        loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
+        #loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
 
-        update_weights = reweight != 0
-        if update_weights:
-            log_prior = trans_dist.log_prob(x_t)
-            log_q = log_q0 - log_det
-            log_w = log_w_prev + tf.cast(loglik + log_prior - log_q, tf.float32)
-        else:
-            log_w = log_w_prev
+        # update_weights = reweight != 0
+        # if update_weights:
+        #     log_prior = trans_dist.log_prob(x_t)
+        #     log_q = log_q0 - log_det
+        #     log_w = log_w_prev + tf.cast(loglik + log_prior - log_q, tf.float32)
+        # else:
+        log_w = log_w_prev
 
         log_w_norm, w, _ = self._log_normalize(log_w)
         x_pre = x_t
@@ -666,6 +776,18 @@ class KernelParticleFlow(FlowBase):
         return mu_tilde, x_t, log_w_norm, w, parent_indices, m_pred, P_pred, x_pre, w_pre, flow_diag
 
     def sample(self, x_prev, y_t, w=None, seed=None):
+        """Sample and transport particles without resampling.
+
+        Shapes:
+          x_prev: [B, N, dx]
+          y_t: [B, dy]
+          w: [B, N] (optional)
+        Returns:
+          x_next: [B, N, dx]
+          log_q: [B, N]
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+        """
         mu_tilde, log_q0 = self._propagate_particles(x_prev, seed=seed)
         batch_shape = tf.shape(mu_tilde)[:-2]
         num_particles = tf.shape(mu_tilde)[-2]

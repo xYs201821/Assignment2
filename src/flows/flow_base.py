@@ -1,3 +1,5 @@
+"""Shared base class for particle flow filters."""
+
 from typing import Dict
 
 import tensorflow as tf
@@ -7,7 +9,7 @@ from src.filters.mixins import LinearizationMixin
 
 
 class FlowBase(ParticleFilter, LinearizationMixin):
-    """Shared scaffolding for EDH/LEDH flows."""
+    """Shared scaffolding for particle flow filters."""
 
     def __init__(
         self,
@@ -21,6 +23,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         debug=False,
         jitter=1e-12,
     ):
+        """Initialize flow hyperparameters and resampling defaults."""
         super().__init__(ssm, num_particles=num_particles, ess_threshold=ess_threshold)
         self.num_lambda = int(num_lambda)
         self.default_reweight = reweight
@@ -31,6 +34,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
     @staticmethod
     def _percentile(values: tf.Tensor, q: float) -> tf.Tensor:
+        """Compute elementwise percentile along the last axis."""
         values = tf.sort(values, axis=-1)
         n = tf.shape(values)[-1]
         q = tf.cast(q, values.dtype) / tf.cast(100.0, values.dtype)
@@ -40,6 +44,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
     @staticmethod
     def _cond_from_matrix(mat: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
+        """Condition number estimate for symmetric matrices."""
         mat = 0.5 * (mat + tf.linalg.matrix_transpose(mat))
         eigvals = tf.linalg.eigvalsh(mat)
         eig_min = tf.reduce_min(eigvals, axis=-1)
@@ -49,6 +54,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
     @staticmethod
     def _cond_from_rect(mat: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
+        """Condition number estimate for rectangular matrices via SVD."""
         s = tf.linalg.svd(mat, compute_uv=False)
         s_max = tf.reduce_max(s, axis=-1)
         s_min = tf.reduce_min(s, axis=-1)
@@ -56,6 +62,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
     @staticmethod
     def _cov_from_particles(x: tf.Tensor, eps: float) -> tf.Tensor:
+        """Sample covariance from particles with jitter."""
         x = tf.convert_to_tensor(x, dtype=tf.float32)
         mean = tf.reduce_mean(x, axis=-2)
         resid = x - mean[..., tf.newaxis, :]
@@ -69,6 +76,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
     @staticmethod
     def _logdet_cov_from_particles(x: tf.Tensor, eps: float) -> tf.Tensor:
+        """Log-determinant of particle covariance via eigenvalues."""
         cov = FlowBase._cov_from_particles(x, eps)
         eigvals = tf.linalg.eigvalsh(cov)
         eigvals = tf.maximum(eigvals, tf.cast(eps, eigvals.dtype))
@@ -76,6 +84,15 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
     # --- Prior builders (can be overridden by subclasses) ---
     def _prior_from_sample(self, mu_tilde, w, batch_shape, state_dim):
+        """Compute weighted prior mean/covariance from particles.
+
+        Shapes:
+          mu_tilde: [B, N, dx]
+          w: [B, N]
+        Returns:
+          m: [B, dx]
+          P: [B, dx, dx]
+        """
         m = tf.einsum("...n,...ni->...i", w, mu_tilde)
         mu_resid = mu_tilde - m[..., tf.newaxis, :]
         P = tf.einsum("...n,...ni,...nj->...ij", w, mu_resid, mu_resid)
@@ -83,13 +100,45 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
     # --- Abstract flow transport ---
     def _flow_transport(self, mu_tilde, y, m0, P):
+        """Transport particles through a flow; return (x_next, log_det, diag).
+
+        Shapes:
+          mu_tilde: [B, N, dx]
+          y: [B, dy]
+          m0: [B, dx]
+          P: [B, dx, dx]
+        Returns:
+          x_next: [B, N, dx]
+          log_det: [B] or [B, N]
+          diag: dict or None
+        """
         raise NotImplementedError
 
     def _propagate_particles(self, x_prev, seed=None):
+        """Propagate particles through transition and return log-prob.
+
+        Shapes:
+          x_prev: [B, N, dx]
+        Returns:
+          mu_tilde: [B, N, dx]
+          log_q0: [B, N]
+        """
         mu_tilde = self.ssm.sample_transition(x_prev, seed=seed)
         return mu_tilde, self.ssm.transition_dist(x_prev).log_prob(mu_tilde)
 
     def sample(self, x_prev, y_t, w=None, seed=None):
+        """Sample next particles and compute proposal log-prob corrections.
+
+        Shapes:
+          x_prev: [B, N, dx]
+          y_t: [B, dy]
+          w: [B, N] (optional)
+        Returns:
+          x_next: [B, N, dx]
+          log_q: [B, N]
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+        """
         batch_shape = tf.shape(x_prev)[:-2]
         state_dim = tf.shape(x_prev)[-1]
 
@@ -104,6 +153,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         return x_next, log_q0 - log_det, m_pred, P_pred
 
     def warmup(self, batch_size=1, reweight="auto", resample="never"):
+        """Trace the step function to reduce first-call overhead."""
         x_spec = tf.TensorSpec(
             shape=[None, self.num_particles, self.ssm.state_dim],
             dtype=tf.float32,
@@ -141,6 +191,24 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         resample="never",
         **kwargs,
     ):
+        """Propagate, flow-transport, and (optionally) resample particles.
+
+        Shapes:
+          x_prev: [B, N, dx]
+          log_w_prev: [B, N]
+          y_t: [B, dy]
+        Returns:
+          x_pred: [B, N, dx]
+          x_t: [B, N, dx]
+          log_w_final: [B, N]
+          w_final: [B, N]
+          parent_indices: [B, N]
+          m_pred: [B, dx]
+          P_pred: [B, dx, dx]
+          x_pre: [B, N, dx]
+          w_pre: [B, N]
+          flow_diag: dict or None
+        """
         if reweight is None:
             reweight = self.default_reweight
         if resample is None:
@@ -162,6 +230,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
         loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
 
+        # Importance reweighting with flow Jacobian correction.
         update_weights = reweight != 0
         if update_weights:
             log_prior = trans_dist.log_prob(x_t)
@@ -239,6 +308,16 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         init_particles=None,
         memory_sampler=None,
     ):
+        """Run the flow filter over a full observation sequence.
+
+        Shapes:
+          y: [T, dy] or [B, T, dy]
+        Returns:
+          x_seq: [B, T, N, dx]
+          w_seq: [B, T, N]
+          diagnostics: dict of per-step tensors
+          parent_seq: [B, T, N]
+        """
         self.update_params(num_particles, ess_threshold)
         y = self._normalize_y(y)
         if reweight is None:
@@ -260,6 +339,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         x_pred_ta = tf.TensorArray(tf.float32, size=T)
         w_ta = tf.TensorArray(tf.float32, size=T)
         w_pre_ta = tf.TensorArray(tf.float32, size=T)
+        w_prev_ta = tf.TensorArray(tf.float32, size=T)
         m_pred_ta = tf.TensorArray(tf.float32, size=T)
         P_pred_ta = tf.TensorArray(tf.float32, size=T)
         parent_ta = tf.TensorArray(tf.int32, size=T)
@@ -271,6 +351,8 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         for t in range(T):
             t_start = tf.timestamp()
             y_t = y[..., t, :]
+            w_prev = tf.exp(log_w)
+            w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
             (
                 x_pred,
                 x,
@@ -294,6 +376,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             x_ta = x_ta.write(t, x)
             w_ta = w_ta.write(t, w)
             w_pre_ta = w_pre_ta.write(t, w_pre)
+            w_prev_ta = w_prev_ta.write(t, w_prev)
             m_pred_ta = m_pred_ta.write(t, m_pred)
             P_pred_ta = P_pred_ta.write(t, P_pred)
             parent_ta = parent_ta.write(t, parent_indices)
@@ -338,6 +421,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             "x_pred": self._stack_and_permute(x_pred_ta, tail_dims=2),
             "x_pre": self._stack_and_permute(x_pre_ta, tail_dims=2),
             "w_pre": self._stack_and_permute(w_pre_ta, tail_dims=1),
+            "w_prev": self._stack_and_permute(w_prev_ta, tail_dims=1),
         }
         for key, ta in flow_diag_ta.items():
             diagnostics[key] = self._stack_and_permute(ta, tail_dims=0)
