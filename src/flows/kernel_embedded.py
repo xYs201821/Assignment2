@@ -2,6 +2,7 @@
 
 import tensorflow as tf
 
+from src.flows.diagnostics import KernelDiagnostics
 from src.flows.flow_base import FlowBase
 from src.optimizer import FixStepSize, FunctionalAdagrad, FunctionalAdam, apply_stop_mask, update_norm
 from src.ssm import SSM
@@ -188,6 +189,10 @@ class KernelParticleFlow(FlowBase):
         """Return True if observation noise can be treated as additive."""
         return self._obs_noise_is_additive and self.ssm.r_dim == self.ssm.obs_dim
 
+    def _flow_supports_reweight(self):
+        """Kernel flow does not provide a valid Jacobian correction."""
+        return False
+
     def _sample_mean_and_cov(self, x, w):
         """Weighted sample mean and covariance with optional localization."""
         x = tf.convert_to_tensor(x, dtype=tf.float32)
@@ -237,23 +242,11 @@ class KernelParticleFlow(FlowBase):
         y_expand = self._broadcast_observation(y, x)
         r_dim = tf.cast(self.ssm.r_dim, tf.int32)
         batch_shape = tf.shape(x)[:-2]
-        batch_size = tf.reduce_prod(batch_shape)
         state_dim = tf.shape(x)[-1]
         obs_dim = tf.shape(y)[-1]
         num_particles = tf.shape(x)[-2]
         r0 = tf.zeros(tf.concat([tf.shape(x)[:-1], [r_dim]], axis=0), dtype=tf.float32)
-
-        r0_flat = tf.reshape(r0, tf.stack([batch_size * num_particles, r_dim]))
-        x_flat = tf.reshape(x, tf.stack([batch_size * num_particles, state_dim]))
-        H_x_flat, y_hat_flat = self.jacobian_h_x(x_flat, r0_flat)
-        H_x = tf.reshape(
-            H_x_flat,
-            tf.concat([batch_shape, [num_particles, obs_dim, state_dim]], axis=0),
-        )
-        y_hat = tf.reshape(
-            y_hat_flat,
-            tf.concat([batch_shape, [num_particles, obs_dim]], axis=0),
-        )
+        H_x, y_hat = self.jacobian_h_x(x, r0)
 
         v = self.ssm.innovation(y_expand, y_hat)  # [..., n, obs_dim]
         R = tf.convert_to_tensor(self.ssm.cov_eps_y, dtype=tf.float32)
@@ -263,11 +256,7 @@ class KernelParticleFlow(FlowBase):
                 tf.concat([batch_shape, tf.expand_dims(num_particles, 0), tf.shape(R)], axis=0),
             )
         else:
-            H_r_flat, _ = self.jacobian_h_r(x_flat, r0_flat)
-            H_r = tf.reshape(
-                H_r_flat,
-                tf.concat([batch_shape, [num_particles, obs_dim, r_dim]], axis=0),
-            )
+            H_r, _ = self.jacobian_h_r(x, r0)
             R_eff = quadratic_matmul(H_r, R, H_r)
         # Solve R_eff^{-1} v, then project with H_x^T.
         z = cholesky_solve(R_eff, v[..., tf.newaxis], jitter=self.jitter)
@@ -589,13 +578,14 @@ class KernelParticleFlow(FlowBase):
         jitter_val = tf.cast(self.jitter, tf.float32)
         eps_float = 1e-12 if self.jitter is None or self.jitter <= 0.0 else float(self.jitter)
         eps_val = tf.cast(eps_float, tf.float32)
-        dx_p95_max = tf.zeros(batch_shape, dtype=tf.float32)
-        condK_log10_max = tf.zeros(batch_shape, dtype=tf.float32)
-        flow_norm_mean_max = tf.zeros(batch_shape, dtype=tf.float32)
-        max_flow_frac = (
-            tf.zeros(batch_shape, dtype=tf.float32) if max_flow_norm is not None else None
-        )
         log10_base = tf.math.log(tf.cast(10.0, tf.float32))
+        diag = KernelDiagnostics(
+            self,
+            batch_shape,
+            eps_val,
+            log10_base,
+            track_max_flow_frac=(max_flow_norm is not None),
+        )
         stopped = tf.zeros(batch_shape, dtype=tf.bool)
         for i in range(self.num_lambda):
             if self.ll_grad_mode == "dist":
@@ -618,13 +608,12 @@ class KernelParticleFlow(FlowBase):
             flow = tf.einsum("...ij,...nj->...ni", B, flow) # preconditioning with B
             flow_norm_particles = update_norm(flow)
             flow_norm = tf.reduce_mean(flow_norm_particles, axis=-1)
-            flow_norm_mean_max = tf.maximum(flow_norm_mean_max, flow_norm)
+            clipped_frac = None
             if max_flow_norm is not None:
                 clipped_frac = tf.reduce_mean(
                     tf.cast(flow_norm_particles > max_flow_norm, tf.float32),
                     axis=-1,
                 )
-                max_flow_frac = tf.maximum(max_flow_frac, clipped_frac)
                 flow_scale = tf.math.divide_no_nan(
                     max_flow_norm,
                     flow_norm + jitter_val,
@@ -654,152 +643,7 @@ class KernelParticleFlow(FlowBase):
                 flow_tol,
             )
             dx_norm = update_norm(update_eff)
-            dx_p95 = self._percentile(dx_norm, 95.0)
-            dx_p95_max = tf.maximum(dx_p95_max, dx_p95)
-            if self.kernel_type == "scalar":
-                K_for_cond = K
-                K_sym = 0.5 * (K_for_cond + tf.linalg.matrix_transpose(K_for_cond))
-                eye_k = tf.eye(
-                    tf.shape(K_sym)[-1],
-                    batch_shape=tf.shape(K_sym)[:-2],
-                    dtype=K_sym.dtype,
-                )
-                K_sym = K_sym + jitter_val * eye_k
-                condK = self._cond_from_matrix(K_sym, eps_val)
-            else:
-                K_for_cond = K
-                rank = tf.rank(K_for_cond)
-                perm_swap = tf.concat(
-                    [
-                        tf.range(rank - 3),
-                        tf.stack([rank - 2, rank - 3, rank - 1]),
-                    ],
-                    axis=0,
-                )
-                K_t = tf.transpose(K_for_cond, perm=perm_swap)
-                K_sym = 0.5 * (K_for_cond + K_t)
-                perm_dx = tf.concat(
-                    [
-                        tf.range(rank - 3),
-                        tf.stack([rank - 1, rank - 3, rank - 2]),
-                    ],
-                    axis=0,
-                )
-                K_sym_dx = tf.transpose(K_sym, perm=perm_dx)
-                eye_k = tf.eye(
-                    tf.shape(K_sym_dx)[-1],
-                    batch_shape=tf.shape(K_sym_dx)[:-2],
-                    dtype=K_sym_dx.dtype,
-                )
-                K_sym_dx = K_sym_dx + jitter_val * eye_k
-                cond_per_dim = self._cond_from_matrix(K_sym_dx, eps_val)
-                condK = tf.reduce_max(cond_per_dim, axis=-1)
-            condK_log10 = tf.math.log(condK + eps_val) / log10_base
-            condK_log10_max = tf.maximum(condK_log10_max, condK_log10)
             x = x + update_eff
-        cov = self._cov_from_particles(x, eps_float)
-        cond_cov = self._cond_from_matrix(cov, eps_val)
-        cond_cov_log10 = tf.math.log(cond_cov + eps_val) / log10_base
-        logdet_cov = self._logdet_cov_from_particles(x, eps_float)
-        diagnostics = {
-            "dx_p95_max": dx_p95_max,
-            "condK_log10_max": condK_log10_max,
-            "flow_norm_mean_max": flow_norm_mean_max,
-            "condCov_log10": cond_cov_log10,
-            "logdet_cov": logdet_cov,
-        }
-        if max_flow_frac is not None:
-            diagnostics["max_flow_frac"] = max_flow_frac
+            diag.update(K, dx_norm, flow_norm, jitter_val, clipped_frac=clipped_frac)
+        diagnostics = diag.finalize(x, eps_float)
         return x, diagnostics
-
-    @tf.function
-    def step(
-        self,
-        x_prev,
-        log_w_prev,
-        y_t,
-        reweight="auto",
-        **kwargs,
-    ):
-        """Kernel flow step.
-
-        Shapes:
-          x_prev: [B, N, dx]
-          log_w_prev: [B, N]
-          y_t: [B, dy]
-        Returns:
-          mu_tilde: [B, N, dx]
-          x_t: [B, N, dx]
-          log_w_norm: [B, N]
-          w: [B, N]
-          parent_indices: [B, N]
-          m_pred: [B, dx]
-          P_pred: [B, dx, dx]
-          x_pre: [B, N, dx]
-          w_pre: [B, N]
-          flow_diag: dict
-        """
-        if reweight is None:
-            reweight = self.default_reweight
-
-        mu_tilde = self.ssm.sample_transition(x_prev, seed=self.ssm._tfp_seed())
-        trans_dist = self.ssm.transition_dist(x_prev)
-        log_q0 = trans_dist.log_prob(mu_tilde)
-
-        w_prev = tf.exp(log_w_prev)
-        w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
-        m_pred = self.ssm.state_mean(mu_tilde, w_prev)
-        P_pred = self.ssm.state_cov(mu_tilde, w_prev)
-
-        m, P = self._prior_from_sample(mu_tilde, w_prev)
-        x_t, log_det, flow_diag = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
-
-        #loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
-
-        # update_weights = reweight != 0
-        # if update_weights:
-        #     log_prior = trans_dist.log_prob(x_t)
-        #     log_q = log_q0 - log_det
-        #     log_w = log_w_prev + tf.cast(loglik + log_prior - log_q, tf.float32)
-        # else:
-        log_w = log_w_prev
-
-        log_w_norm, w, _ = self._log_normalize(log_w)
-        x_pre = x_t
-        w_pre = w
-
-        batch_shape_out = tf.shape(x_t)[:-2]
-        parent_indices = tf.broadcast_to(
-            tf.range(self.num_particles, dtype=tf.int32),
-            tf.concat([batch_shape_out, [self.num_particles]], axis=0),
-        )
-        return mu_tilde, x_t, log_w_norm, w, parent_indices, m_pred, P_pred, x_pre, w_pre, flow_diag
-
-    def sample(self, x_prev, y_t, w=None, seed=None):
-        """Sample and transport particles without resampling.
-
-        Shapes:
-          x_prev: [B, N, dx]
-          y_t: [B, dy]
-          w: [B, N] (optional)
-        Returns:
-          x_next: [B, N, dx]
-          log_q: [B, N]
-          m_pred: [B, dx]
-          P_pred: [B, dx, dx]
-        """
-        mu_tilde, log_q0 = self._propagate_particles(x_prev, seed=seed)
-        batch_shape = tf.shape(mu_tilde)[:-2]
-        num_particles = tf.shape(mu_tilde)[-2]
-        if w is None:
-            w = tf.ones(tf.concat([batch_shape, [num_particles]], axis=0), dtype=tf.float32)
-            w = w / tf.cast(num_particles, tf.float32)
-        else:
-            w = tf.convert_to_tensor(w, dtype=tf.float32)
-            w = tf.math.divide_no_nan(w, tf.reduce_sum(w, axis=-1, keepdims=True))
-        m_pred = self.ssm.state_mean(mu_tilde, w)
-        P_pred = self.ssm.state_cov(mu_tilde, w)
-        m0, P0 = self._prior_from_sample(mu_tilde, w)
-        x_next, log_det, _ = self._flow_transport(mu_tilde, y_t, m0, P0, w=w)
-        return x_next, log_q0 - log_det, m_pred, P_pred
-    

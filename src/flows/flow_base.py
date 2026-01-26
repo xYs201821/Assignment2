@@ -32,58 +32,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         self.debug = bool(debug)
         self.jitter = jitter
 
-    @staticmethod
-    def _percentile(values: tf.Tensor, q: float) -> tf.Tensor:
-        """Compute elementwise percentile along the last axis."""
-        values = tf.sort(values, axis=-1)
-        n = tf.shape(values)[-1]
-        q = tf.cast(q, values.dtype) / tf.cast(100.0, values.dtype)
-        idx = tf.cast(tf.floor(q * tf.cast(n - 1, values.dtype)), tf.int32)
-        idx = tf.clip_by_value(idx, 0, tf.maximum(n - 1, 0))
-        return tf.gather(values, idx, axis=-1)
-
-    @staticmethod
-    def _cond_from_matrix(mat: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
-        """Condition number estimate for symmetric matrices."""
-        mat = 0.5 * (mat + tf.linalg.matrix_transpose(mat))
-        eigvals = tf.linalg.eigvalsh(mat)
-        eig_min = tf.reduce_min(eigvals, axis=-1)
-        eig_max = tf.reduce_max(eigvals, axis=-1)
-        eig_min = tf.maximum(eig_min, eps)
-        return eig_max / (eig_min + eps)
-
-    @staticmethod
-    def _cond_from_rect(mat: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
-        """Condition number estimate for rectangular matrices via SVD."""
-        s = tf.linalg.svd(mat, compute_uv=False)
-        s_max = tf.reduce_max(s, axis=-1)
-        s_min = tf.reduce_min(s, axis=-1)
-        return s_max / (s_min + eps)
-
-    @staticmethod
-    def _cov_from_particles(x: tf.Tensor, eps: float) -> tf.Tensor:
-        """Sample covariance from particles with jitter."""
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
-        mean = tf.reduce_mean(x, axis=-2)
-        resid = x - mean[..., tf.newaxis, :]
-        n = tf.cast(tf.shape(x)[-2], x.dtype)
-        denom = tf.maximum(n - 1.0, 1.0)
-        cov = tf.einsum("...ni,...nj->...ij", resid, resid) / denom
-        cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
-        eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
-        cov = cov + eye * tf.cast(eps, cov.dtype)
-        return cov
-
-    @staticmethod
-    def _logdet_cov_from_particles(x: tf.Tensor, eps: float) -> tf.Tensor:
-        """Log-determinant of particle covariance via eigenvalues."""
-        cov = FlowBase._cov_from_particles(x, eps)
-        eigvals = tf.linalg.eigvalsh(cov)
-        eigvals = tf.maximum(eigvals, tf.cast(eps, eigvals.dtype))
-        return tf.reduce_sum(tf.math.log(eigvals), axis=-1)
-
-    # --- Prior builders (can be overridden by subclasses) ---
-    def _prior_from_sample(self, mu_tilde, w, batch_shape, state_dim):
+    def _prior_from_sample(self, mu_tilde, w=None):
         """Compute weighted prior mean/covariance from particles.
 
         Shapes:
@@ -93,13 +42,65 @@ class FlowBase(ParticleFilter, LinearizationMixin):
           m: [B, dx]
           P: [B, dx, dx]
         """
+        if w is None:
+            w = tf.ones_like(mu_tilde[..., 0]) / tf.cast(tf.shape(mu_tilde)[-2], tf.float32)
         m = tf.einsum("...n,...ni->...i", w, mu_tilde)
         mu_resid = mu_tilde - m[..., tf.newaxis, :]
         P = tf.einsum("...n,...ni,...nj->...ij", w, mu_resid, mu_resid)
         return m, P
 
+    def _normalize_step_modes(self, reweight, resample):
+        """Normalize reweight/resample flags into integer modes."""
+        if reweight is None:
+            reweight = self.default_reweight
+        if resample is None:
+            resample = self.default_resample
+        reweight = self._normalize_reweight(reweight)
+        resample = self._normalize_reweight(resample)
+        return reweight, resample
+
+    def _flow_supports_reweight(self):
+        """Return True if the flow supports Jacobian-based reweighting."""
+        return True
+
+    @staticmethod
+    def _broadcast_log_det(log_det, log_q0):
+        """Broadcast log_det to match log_q0 rank when needed."""
+        log_det = tf.convert_to_tensor(log_det, dtype=log_q0.dtype)
+        rank_diff = tf.rank(log_q0) - tf.rank(log_det)
+
+        def _pad_log_det():
+            new_shape = tf.concat(
+                [tf.shape(log_det), tf.ones(rank_diff, dtype=tf.int32)],
+                axis=0,
+            )
+            return tf.reshape(log_det, new_shape)
+
+        return tf.cond(rank_diff > 0, _pad_log_det, lambda: log_det)
+
+    def _flow_reweight(
+        self,
+        log_w_prev,
+        x_prev,
+        mu_tilde,
+        x_t,
+        y_t,
+        log_q0,
+        log_det,
+        trans_dist,
+        reweight,
+    ):
+        """Compute updated log-weights after flow transport."""
+        if reweight == 0:
+            return log_w_prev
+        loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
+        log_prior = trans_dist.log_prob(x_t)
+        log_det = self._broadcast_log_det(log_det, log_q0)
+        log_q = log_q0 - log_det
+        return log_w_prev + tf.cast(loglik + log_prior - log_q, tf.float32)
+
     # --- Abstract flow transport ---
-    def _flow_transport(self, mu_tilde, y, m0, P):
+    def _flow_transport(self, mu_tilde, y, m0, P, **kwargs):
         """Transport particles through a flow; return (x_next, log_det, diag).
 
         Shapes:
@@ -107,6 +108,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
           y: [B, dy]
           m0: [B, dx]
           P: [B, dx, dx]
+          kwargs: optional flow-specific inputs (e.g., weights)
         Returns:
           x_next: [B, N, dx]
           log_det: [B] or [B, N]
@@ -139,17 +141,14 @@ class FlowBase(ParticleFilter, LinearizationMixin):
           m_pred: [B, dx]
           P_pred: [B, dx, dx]
         """
-        batch_shape = tf.shape(x_prev)[:-2]
-        state_dim = tf.shape(x_prev)[-1]
-
         mu_tilde, log_q0 = self._propagate_particles(x_prev, seed=seed)
         w = tf.convert_to_tensor(w)
         w = tf.math.divide_no_nan(w, tf.reduce_sum(w, axis=-1, keepdims=True))
         m_pred = self.ssm.state_mean(mu_tilde, w)
         P_pred = self.ssm.state_cov(mu_tilde, w)
-        m, P = self._prior_from_sample(mu_tilde, w, batch_shape, state_dim)
+        m, P = self._prior_from_sample(mu_tilde, w)
 
-        x_next, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P)
+        x_next, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P, w=w)
         return x_next, log_q0 - log_det, m_pred, P_pred
 
     def warmup(self, batch_size=1, reweight="auto", resample="never"):
@@ -160,14 +159,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         )
         y_spec = tf.TensorSpec(shape=[None, self.ssm.obs_dim], dtype=tf.float32)
         log_w_spec = tf.TensorSpec(shape=[None, self.num_particles], dtype=tf.float32)
-        if reweight is None:
-            reweight = self.default_reweight
-        if reweight is None:
-            reweight = self.default_reweight
-        if resample is None:
-            resample = self.default_resample
-        reweight = self._normalize_reweight(reweight)
-        resample = self._normalize_reweight(resample)
+        reweight, resample = self._normalize_step_modes(reweight, resample)
         _ = self.step.get_concrete_function(
             x_spec,
             log_w_spec,
@@ -209,10 +201,16 @@ class FlowBase(ParticleFilter, LinearizationMixin):
           w_pre: [B, N]
           flow_diag: dict or None
         """
-        if reweight is None:
-            reweight = self.default_reweight
-        if resample is None:
-            resample = self.default_resample
+        reweight, resample = self._normalize_step_modes(reweight, resample)
+        if reweight != 0 and not self._flow_supports_reweight():
+            if self.debug:
+                tf.print(
+                    "Reweight requested for",
+                    self.__class__.__name__,
+                    "but flow does not support it; disabling.",
+                    summarize=4,
+                )
+            reweight = 0
 
         mu_tilde = self.ssm.sample_transition(x_prev, seed=self.ssm._tfp_seed())
         trans_dist = self.ssm.transition_dist(x_prev)
@@ -223,32 +221,21 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         m_pred = self.ssm.state_mean(mu_tilde, w_prev)
         P_pred = self.ssm.state_cov(mu_tilde, w_prev)
 
-        batch_shape = tf.shape(mu_tilde)[:-2]
-        state_dim = tf.shape(mu_tilde)[-1]
-        m, P = self._prior_from_sample(mu_tilde, w_prev, batch_shape, state_dim)
-        x_t, log_det, flow_diag = self._flow_transport(mu_tilde, y_t, m, P)
+        m, P = self._prior_from_sample(mu_tilde, w_prev)
+        x_t, log_det, flow_diag = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
 
-        loglik = self.ssm.observation_dist(x_t).log_prob(y_t[..., tf.newaxis, :])
-
-        # Importance reweighting with flow Jacobian correction.
-        update_weights = reweight != 0
-        if update_weights:
-            log_prior = trans_dist.log_prob(x_t)
-            log_det = tf.convert_to_tensor(log_det, dtype=log_q0.dtype)
-            rank_diff = tf.rank(log_q0) - tf.rank(log_det)
-
-            def _pad_log_det():
-                new_shape = tf.concat(
-                    [tf.shape(log_det), tf.ones(rank_diff, dtype=tf.int32)],
-                    axis=0,
-                )
-                return tf.reshape(log_det, new_shape)
-
-            log_det = tf.cond(rank_diff > 0, _pad_log_det, lambda: log_det)
-            log_q = log_q0 - log_det
-            log_w = log_w_prev + tf.cast(loglik + log_prior - log_q, tf.float32)
-        else:
-            log_w = log_w_prev
+        # Importance reweighting with flow Jacobian correction (if supported).
+        log_w = self._flow_reweight(
+            log_w_prev,
+            x_prev,
+            mu_tilde,
+            x_t,
+            y_t,
+            log_q0,
+            log_det,
+            trans_dist,
+            reweight,
+        )
 
         log_w_norm, w, _ = self._log_normalize(log_w)
         x_pre = x_t
