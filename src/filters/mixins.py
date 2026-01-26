@@ -17,10 +17,21 @@ class LinearizationMixin:
           J_x(f): [B, dx, dx]
           f(x,q): [B, dx]
         """
+        x = tf.convert_to_tensor(x)
+        q = tf.convert_to_tensor(q)
+        batch_shape = tf.shape(x)[:-1]
+        x_dim = tf.shape(x)[-1]
+        q_dim = tf.shape(q)[-1]
+        x_flat = tf.reshape(x, tf.stack([-1, x_dim]))
+        q_flat = tf.reshape(q, tf.stack([-1, q_dim]))
         with tf.GradientTape() as tape:
-            tape.watch(x)
-            y = self.ssm.f_with_noise(x, q)
-        return tape.batch_jacobian(y, x), y
+            tape.watch(x_flat)
+            y_flat = self.ssm.f_with_noise(x_flat, q_flat)
+        J_flat = tape.batch_jacobian(y_flat, x_flat)
+        y_dim = tf.shape(y_flat)[-1]
+        y = tf.reshape(y_flat, tf.concat([batch_shape, [y_dim]], axis=0))
+        J = tf.reshape(J_flat, tf.concat([batch_shape, [y_dim, x_dim]], axis=0))
+        return J, y
 
     @tf.function(reduce_retracing=True)
     def jacobian_f_q(self, x, q):
@@ -33,10 +44,21 @@ class LinearizationMixin:
           J_q(f): [B, dx, dq]
           f(x,q): [B, dx]
         """
+        x = tf.convert_to_tensor(x)
+        q = tf.convert_to_tensor(q)
+        batch_shape = tf.shape(x)[:-1]
+        x_dim = tf.shape(x)[-1]
+        q_dim = tf.shape(q)[-1]
+        x_flat = tf.reshape(x, tf.stack([-1, x_dim]))
+        q_flat = tf.reshape(q, tf.stack([-1, q_dim]))
         with tf.GradientTape() as tape:
-            tape.watch(q)
-            y = self.ssm.f_with_noise(x, q)
-        return tape.batch_jacobian(y, q), y
+            tape.watch(q_flat)
+            y_flat = self.ssm.f_with_noise(x_flat, q_flat)
+        J_flat = tape.batch_jacobian(y_flat, q_flat)
+        y_dim = tf.shape(y_flat)[-1]
+        y = tf.reshape(y_flat, tf.concat([batch_shape, [y_dim]], axis=0))
+        J = tf.reshape(J_flat, tf.concat([batch_shape, [y_dim, q_dim]], axis=0))
+        return J, y
 
     @tf.function(reduce_retracing=True)
     def jacobian_h_x(self, x, r):
@@ -49,10 +71,21 @@ class LinearizationMixin:
           J_x(h): [B, dy, dx]
           h(x,r): [B, dy]
         """
+        x = tf.convert_to_tensor(x)
+        r = tf.convert_to_tensor(r)
+        batch_shape = tf.shape(x)[:-1]
+        x_dim = tf.shape(x)[-1]
+        r_dim = tf.shape(r)[-1]
+        x_flat = tf.reshape(x, tf.stack([-1, x_dim]))
+        r_flat = tf.reshape(r, tf.stack([-1, r_dim]))
         with tf.GradientTape() as tape:
-            tape.watch(x)
-            y = self.ssm.h_with_noise(x, r)
-        return tape.batch_jacobian(y, x), y
+            tape.watch(x_flat)
+            y_flat = self.ssm.h_with_noise(x_flat, r_flat)
+        J_flat = tape.batch_jacobian(y_flat, x_flat)
+        y_dim = tf.shape(y_flat)[-1]
+        y = tf.reshape(y_flat, tf.concat([batch_shape, [y_dim]], axis=0))
+        J = tf.reshape(J_flat, tf.concat([batch_shape, [y_dim, x_dim]], axis=0))
+        return J, y
 
     @tf.function(reduce_retracing=True)
     def jacobian_h_r(self, x, r):
@@ -65,10 +98,21 @@ class LinearizationMixin:
           J_r(h): [B, dy, dr]
           h(x,r): [B, dy]
         """
+        x = tf.convert_to_tensor(x)
+        r = tf.convert_to_tensor(r)
+        batch_shape = tf.shape(x)[:-1]
+        x_dim = tf.shape(x)[-1]
+        r_dim = tf.shape(r)[-1]
+        x_flat = tf.reshape(x, tf.stack([-1, x_dim]))
+        r_flat = tf.reshape(r, tf.stack([-1, r_dim]))
         with tf.GradientTape() as tape:
-            tape.watch(r)
-            y = self.ssm.h_with_noise(x, r)
-        return tape.batch_jacobian(y, r), y
+            tape.watch(r_flat)
+            y_flat = self.ssm.h_with_noise(x_flat, r_flat)
+        J_flat = tape.batch_jacobian(y_flat, r_flat)
+        y_dim = tf.shape(y_flat)[-1]
+        y = tf.reshape(y_flat, tf.concat([batch_shape, [y_dim]], axis=0))
+        J = tf.reshape(J_flat, tf.concat([batch_shape, [y_dim, r_dim]], axis=0))
+        return J, y
 
     def _jacobian(self, func, x):
         """Generic Jacobian helper for custom functions."""
