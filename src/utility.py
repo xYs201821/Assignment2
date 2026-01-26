@@ -38,11 +38,8 @@ def cholesky_solve(A, B, jitter=1e-6):
     """
     A = tf.convert_to_tensor(A)
     B = tf.convert_to_tensor(B)
-    squeeze = False
-    if A.shape.rank == 2:
-        A = A[tf.newaxis, ...]
-        B = B[tf.newaxis, ...]
-        squeeze = True
+    need_rhs = tf.equal(tf.rank(B), tf.rank(A) - 1)
+    B = tf.cond(need_rhs, lambda: B[..., tf.newaxis], lambda: B)
 
     A_sym = (A + tf.linalg.matrix_transpose(A)) / 2.0
     eye = tf.eye(tf.shape(A_sym)[-1], batch_shape=tf.shape(A_sym)[:-2], dtype=A_sym.dtype)
@@ -50,10 +47,7 @@ def cholesky_solve(A, B, jitter=1e-6):
     L = tf.linalg.cholesky(A_robust)
     Y = tf.linalg.triangular_solve(L, B, lower=True)
     X = tf.linalg.triangular_solve(tf.linalg.matrix_transpose(L), Y, lower=False)
-
-    if squeeze:
-        X = X[0]
-    return X
+    return tf.cond(need_rhs, lambda: X[..., 0], lambda: X)
 
 def block_diag(A, B):
     """
