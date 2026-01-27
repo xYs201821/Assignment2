@@ -24,3 +24,11 @@ def assert_psd(P, eps=-1e-5):
     P_flat = tf.reshape(P, [B * T, dx, dx])
     eigvals = tf.linalg.eigvalsh(0.5 * (P_flat + tf.transpose(P_flat, [0, 2, 1])))
     tf.debugging.assert_greater_equal(tf.reduce_min(eigvals), eps)
+
+
+def assert_step_time_shape(step_time_s, T):
+    step_time_s = tf.convert_to_tensor(step_time_s)
+    if step_time_s.shape.rank == 2:
+        tf.debugging.assert_equal(tf.shape(step_time_s)[1], T)
+    else:
+        tf.debugging.assert_equal(tf.shape(step_time_s)[0], T)

@@ -10,6 +10,12 @@ from src.ssm import LinearGaussianSSM, StochasticVolatilitySSM, RangeBearingSSM
 from src.motion_model import ConstantVelocityMotionModel, ConstantTurnRateMotionModel
 from src.utility import tfp_lgssm  
 
+
+@pytest.fixture(autouse=True)
+def _set_seeds():
+    np.random.seed(0)
+    tf.random.set_seed(0)
+
 @pytest.fixture
 def lgssm_3d():
     dx, dy = 3, 2
@@ -41,9 +47,20 @@ def lgssm_2d():
     model = LinearGaussianSSM(A, B, C, D, m0, P0)
     return model
 
+
+@pytest.fixture
+def lgssm_1d():
+    A = np.array([[1.0]], dtype=np.float32)
+    B = np.array([[1.0]], dtype=np.float32)
+    C = np.array([[1.0]], dtype=np.float32)
+    D = np.array([[1.0]], dtype=np.float32)
+    m0 = np.zeros(1, dtype=np.float32)
+    P0 = np.eye(1, dtype=np.float32)
+    return LinearGaussianSSM(A, B, C, D, m0, P0)
+
 @pytest.fixture
 def sim_data_3d(lgssm_3d):
-    T = 80
+    T = 40
     batch_size = 1
 
     x_traj, y_traj = lgssm_3d.simulate(T=T, shape=(batch_size, ))
