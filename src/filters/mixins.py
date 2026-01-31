@@ -17,6 +17,9 @@ class LinearizationMixin:
           J_x(f): [B, dx, dx]
           f(x,q): [B, dx]
         """
+        ssm_jac = getattr(self.ssm, "jacobian_f_x", None)
+        if callable(ssm_jac):
+            return ssm_jac(x, q)
         x = tf.convert_to_tensor(x)
         q = tf.convert_to_tensor(q)
         batch_shape = tf.shape(x)[:-1]
@@ -44,6 +47,9 @@ class LinearizationMixin:
           J_q(f): [B, dx, dq]
           f(x,q): [B, dx]
         """
+        ssm_jac = getattr(self.ssm, "jacobian_f_q", None)
+        if callable(ssm_jac):
+            return ssm_jac(x, q)
         x = tf.convert_to_tensor(x)
         q = tf.convert_to_tensor(q)
         batch_shape = tf.shape(x)[:-1]
@@ -71,6 +77,9 @@ class LinearizationMixin:
           J_x(h): [B, dy, dx]
           h(x,r): [B, dy]
         """
+        ssm_jac = getattr(self.ssm, "jacobian_h_x", None)
+        if callable(ssm_jac):
+            return ssm_jac(x, r)
         x = tf.convert_to_tensor(x)
         r = tf.convert_to_tensor(r)
         batch_shape = tf.shape(x)[:-1]
@@ -98,6 +107,9 @@ class LinearizationMixin:
           J_r(h): [B, dy, dr]
           h(x,r): [B, dy]
         """
+        ssm_jac = getattr(self.ssm, "jacobian_h_r", None)
+        if callable(ssm_jac):
+            return ssm_jac(x, r)
         x = tf.convert_to_tensor(x)
         r = tf.convert_to_tensor(r)
         batch_shape = tf.shape(x)[:-1]
