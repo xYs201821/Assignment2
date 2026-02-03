@@ -440,6 +440,12 @@ class KernelParticleFlow(FlowBase):
         log_det = tf.zeros(tf.shape(mu_tilde)[:-1], dtype=tf.float32)
         return x_next, log_det, diagnostics
 
+    def _flow_diag_keys(self):
+        keys = ("dx_p95_max", "condK_log10_max", "flow_norm_mean_max")
+        if self.max_flow_norm is not None:
+            keys = keys + ("max_flow_frac",)
+        return keys + ("condCov_log10", "logdet_cov")
+
     @staticmethod
     def _median_midpoint(x):
         """Median midpoint along the last axis."""

@@ -140,6 +140,11 @@ def _is_pf_method(method: str) -> bool:
     return method in ("pf", "bootstrap") or method.startswith("pf")
 
 
+def _is_stochastic_pf_method(method: str) -> bool:
+    method = str(method).lower()
+    return method.startswith("stochastic_pf") or method.startswith("stochastic-pf") or method == "spf"
+
+
 def _is_pfpf_flow_method(method: str) -> bool:
     method = str(method).lower()
     return "pfpf" in method and (method.startswith("edh") or method.startswith("ledh"))
@@ -153,6 +158,8 @@ def _ess_threshold_for_method(
     if _is_pf_method(method):
         return pf_threshold
     if _is_pfpf_flow_method(method):
+        return flow_threshold
+    if _is_stochastic_pf_method(method):
         return flow_threshold
     return None
 
@@ -365,6 +372,7 @@ def main() -> None:
     filters_cfg = cfg.get("filters", {})
     pf_cfg = filters_cfg.get("pf", {})
     flow_cfg = filters_cfg.get("flow", {})
+    spf_cfg = filters_cfg.get("stochastic_pf", {})
     kflow_cfg = filters_cfg.get("kflow", {})
     ukf_cfg = filters_cfg.get("ukf", {})
     init_cfg = cfg.get("init", {})
@@ -377,18 +385,35 @@ def main() -> None:
     seeds = [int(s) for s in _as_list(exp_cfg.get("seeds", [0]))]
     pair_particles = bool(exp_cfg.get("pair_particles", True))
     calc_ekf_jacobian = bool(exp_cfg.get("calc_ekf_jacobian_error", True))
-    plot_state = bool(exp_cfg.get("plot_state", False))
-    plot_seed0_only = bool(exp_cfg.get("plot_seed0_only", True))
-    show_plots = bool(exp_cfg.get("show_plots", False))
-    plot_interactive = bool(exp_cfg.get("plot_interactive", False))
+    plot_show = exp_cfg.get("plot_show")
+    if plot_show is None:
+        plot_state = bool(exp_cfg.get("plot_state", False))
+        plot_seed0_only = bool(exp_cfg.get("plot_seed0_only", True))
+        show_plots = bool(exp_cfg.get("show_plots", False))
+        plot_interactive = bool(exp_cfg.get("plot_interactive", False))
+        plot_pf_ess = bool(exp_cfg.get("plot_pf_ess", False))
+        plot_pf_ess_seed0_only = bool(exp_cfg.get("plot_pf_ess_seed0_only", True))
+        plot_pf_ess_show = bool(exp_cfg.get("plot_pf_ess_show", False))
+        plot_stability = bool(exp_cfg.get("plot_stability", False))
+        plot_stability_seed0_only = bool(exp_cfg.get("plot_stability_seed0_only", True))
+        plot_stability_show = bool(exp_cfg.get("plot_stability_show", False))
+    else:
+        plot_show = bool(plot_show)
+        plot_state = plot_show
+        plot_pf_ess = plot_show
+        plot_stability = plot_show
+        plot_seed0_only = bool(exp_cfg.get("plot_seed0_only", True))
+        plot_pf_ess_seed0_only = bool(exp_cfg.get("plot_pf_ess_seed0_only", True))
+        plot_stability_seed0_only = bool(exp_cfg.get("plot_stability_seed0_only", True))
+        show_plots = plot_show and bool(exp_cfg.get("show_plots", False))
+        plot_interactive = plot_show and bool(exp_cfg.get("plot_interactive", False))
+        plot_pf_ess_show = show_plots
+        plot_stability_show = show_plots
     plot_time_gap = exp_cfg.get("plot_time_gap")
     if plot_time_gap is not None:
         plot_time_gap = int(plot_time_gap)
         if plot_time_gap <= 0:
             plot_time_gap = None
-    plot_pf_ess = bool(exp_cfg.get("plot_pf_ess", False))
-    plot_pf_ess_seed0_only = bool(exp_cfg.get("plot_pf_ess_seed0_only", True))
-    plot_pf_ess_show = bool(exp_cfg.get("plot_pf_ess_show", False))
     plot_pf_ess_percentiles = exp_cfg.get("plot_pf_ess_percentiles")
     if plot_pf_ess_percentiles is None:
         plot_pf_ess_percentiles = (10.0, 90.0)
@@ -398,9 +423,6 @@ def main() -> None:
             plot_pf_ess_percentiles = (float(vals[0]), float(vals[1]))
         else:
             plot_pf_ess_percentiles = (10.0, 90.0)
-    plot_stability = bool(exp_cfg.get("plot_stability", False))
-    plot_stability_seed0_only = bool(exp_cfg.get("plot_stability_seed0_only", True))
-    plot_stability_show = bool(exp_cfg.get("plot_stability_show", False))
     plot_stability_percentiles = exp_cfg.get("plot_stability_percentiles")
     if plot_stability_percentiles is None:
         plot_stability_percentiles = (25.0, 75.0)
@@ -503,7 +525,9 @@ def main() -> None:
                         reweight_pf=pf_reweight,
                         reweight_flow=flow_reweight,
                         methods=base_methods,
+                        flow_cfg=flow_cfg,
                         kflow_cfg=kflow_cfg,
+                        stochastic_pf_cfg=spf_cfg,
                     )
                     metrics_across_seeds: Dict[str, List[Dict[str, Any]]] = {
                         method: [] for method in methods
@@ -575,9 +599,11 @@ def main() -> None:
                             metrics_across_seeds[method].append(metrics)
 
                             if plot_pf_ess and (not plot_pf_ess_seed0_only or seed == seeds[0]):
-                                if (_is_pf_method(method) or _is_pfpf_flow_method(method)) and not out.get(
-                                    "is_gaussian", False
-                                ):
+                                if (
+                                    _is_pf_method(method)
+                                    or _is_pfpf_flow_method(method)
+                                    or _is_stochastic_pf_method(method)
+                                ) and not out.get("is_gaussian", False):
                                     w_pre = _select_pre_resample_weights(out)
                                     if w_pre is not None:
                                         ess_threshold = _ess_threshold_for_method(

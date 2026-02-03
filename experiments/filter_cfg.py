@@ -19,13 +19,16 @@ def _is_kflow_method(method: str) -> bool:
     return method.startswith("kflow") or method.startswith("kernel")
 
 
-def _flow_pfpf_base(method: str) -> str | None:
-    method = str(method).lower()
-    if method in ("edh(pfpf)", "edh_pfpf", "edh-pfpf"):
-        return "edh"
-    if method in ("ledh(pfpf)", "ledh_pfpf", "ledh-pfpf"):
-        return "ledh"
-    return None
+def _flow_method_flags(method: str) -> Tuple[str | None, bool, bool]:
+    method = str(method).lower().replace(" ", "")
+    base: str | None = None
+    if method.startswith("edh"):
+        base = "edh"
+    elif method.startswith("ledh"):
+        base = "ledh"
+    if base is None:
+        return None, False, False
+    return base, ("pfpf" in method), ("opt" in method)
 
 
 def _kflow_param_grid(
@@ -115,7 +118,9 @@ def build_filter_cfg(
     reweight_pf: str = "auto",
     reweight_flow: str = "auto",
     methods: Iterable[str] | None = None,
+    flow_cfg: Dict[str, Any] | None = None,
     kflow_cfg: Dict[str, Any] | None = None,
+    stochastic_pf_cfg: Dict[str, Any] | None = None,
 ) -> Tuple[List[str], Dict[str, Dict[str, Any]]]:
     ukf_cfg: Dict[str, Any] = {}
     if ukf_alpha is not None:
@@ -147,20 +152,65 @@ def build_filter_cfg(
             "ess_threshold": float(ess_threshold_flow),
             "reweight": reweight_flow,
         },
+        "stochastic_pf": {
+            "num_particles": int(num_particles_flow),
+            "num_lambda": int(num_lambda_flow),
+            "ess_threshold": float(ess_threshold_flow),
+            "reweight": reweight_flow,
+        },
     }
+    if isinstance(flow_cfg, dict):
+        beta_schedule = flow_cfg.get("beta_schedule")
+        if beta_schedule is not None:
+            filter_cfg["edh"]["beta_schedule"] = beta_schedule
+            filter_cfg["ledh"]["beta_schedule"] = beta_schedule
+        flow_beta_schedule_opt = flow_cfg.get("beta_schedule_opt")
+        if flow_beta_schedule_opt is None and beta_schedule is not None:
+            flow_beta_schedule_opt = beta_schedule
+    else:
+        flow_beta_schedule_opt = None
+    if isinstance(stochastic_pf_cfg, dict):
+        spf_cfg = dict(filter_cfg["stochastic_pf"])
+        for key, value in stochastic_pf_cfg.items():
+            if value is None:
+                continue
+            if key in ("num_particles", "num_lambda"):
+                spf_cfg[key] = int(value)
+            elif key in ("ess_threshold", "jitter"):
+                spf_cfg[key] = float(value)
+            elif key in ("optimal_beta", "beta_guard", "beta_mode", "beta_mu"):
+                continue
+            elif key in ("debug",):
+                spf_cfg[key] = bool(value)
+            elif key in ("reweight", "resample"):
+                spf_cfg[key] = str(value)
+            else:
+                spf_cfg[key] = value
+        filter_cfg["stochastic_pf"] = spf_cfg
     if methods is None:
         return [], filter_cfg
 
     methods_list = [str(m).lower() for m in methods]
-    if kflow_cfg is None:
-        for method in methods_list:
-            base = _flow_pfpf_base(method)
-            if base is None:
-                continue
-            base_cfg = dict(filter_cfg.get(base, {}))
+
+    def _apply_flow_overrides(method_name: str) -> None:
+        base, is_pfpf, is_opt = _flow_method_flags(method_name)
+        if base is None:
+            return
+        if not is_pfpf and not is_opt:
+            return
+        base_cfg = dict(filter_cfg.get(base, {}))
+        if is_opt:
+            if flow_beta_schedule_opt is not None:
+                base_cfg["beta_schedule"] = flow_beta_schedule_opt
+            else:
+                base_cfg["beta_schedule"] = {"mode": "optimal"}
+        if is_pfpf:
             base_cfg["reweight"] = "always"
             base_cfg["resample"] = "auto"
-            filter_cfg[method] = base_cfg
+        filter_cfg[method_name] = base_cfg
+    if kflow_cfg is None:
+        for method in methods_list:
+            _apply_flow_overrides(method)
         return methods_list, filter_cfg
 
     kflow_grid = _kflow_param_grid(kflow_cfg, num_particles_flow, num_lambda_flow)
@@ -187,11 +237,5 @@ def build_filter_cfg(
             method_cfg.update(kflow_base)
             filter_cfg[method_name] = method_cfg
     for method in methods_list:
-        base = _flow_pfpf_base(method)
-        if base is None:
-            continue
-        base_cfg = dict(filter_cfg.get(base, {}))
-        base_cfg["reweight"] = "always"
-        base_cfg["resample"] = "auto"
-        filter_cfg[method] = base_cfg
+        _apply_flow_overrides(method)
     return methods_list, filter_cfg

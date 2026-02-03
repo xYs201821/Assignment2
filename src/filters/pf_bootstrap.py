@@ -141,8 +141,7 @@ class BootstrapParticleFilter(ParticleFilter):
         P_pred_ta = tf.TensorArray(tf.float32, size=T)
         parent_ta = tf.TensorArray(tf.int32, size=T)
         step_time_ta = tf.TensorArray(tf.float32, size=T)
-        mem_rss_ta = tf.TensorArray(tf.float32, size=T) if memory_sampler is not None else None
-        mem_gpu_ta = tf.TensorArray(tf.float32, size=T) if memory_sampler is not None else None
+        mem_rss_ta, mem_gpu_ta = self._init_memory_traces(T, memory_sampler)
 
         for t in range(T):
             t_start = tf.timestamp()
@@ -167,25 +166,12 @@ class BootstrapParticleFilter(ParticleFilter):
             step_time = tf.cast(tf.timestamp() - t_start, tf.float32)
             step_time_ta = step_time_ta.write(t, step_time)
 
-            if memory_sampler is not None:
-                sample = memory_sampler()
-                rss = None
-                gpu = None
-                if isinstance(sample, dict):
-                    rss = sample.get("rss")
-                    gpu = sample.get("gpu")
-                elif isinstance(sample, (tuple, list)):
-                    if len(sample) > 0:
-                        rss = sample[0]
-                    if len(sample) > 1:
-                        gpu = sample[1]
-                else:
-                    rss = sample
-                if rss is not None:
-                    mem_rss_ta = mem_rss_ta.write(t, tf.cast(rss, tf.float32))
-                if mem_gpu_ta is not None:
-                    gpu_val = 0.0 if gpu is None else gpu
-                    mem_gpu_ta = mem_gpu_ta.write(t, tf.cast(gpu_val, tf.float32))
+            mem_rss_ta, mem_gpu_ta = self._record_memory(
+                t,
+                memory_sampler,
+                mem_rss_ta,
+                mem_gpu_ta,
+            )
 
         x_seq = self._stack_and_permute(x_ta, tail_dims=2)
         w_seq = self._stack_and_permute(w_ta, tail_dims=1)
@@ -199,8 +185,5 @@ class BootstrapParticleFilter(ParticleFilter):
             "w_pre": self._stack_and_permute(w_pre_ta, tail_dims=1),
             "w_prev": self._stack_and_permute(w_prev_ta, tail_dims=1),
         }
-        if mem_rss_ta is not None:
-            diagnostics["memory_rss"] = self._stack_and_permute(mem_rss_ta, tail_dims=0)
-        if mem_gpu_ta is not None:
-            diagnostics["memory_gpu"] = self._stack_and_permute(mem_gpu_ta, tail_dims=0)
+        diagnostics = self._finalize_memory(diagnostics, mem_rss_ta, mem_gpu_ta)
         return x_seq, w_seq, diagnostics, parent_seq

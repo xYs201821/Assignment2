@@ -97,6 +97,54 @@ class BaseFilter(tf.Module):
         perm = tf.concat([prefix, [0], tf.range(1 + batch_rank, rank)], axis=0)
         return tf.transpose(seq, perm)
 
+    @staticmethod
+    def _init_memory_traces(size, memory_sampler):
+        """Initialize memory trace TensorArrays when enabled."""
+        if memory_sampler is None:
+            return None, None
+        return (
+            tf.TensorArray(dtype=tf.float32, size=size),
+            tf.TensorArray(dtype=tf.float32, size=size),
+        )
+
+    @staticmethod
+    def _parse_memory_sample(sample):
+        """Normalize memory sampler output into (rss, gpu)."""
+        rss = None
+        gpu = None
+        if isinstance(sample, dict):
+            rss = sample.get("rss")
+            gpu = sample.get("gpu")
+        elif isinstance(sample, (tuple, list)):
+            if len(sample) > 0:
+                rss = sample[0]
+            if len(sample) > 1:
+                gpu = sample[1]
+        else:
+            rss = sample
+        return rss, gpu
+
+    def _record_memory(self, step, memory_sampler, mem_rss_ta, mem_gpu_ta):
+        """Record a memory sample into TensorArrays."""
+        if memory_sampler is None:
+            return mem_rss_ta, mem_gpu_ta
+        sample = memory_sampler()
+        rss, gpu = self._parse_memory_sample(sample)
+        if rss is not None:
+            mem_rss_ta = mem_rss_ta.write(step, tf.cast(rss, tf.float32))
+        if mem_gpu_ta is not None:
+            gpu_val = 0.0 if gpu is None else gpu
+            mem_gpu_ta = mem_gpu_ta.write(step, tf.cast(gpu_val, tf.float32))
+        return mem_rss_ta, mem_gpu_ta
+
+    def _finalize_memory(self, out, mem_rss_ta, mem_gpu_ta):
+        """Attach memory traces to output dict."""
+        if mem_rss_ta is not None:
+            out["memory_rss"] = self._stack_and_permute(mem_rss_ta, tail_dims=0)
+        if mem_gpu_ta is not None:
+            out["memory_gpu"] = self._stack_and_permute(mem_gpu_ta, tail_dims=0)
+        return out
+
 
 class GaussianFilter(BaseFilter):
     """Base class for Gaussian filters with predict/update structure."""
@@ -223,8 +271,7 @@ class GaussianFilter(BaseFilter):
         P_pred_ta = tf.TensorArray(dtype=tf.float32, size=T)
         cond_P_ta = tf.TensorArray(dtype=tf.float32, size=T)
         step_time_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        mem_rss_ta = tf.TensorArray(dtype=tf.float32, size=T) if memory_sampler is not None else None
-        mem_gpu_ta = tf.TensorArray(dtype=tf.float32, size=T) if memory_sampler is not None else None
+        mem_rss_ta, mem_gpu_ta = self._init_memory_traces(T, memory_sampler)
 
         for t in range(T):
             t_start = tf.timestamp()
@@ -240,25 +287,12 @@ class GaussianFilter(BaseFilter):
             cond_P_ta = cond_P_ta.write(t, tf_cond(P_filt))
             step_time = tf.cast(tf.timestamp() - t_start, tf.float32)
             step_time_ta = step_time_ta.write(t, step_time)
-            if memory_sampler is not None:
-                sample = memory_sampler()
-                rss = None
-                gpu = None
-                if isinstance(sample, dict):
-                    rss = sample.get("rss")
-                    gpu = sample.get("gpu")
-                elif isinstance(sample, (tuple, list)):
-                    if len(sample) > 0:
-                        rss = sample[0]
-                    if len(sample) > 1:
-                        gpu = sample[1]
-                else:
-                    rss = sample
-                if rss is not None:
-                    mem_rss_ta = mem_rss_ta.write(t, tf.cast(rss, tf.float32))
-                if mem_gpu_ta is not None:
-                    gpu_val = 0.0 if gpu is None else gpu
-                    mem_gpu_ta = mem_gpu_ta.write(t, tf.cast(gpu_val, tf.float32))
+            mem_rss_ta, mem_gpu_ta = self._record_memory(
+                t,
+                memory_sampler,
+                mem_rss_ta,
+                mem_gpu_ta,
+            )
 
         out = {
             "m_filt": self._stack_and_permute(m_filt_ta, tail_dims=1),
@@ -268,11 +302,7 @@ class GaussianFilter(BaseFilter):
             "cond_P": self._stack_and_permute(cond_P_ta, tail_dims=0),
             "step_time_s": self._stack_and_permute(step_time_ta, tail_dims=0),
         }
-        if mem_rss_ta is not None:
-            out["memory_rss"] = self._stack_and_permute(mem_rss_ta, tail_dims=0)
-        if mem_gpu_ta is not None:
-            out["memory_gpu"] = self._stack_and_permute(mem_gpu_ta, tail_dims=0)
-        return out
+        return self._finalize_memory(out, mem_rss_ta, mem_gpu_ta)
 
     @staticmethod
     def _kalman_gain(C, P, R):

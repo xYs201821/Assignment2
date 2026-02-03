@@ -17,6 +17,7 @@ import tensorflow_probability as tfp
 
 from src.ssm.base import SSM
 from src.flows.stochastic_pf import StochasticParticleFlow
+from src.flows.beta_schedule import BetaScheduleConfig, OptimalBetaSolver
 
 
 tfd = tfp.distributions
@@ -105,8 +106,8 @@ class BearingOnlySSM(SSM):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dai(22) bearing-only SPF (single step).")
     parser.add_argument("--num_particles", type=int, default=50)
-    parser.add_argument("--num_lambda", type=int, default=10000)
-    parser.add_argument("--beta_mode", choices=["linear", "optimal", "both"], default="linear")
+    parser.add_argument("--num_lambda", type=int, default=1000)
+    parser.add_argument("--beta_mode", choices=["linear", "optimal", "both"], default="both")
     parser.add_argument("--mu", type=float, default=0.2)
     parser.add_argument("--mc_runs", type=int, default=20)
     parser.add_argument("--shared-init", dest="shared_init", action="store_true")
@@ -164,8 +165,6 @@ def main() -> None:
         num_particles=args.num_particles,
         diffusion=Q,
         reweight="never",
-        beta_mode="linear",
-        optimal_beta=False,
     )
 
     batch_size = max(1, int(args.mc_runs))
@@ -186,33 +185,46 @@ def main() -> None:
 
     _, Info = flow._likelihood_terms(x0_tf, y_tf)
     P0_inv = flow._inverse_from_cov(P0_tf)
-    beta_opt, beta_dot_opt, _ = flow.solve_optimal_beta_schedule(
+    solver = OptimalBetaSolver(args.num_lambda)
+    beta_opt, beta_dot_opt, _ = solver.solve(
         P0_inv,
         Info,
         mu=args.mu,
     )
     beta_base = np.linspace(0.0, 1.0, args.num_lambda + 1, dtype=np.float32)[:-1]
     beta_dot_base = np.ones_like(beta_base)
-    beta_base_tf = tf.convert_to_tensor(beta_base[tf.newaxis, :], dtype=tf.float32)
-    beta_dot_base_tf = tf.convert_to_tensor(beta_dot_base[tf.newaxis, :], dtype=tf.float32)
-
-    flow.beta = beta_base_tf
-    flow.beta_dot = beta_dot_base_tf
-    flow.optimal_beta = False
-    flow.beta_guard = False
     ssm.rng = tf.random.Generator.from_seed(int(args.seed))
-    x_post_base, _, _ = flow._flow_transport(x0_tf, y_tf, m0_tf, P0_tf, beta_mu=args.mu)
-
-    flow.beta_guard = True
-    ssm.rng = tf.random.Generator.from_seed(int(args.seed))
-    x_post_opt, _, _ = flow._flow_transport(
+    flow_base = StochasticParticleFlow(
+        ssm,
+        num_lambda=args.num_lambda,
+        num_particles=args.num_particles,
+        diffusion=Q,
+        reweight="never",
+        beta_schedule=BetaScheduleConfig(mode="linear"),
+    )
+    flow_base_transport = tf.function(flow_base._flow_transport)
+    x_post_base, _, _ = flow_base_transport(
         x0_tf,
         y_tf,
         m0_tf,
         P0_tf,
-        beta_mu=args.mu,
-        beta_override=beta_opt,
-        beta_dot_override=beta_dot_opt,
+    )
+
+    ssm.rng = tf.random.Generator.from_seed(int(args.seed))
+    flow_opt = StochasticParticleFlow(
+        ssm,
+        num_lambda=args.num_lambda,
+        num_particles=args.num_particles,
+        diffusion=Q,
+        reweight="never",
+        beta_schedule=BetaScheduleConfig(mode="optimal", mu=args.mu, guard="cond_f"),
+    )
+    flow_opt_transport = tf.function(flow_opt._flow_transport)
+    x_post_opt, _, _ = flow_opt_transport(
+        x0_tf,
+        y_tf,
+        m0_tf,
+        P0_tf,
     )
 
     x_post_base_np = x_post_base.numpy()

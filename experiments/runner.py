@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import os
+import time
+
 import numpy as np
 import tensorflow as tf
+
+import threading
 
 from src.benchmark import MemorySampler, summarize_gpu, summarize_rss, summarize_step_times
 from src.filters.ekf import ExtendedKalmanFilter
@@ -13,6 +18,8 @@ from src.filters.ukf import UnscentedKalmanFilter
 from src.flows.edh import EDHFlow
 from src.flows.ledh import LEDHFlow
 from src.flows.kernel_embedded import KernelParticleFlow
+from src.flows.stochastic_pf import StochasticParticleFlow
+from src.flows.beta_schedule import BetaScheduleConfig
 
 
 def _normalize_y(y: tf.Tensor, obs_dim: int) -> tf.Tensor:
@@ -36,6 +43,8 @@ def _flow_kind(method: str) -> Optional[str]:
         return "edh"
     if method.startswith("ledh"):
         return "ledh"
+    if method.startswith("stochastic_pf") or method.startswith("stochastic-pf") or method == "spf":
+        return "stochastic_pf"
     return None
 
 
@@ -51,6 +60,24 @@ def _flow_resample_default(method: str, fallback: str) -> str:
     return fallback
 
 
+def _beta_schedule_from_cfg(value: Any) -> BetaScheduleConfig | None:
+    if value is None:
+        return None
+    if isinstance(value, BetaScheduleConfig):
+        return value
+    if isinstance(value, str):
+        return BetaScheduleConfig(mode=value)
+    if isinstance(value, dict):
+        if "beta" in value or "beta_dot" in value:
+            raise ValueError("explicit beta arrays are not supported; use mode 'linear' or 'optimal'")
+        return BetaScheduleConfig(
+            mode=value.get("mode", "linear"),
+            mu=float(value.get("mu", 0.2)),
+            guard=value.get("guard", value.get("beta_guard")),
+        )
+    raise TypeError("beta_schedule must be None, BetaScheduleConfig, dict, or str")
+
+
 def _particles_to_stats(ssm, x: tf.Tensor, w: Optional[tf.Tensor]) -> Dict[str, tf.Tensor]:
     if w is None:
         w = tf.ones(tf.shape(x)[:-1], dtype=tf.float32)
@@ -60,11 +87,45 @@ def _particles_to_stats(ssm, x: tf.Tensor, w: Optional[tf.Tensor]) -> Dict[str, 
     return {"mean": mean, "cov": cov}
 
 
-def _runtime_and_memory(diagnostics: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_diffusion_matrix(value: Any, state_dim: int) -> Optional[np.ndarray]:
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.ndim == 0:
+        return np.eye(state_dim, dtype=np.float32) * float(arr)
+    if arr.ndim == 1:
+        if arr.shape[0] != state_dim:
+            raise ValueError(
+                f"stochastic_pf.diffusion length {arr.shape[0]} must match state_dim={state_dim}"
+            )
+        return np.diag(arr)
+    return arr
+
+
+def _runtime_and_memory(
+    diagnostics: Dict[str, Any],
+    wall_time_s: Optional[float] = None,
+    num_steps: Optional[int] = None,
+    batch_size: Optional[int] = None,
+) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     step_times = diagnostics.get("step_time_s")
     if step_times is not None:
         out["runtime"] = summarize_step_times(np.asarray(step_times))
+    if wall_time_s is not None:
+        out.setdefault("runtime", {})
+        runtime = out["runtime"]
+        runtime["total_s"] = float(wall_time_s)
+        if num_steps and num_steps > 0:
+            runtime["mean_s"] = float(wall_time_s / float(num_steps))
+            if runtime.get("p95_s", 0.0) == 0.0:
+                runtime["p95_s"] = runtime["mean_s"]
+        if batch_size and batch_size > 0:
+            runtime["per_batch_s"] = float(wall_time_s / float(batch_size))
+            if num_steps and num_steps > 0:
+                runtime["per_step_per_batch_s"] = float(
+                    wall_time_s / float(num_steps * batch_size)
+                )
     rss = diagnostics.get("memory_rss")
     if rss is not None:
         out["memory"] = summarize_rss(np.asarray(rss))
@@ -86,8 +147,62 @@ def _add_pred_stats(out: Dict[str, Any], diagnostics: Dict[str, Any]) -> None:
 def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
     method = str(method).lower()
     y_obs = _normalize_y(y_obs, ssm.obs_dim)
-    memory_sampler = MemorySampler(sample_gpu=bool(cfg.get("sample_gpu", False)))
-    mem_fn = memory_sampler.sample if cfg.get("track_memory", True) else None
+    track_memory = bool(cfg.get("track_memory", True))
+    profile = bool(cfg.get("track_profile", track_memory))
+    profile_root = cfg.get("profile_dir", "results/tf_profiler")
+    mem_interval = float(cfg.get("memory_sample_interval_s", 0.01))
+    sample_gpu = bool(cfg.get("sample_gpu", False))
+    init_seed = cfg.get("init_seed")
+    if init_seed is not None:
+        init_seed = tf.convert_to_tensor(init_seed, dtype=tf.int32)
+
+    def _run_profiled(fn):
+        t0 = time.perf_counter()
+        mem_rss: list[int] = []
+        mem_gpu: list[int] = []
+        stop_event = threading.Event()
+        sample_thread = None
+
+        if track_memory:
+            sampler = MemorySampler(sample_gpu=sample_gpu)
+            rss0, gpu0 = sampler.sample()
+            mem_rss.append(rss0)
+            if gpu0 is not None:
+                mem_gpu.append(gpu0)
+
+            def _sample_loop():
+                while not stop_event.is_set():
+                    rss, gpu = sampler.sample()
+                    mem_rss.append(rss)
+                    if gpu is not None:
+                        mem_gpu.append(gpu)
+                    time.sleep(mem_interval)
+
+            sample_thread = threading.Thread(target=_sample_loop, daemon=True)
+            sample_thread.start()
+
+        if profile:
+            logdir = os.path.join(profile_root, f"{method}_{int(time.time())}")
+            tf.profiler.experimental.start(logdir)
+        try:
+            result = fn()
+        finally:
+            if hasattr(tf.experimental, "async_wait"):
+                try:
+                    tf.experimental.async_wait()
+                except Exception:
+                    pass
+            if profile:
+                tf.profiler.experimental.stop()
+            if track_memory:
+                stop_event.set()
+                if sample_thread is not None:
+                    sample_thread.join()
+                rss1, gpu1 = sampler.sample()
+                mem_rss.append(rss1)
+                if gpu1 is not None:
+                    mem_gpu.append(gpu1)
+        return result, time.perf_counter() - t0, mem_rss, mem_gpu
 
     m0 = cfg.get("m0")
     P0 = cfg.get("P0")
@@ -97,7 +212,9 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
         print("Running Kalman filter...")
         filt = KalmanFilter(ssm)
         filt.warmup(batch_size=tf.shape(y_obs)[0])
-        res = filt.filter(y_obs, m0=m0, P0=P0, memory_sampler=mem_fn)
+        res, wall_time_s, mem_rss, mem_gpu = _run_profiled(
+            lambda: filt.filter(y_obs, m0=m0, P0=P0)
+        )
         mean = res["m_filt"]
         cov = res["P_filt"]
         batch = tf.shape(mean)[:-2]
@@ -105,6 +222,10 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
         x_particles = mean[..., tf.newaxis, :]
         w = _uniform_weights(batch, T, 1)
         diagnostics = {k: v for k, v in res.items() if k not in ("m_filt", "P_filt")}
+        if mem_rss:
+            diagnostics["memory_rss"] = mem_rss
+        if mem_gpu:
+            diagnostics["memory_gpu"] = mem_gpu
         out = {
             "x_particles": x_particles,
             "w": w,
@@ -115,14 +236,18 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             "P_pred": res.get("P_pred"),
             "is_gaussian": True,
         }
-        out.update(_runtime_and_memory(diagnostics))
+        batch_size = int(y_obs.shape[0] or tf.shape(y_obs)[0].numpy())
+        num_steps = int(y_obs.shape[1] or tf.shape(y_obs)[1].numpy())
+        out.update(_runtime_and_memory(diagnostics, wall_time_s, num_steps, batch_size))
         return out
 
     if method == "ekf":
         print("Running EKF...")
         filt = ExtendedKalmanFilter(ssm, joseph=True)
         filt.warmup(batch_size=tf.shape(y_obs)[0])
-        res = filt.filter(y_obs, m0=m0, P0=P0, memory_sampler=mem_fn)
+        res, wall_time_s, mem_rss, mem_gpu = _run_profiled(
+            lambda: filt.filter(y_obs, m0=m0, P0=P0)
+        )
         mean = res["m_filt"]
         cov = res["P_filt"]
         batch = tf.shape(mean)[:-2]
@@ -130,6 +255,10 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
         x_particles = mean[..., tf.newaxis, :]
         w = _uniform_weights(batch, T, 1)
         diagnostics = {k: v for k, v in res.items() if k not in ("m_filt", "P_filt")}
+        if mem_rss:
+            diagnostics["memory_rss"] = mem_rss
+        if mem_gpu:
+            diagnostics["memory_gpu"] = mem_gpu
         out = {
             "x_particles": x_particles,
             "w": w,
@@ -140,7 +269,9 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             "P_pred": res.get("P_pred"),
             "is_gaussian": True,
         }
-        out.update(_runtime_and_memory(diagnostics))
+        batch_size = int(y_obs.shape[0] or tf.shape(y_obs)[0].numpy())
+        num_steps = int(y_obs.shape[1] or tf.shape(y_obs)[1].numpy())
+        out.update(_runtime_and_memory(diagnostics, wall_time_s, num_steps, batch_size))
         return out
 
     if method == "ukf":
@@ -154,7 +285,9 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             jitter=float(cfg.get("jitter", 1e-6)),
         )
         filt.warmup(batch_size=tf.shape(y_obs)[0])
-        res = filt.filter(y_obs, m0=m0, P0=P0, memory_sampler=mem_fn)
+        res, wall_time_s, mem_rss, mem_gpu = _run_profiled(
+            lambda: filt.filter(y_obs, m0=m0, P0=P0)
+        )
         mean = res["m_filt"]
         cov = res["P_filt"]
         batch = tf.shape(mean)[:-2]
@@ -162,6 +295,10 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
         x_particles = mean[..., tf.newaxis, :]
         w = _uniform_weights(batch, T, 1)
         diagnostics = {k: v for k, v in res.items() if k not in ("m_filt", "P_filt")}
+        if mem_rss:
+            diagnostics["memory_rss"] = mem_rss
+        if mem_gpu:
+            diagnostics["memory_gpu"] = mem_gpu
         out = {
             "x_particles": x_particles,
             "w": w,
@@ -172,7 +309,9 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             "P_pred": res.get("P_pred"),
             "is_gaussian": True,
         }
-        out.update(_runtime_and_memory(diagnostics))
+        batch_size = int(y_obs.shape[0] or tf.shape(y_obs)[0].numpy())
+        num_steps = int(y_obs.shape[1] or tf.shape(y_obs)[1].numpy())
+        out.update(_runtime_and_memory(diagnostics, wall_time_s, num_steps, batch_size))
         return out
 
     if method in ("pf", "bootstrap"):
@@ -184,13 +323,14 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             ess_threshold=float(cfg.get("ess_threshold", 0.5)),
         )
         filt.warmup(batch_size=tf.shape(y_obs)[0], resample=cfg.get("reweight", "auto"))
-        x, w, diagnostics, parents = filt.filter(
-            y_obs,
-            resample=cfg.get("reweight", "auto"),
-            init_dist=cfg.get("init_dist"),
-            init_seed=cfg.get("init_seed"),
-            init_particles=init_particles,
-            memory_sampler=mem_fn,
+        (x, w, diagnostics, parents), wall_time_s, mem_rss, mem_gpu = _run_profiled(
+            lambda: filt.filter(
+                y_obs,
+                resample=cfg.get("reweight", "auto"),
+                init_dist=cfg.get("init_dist"),
+                init_seed=init_seed,
+                init_particles=init_particles,
+            )
         )
         stats = _particles_to_stats(ssm, x, w)
         out = {
@@ -202,7 +342,13 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             "parents": parents,
         }
         _add_pred_stats(out, diagnostics)
-        out.update(_runtime_and_memory(diagnostics))
+        if mem_rss:
+            diagnostics["memory_rss"] = mem_rss
+        if mem_gpu:
+            diagnostics["memory_gpu"] = mem_gpu
+        batch_size = int(y_obs.shape[0] or tf.shape(y_obs)[0].numpy())
+        num_steps = int(y_obs.shape[1] or tf.shape(y_obs)[1].numpy())
+        out.update(_runtime_and_memory(diagnostics, wall_time_s, num_steps, batch_size))
         return out
 
     flow_kind = _flow_kind(method)
@@ -221,16 +367,19 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             num_particles=int(cfg.get("num_particles", 100)),
             ess_threshold=float(cfg.get("ess_threshold", 0.5)),
             reweight=reweight,
+            beta_schedule=_beta_schedule_from_cfg(cfg.get("beta_schedule")),
+            jitter=float(cfg.get("jitter", 1e-6)),
         )
         filt.warmup(batch_size=tf.shape(y_obs)[0], reweight=reweight, resample=resample)
-        x, w, diagnostics, parents = filt.filter(
-            y_obs,
-            init_dist=cfg.get("init_dist"),
-            reweight=reweight,
-            resample=resample,
-            init_seed=cfg.get("init_seed"),
-            init_particles=init_particles,
-            memory_sampler=mem_fn,
+        (x, w, diagnostics, parents), wall_time_s, mem_rss, mem_gpu = _run_profiled(
+            lambda: filt.filter(
+                y_obs,
+                init_dist=cfg.get("init_dist"),
+                reweight=reweight,
+                resample=resample,
+                init_seed=init_seed,
+                init_particles=init_particles,
+            )
         )
         stats = _particles_to_stats(ssm, x, w)
         out = {
@@ -242,7 +391,13 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             "parents": parents,
         }
         _add_pred_stats(out, diagnostics)
-        out.update(_runtime_and_memory(diagnostics))
+        if mem_rss:
+            diagnostics["memory_rss"] = mem_rss
+        if mem_gpu:
+            diagnostics["memory_gpu"] = mem_gpu
+        batch_size = int(y_obs.shape[0] or tf.shape(y_obs)[0].numpy())
+        num_steps = int(y_obs.shape[1] or tf.shape(y_obs)[1].numpy())
+        out.update(_runtime_and_memory(diagnostics, wall_time_s, num_steps, batch_size))
         return out
 
     if flow_kind == "ledh":
@@ -259,16 +414,19 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             num_particles=int(cfg.get("num_particles", 100)),
             ess_threshold=float(cfg.get("ess_threshold", 0.5)),
             reweight=reweight,
+            beta_schedule=_beta_schedule_from_cfg(cfg.get("beta_schedule")),
+            jitter=float(cfg.get("jitter", 1e-6)),
         )
         filt.warmup(batch_size=tf.shape(y_obs)[0], reweight=reweight, resample=resample)
-        x, w, diagnostics, parents = filt.filter(
-            y_obs,
-            init_dist=cfg.get("init_dist"),
-            reweight=reweight,
-            resample=resample,
-            init_seed=cfg.get("init_seed"),
-            init_particles=init_particles,
-            memory_sampler=mem_fn,
+        (x, w, diagnostics, parents), wall_time_s, mem_rss, mem_gpu = _run_profiled(
+            lambda: filt.filter(
+                y_obs,
+                init_dist=cfg.get("init_dist"),
+                reweight=reweight,
+                resample=resample,
+                init_seed=init_seed,
+                init_particles=init_particles,
+            )
         )
         stats = _particles_to_stats(ssm, x, w)
         out = {
@@ -280,7 +438,61 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             "parents": parents,
         }
         _add_pred_stats(out, diagnostics)
-        out.update(_runtime_and_memory(diagnostics))
+        if mem_rss:
+            diagnostics["memory_rss"] = mem_rss
+        if mem_gpu:
+            diagnostics["memory_gpu"] = mem_gpu
+        batch_size = int(y_obs.shape[0] or tf.shape(y_obs)[0].numpy())
+        num_steps = int(y_obs.shape[1] or tf.shape(y_obs)[1].numpy())
+        out.update(_runtime_and_memory(diagnostics, wall_time_s, num_steps, batch_size))
+        return out
+
+    if flow_kind == "stochastic_pf":
+        print("Running stochastic particle flow...")
+        reweight = cfg.get("reweight")
+        if reweight is None:
+            reweight = "never"
+        resample = cfg.get("resample", "never")
+        diffusion = _parse_diffusion_matrix(cfg.get("diffusion", None), int(ssm.state_dim))
+        filt = StochasticParticleFlow(
+            ssm,
+            num_lambda=int(cfg.get("num_lambda", 20)),
+            num_particles=int(cfg.get("num_particles", 100)),
+            ess_threshold=float(cfg.get("ess_threshold", 0.5)),
+            reweight=reweight,
+            diffusion=diffusion,
+            beta_schedule=_beta_schedule_from_cfg(cfg.get("beta_schedule")),
+            jitter=float(cfg.get("jitter", 1e-6)),
+            debug=bool(cfg.get("debug", False)),
+        )
+        filt.warmup(batch_size=tf.shape(y_obs)[0], reweight=reweight, resample=resample)
+        (x, w, diagnostics, parents), wall_time_s, mem_rss, mem_gpu = _run_profiled(
+            lambda: filt.filter(
+                y_obs,
+                init_dist=cfg.get("init_dist"),
+                reweight=reweight,
+                resample=resample,
+                init_seed=init_seed,
+                init_particles=init_particles,
+            )
+        )
+        stats = _particles_to_stats(ssm, x, w)
+        out = {
+            "x_particles": x,
+            "w": w,
+            "mean": stats["mean"],
+            "cov": stats["cov"],
+            "diagnostics": diagnostics,
+            "parents": parents,
+        }
+        _add_pred_stats(out, diagnostics)
+        if mem_rss:
+            diagnostics["memory_rss"] = mem_rss
+        if mem_gpu:
+            diagnostics["memory_gpu"] = mem_gpu
+        batch_size = int(y_obs.shape[0] or tf.shape(y_obs)[0].numpy())
+        num_steps = int(y_obs.shape[1] or tf.shape(y_obs)[1].numpy())
+        out.update(_runtime_and_memory(diagnostics, wall_time_s, num_steps, batch_size))
         return out
 
     if method.startswith("kflow") or method.startswith("kernel"):
@@ -312,13 +524,14 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             reweight=reweight,
         )
         filt.warmup(batch_size=tf.shape(y_obs)[0], reweight=reweight)
-        x, w, diagnostics, parents = filt.filter(
-            y_obs,
-            init_dist=cfg.get("init_dist"),
-            reweight=reweight,
-            init_seed=cfg.get("init_seed"),
-            init_particles=init_particles,
-            memory_sampler=mem_fn,
+        (x, w, diagnostics, parents), wall_time_s, mem_rss, mem_gpu = _run_profiled(
+            lambda: filt.filter(
+                y_obs,
+                init_dist=cfg.get("init_dist"),
+                reweight=reweight,
+                init_seed=init_seed,
+                init_particles=init_particles,
+            )
         )
         stats = _particles_to_stats(ssm, x, w)
         out = {
@@ -331,7 +544,13 @@ def run_filter(ssm, y_obs: tf.Tensor, method: str, **cfg) -> Dict[str, Any]:
             "kernel_type": kernel_type,
         }
         _add_pred_stats(out, diagnostics)
-        out.update(_runtime_and_memory(diagnostics))
+        if mem_rss:
+            diagnostics["memory_rss"] = mem_rss
+        if mem_gpu:
+            diagnostics["memory_gpu"] = mem_gpu
+        batch_size = int(y_obs.shape[0] or tf.shape(y_obs)[0].numpy())
+        num_steps = int(y_obs.shape[1] or tf.shape(y_obs)[1].numpy())
+        out.update(_runtime_and_memory(diagnostics, wall_time_s, num_steps, batch_size))
         return out
 
     raise ValueError(f"Unknown method '{method}'")
