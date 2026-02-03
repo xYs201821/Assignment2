@@ -2,6 +2,7 @@ import tensorflow as tf
 
 from src.ssm import LinearGaussianSSM
 
+from src.flows.beta_schedule import OptimalBetaSolver
 from src.flows.stochastic_pf import StochasticParticleFlow
 
 
@@ -31,7 +32,8 @@ def test_optimal_beta_linear_schedule_info_zero():
     _, Info = flow._likelihood_terms(x, y)
     P0_inv = flow._inverse_from_cov(P0)[tf.newaxis, ...]
 
-    beta, beta_dot, v0_star = flow.solve_optimal_beta_schedule(
+    solver = OptimalBetaSolver(flow.num_lambda)
+    beta, beta_dot, v0_star = solver.solve(
         P0_inv,
         Info,
         mu=1.0,
@@ -60,7 +62,8 @@ def test_optimal_beta_hits_target_nonzero_info(lgssm_2d):
     target_beta = 1.0
     mu = 0.4
 
-    _, _, v0_star = flow.solve_optimal_beta_schedule(
+    solver = OptimalBetaSolver(flow.num_lambda)
+    _, _, v0_star = solver.solve(
         P0_inv,
         Info,
         mu=mu,
@@ -124,7 +127,8 @@ def test_optimal_beta_matches_linear_when_mu_zero(lgssm_2d):
     _, Info = flow._likelihood_terms(x, y)
     P0_inv = flow._inverse_from_cov(lgssm_2d.P0)[tf.newaxis, ...]
 
-    beta, beta_dot, v0_star = flow.solve_optimal_beta_schedule(
+    solver = OptimalBetaSolver(flow.num_lambda)
+    beta, beta_dot, v0_star = solver.solve(
         P0_inv,
         Info,
         mu=0.0,
