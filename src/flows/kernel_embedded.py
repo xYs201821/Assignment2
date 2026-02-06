@@ -2,7 +2,7 @@
 
 import tensorflow as tf
 
-from src.flows.diagnostics import KernelDiagnostics
+from src.flows.diagnostics import _cond_from_matrix
 from src.flows.flow_base import FlowBase
 from src.optimizer import FixStepSize, FunctionalAdagrad, FunctionalAdam, apply_stop_mask, update_norm
 from src.ssm import SSM
@@ -441,10 +441,10 @@ class KernelParticleFlow(FlowBase):
         return x_next, log_det, diagnostics
 
     def _flow_diag_keys(self):
-        keys = ("dx_p95_max", "condK_log10_max", "flow_norm_mean_max")
-        if self.max_flow_norm is not None:
-            keys = keys + ("max_flow_frac",)
-        return keys + ("condCov_log10", "logdet_cov")
+        return (
+            "condCov_log10",
+            "logdet_cov",
+        )
 
     @staticmethod
     def _median_midpoint(x):
@@ -564,92 +564,97 @@ class KernelParticleFlow(FlowBase):
         alpha = tf.convert_to_tensor(alpha, dtype=tf.float32)
         alpha = tf.broadcast_to(alpha, batch_shape)
         
-        if self.kernel_type == "scalar":
+        use_scalar_kernel = self.kernel_type == "scalar"
+        use_dist_grad = self.ll_grad_mode == "dist"
+        use_optimizer = self.optimizer is not None
+        track_max_flow_frac = self.max_flow_norm is not None
+        
+        if use_scalar_kernel:
             state_dim = tf.shape(x)[-1]
             eye = tf.eye(state_dim, batch_shape=tf.shape(B)[:-2], dtype=tf.float32)
             aB = B + tf.cast(self.jitter, tf.float32) * eye
             # band_inv ~ (alpha * B)^{-1} for scalar kernel.
             band_inv = cholesky_solve(aB, eye, jitter=self.jitter)
         else:
-            band_inv = None
-        opt_state = None
-        if self.optimizer is not None:
+            band_inv = tf.zeros([1, 1], dtype=tf.float32)  # placeholder
+        
+        if use_optimizer:
             opt_state = self.optimizer.init_state(tf.shape(x))
+        else:
+            opt_state = (tf.zeros([1], dtype=tf.float32),)  # placeholder tuple
+        
         ds = tf.ones(batch_shape, dtype=tf.float32) * tf.cast(self.ds_init, tf.float32)
-        diagB_mean = None
-        if self.debug:
-            diagB_mean = tf.reduce_mean(diagB, axis=-1)
-        flow_tol = None if self.flow_tol is None else tf.cast(self.flow_tol, tf.float32)
-        max_flow_norm = None if self.max_flow_norm is None else tf.cast(self.max_flow_norm, tf.float32)
+        max_flow_norm_val = tf.cast(self.max_flow_norm if self.max_flow_norm is not None else -1.0, tf.float32)
         jitter_val = tf.cast(self.jitter, tf.float32)
         eps_float = 1e-12 if self.jitter is None or self.jitter <= 0.0 else float(self.jitter)
         eps_val = tf.cast(eps_float, tf.float32)
-        log10_base = tf.math.log(tf.cast(10.0, tf.float32))
-        diag = KernelDiagnostics(
-            self,
-            batch_shape,
-            eps_val,
-            log10_base,
-            track_max_flow_frac=(max_flow_norm is not None),
-        )
+
         stopped = tf.zeros(batch_shape, dtype=tf.bool)
-        for i in range(self.num_lambda):
-            if self.ll_grad_mode == "dist":
+
+        # Use Python for loop to avoid nested tf.while_loop shape issues
+        for _ in range(self.num_lambda):
+            # Compute gradients
+            if use_dist_grad:
                 grad_ll = self._grad_log_likelihood_from_dist(x, y)
             else:
                 grad_ll = self._grad_log_likelihood_linearized(x, y)
-            grad_prior = self._grad_log_prior_gaussian(x, x_mean, B) # [..., n, dx]
+            grad_prior = self._grad_log_prior_gaussian(x, x_mean, B)
             g = grad_prior + grad_ll
-            if self.kernel_type == "scalar":
+
+            # Compute kernel and gradient
+            if use_scalar_kernel:
                 K, grad_K = self._scalar_kernel_and_grad(x, band_inv, alpha)
-                # K: [..., n, n], grad_K: [..., n, n, dx], g: [..., n, dx]
                 term1 = K[..., tf.newaxis] * g[..., tf.newaxis, :, :]
             else:
                 K, grad_K = self._kernel_and_grad(x, diagB, alpha)
                 # K: [..., n, n, dx], grad_K: [..., n, n, dx], g: [..., n, dx]
                 term1 = K * g[..., tf.newaxis, :, :]
+
             weighted = w[..., tf.newaxis, :, tf.newaxis] * (term1 + grad_K)
-            # Kernel flow update is the weighted sum over particles.
             flow = tf.reduce_sum(weighted, axis=-2)
             flow = tf.einsum("...ij,...nj->...ni", B, flow) # preconditioning with B
             flow_norm_particles = update_norm(flow)
             flow_norm = tf.reduce_mean(flow_norm_particles, axis=-1)
-            clipped_frac = None
-            if max_flow_norm is not None:
-                clipped_frac = tf.reduce_mean(
-                    tf.cast(flow_norm_particles > max_flow_norm, tf.float32),
-                    axis=-1,
-                )
+
+            # Clipping if max_flow_norm is set
+            if track_max_flow_frac:
                 flow_scale = tf.math.divide_no_nan(
-                    max_flow_norm,
+                    max_flow_norm_val,
                     flow_norm + jitter_val,
                 )
                 flow_scale = tf.minimum(flow_scale, 1.0)
                 flow = flow * flow_scale[..., tf.newaxis, tf.newaxis]
                 flow_norm = flow_norm * flow_scale
-            self._debug_print(
-                i,
-                flow_norm,
-                grad_ll,
-                grad_prior,
-                x,
-                diagB_mean,
-                ds,
-                flow_scale if max_flow_norm is not None else None,
-            )
-            if self.optimizer is None:
-                update = ds[..., tf.newaxis, tf.newaxis] * flow
-            else:
+
+            # Compute update
+            if use_optimizer:
                 new_x, opt_state = self.optimizer.apply(x, -flow, opt_state)
                 update = new_x - x
-            update_eff, stopped = self._step_control(
-                update,
-                flow_norm,
-                stopped,
-                flow_tol,
-            )
-            dx_norm = update_norm(update_eff)
+            else:
+                update = ds[..., tf.newaxis, tf.newaxis] * flow
+
+            # Apply step control
+            update_eff, stopped = self._step_control(update, flow_norm, stopped, self.flow_tol)
             x = x + update_eff
-            diag.update(K, dx_norm, flow_norm, jitter_val, clipped_frac=clipped_frac)
-        diagnostics = diag.finalize(x, eps_float)
+
+        # Compute diagnostics outside the loop (not part of the main computation graph)
+        log10_base = tf.math.log(tf.cast(10.0, tf.float32))
+        w_uniform = tf.ones(tf.shape(x)[:-1], dtype=x.dtype) / tf.cast(tf.shape(x)[-2], x.dtype)
+        cov = self.ssm.state_cov(x, w_uniform)
+        # Ensure symmetric and add jitter for numerical stability
+        cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
+        jitter_val = tf.maximum(eps_val, tf.cast(1e-5, cov.dtype))
+        jitter_eye = jitter_val * tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
+        cov_stable = cov + jitter_eye
+        cond_cov = _cond_from_matrix(cov_stable, eps_val)
+        cond_cov_log10 = tf.math.log(cond_cov + eps_val) / log10_base
+        # Use SVD for logdet computation (more stable than eigvalsh)
+        s = tf.linalg.svd(cov_stable, compute_uv=False)
+        s = tf.maximum(s, eps_val)
+        logdet_cov = tf.reduce_sum(tf.math.log(s), axis=-1)
+
+        diagnostics = {
+            "condCov_log10": cond_cov_log10,
+            "logdet_cov": logdet_cov,
+        }
         return x, diagnostics
