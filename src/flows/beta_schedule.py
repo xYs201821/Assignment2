@@ -12,8 +12,11 @@ class BetaScheduleConfig:
 
     mode: str = "linear"
     mu: float = 0.2
-    guard: str | bool | None = None
-
+    guard: bool | None = None
+    solver_steps: int | None = None
+    max_bisect: int = 50
+    max_bracket: int = 30
+    tol: float = 1e-6
 
 def _ensure_rank2(t: tf.Tensor, dtype: tf.DType) -> tf.Tensor:
     t = tf.convert_to_tensor(t, dtype=dtype)
@@ -51,6 +54,10 @@ def build_beta_schedule(
     Info: tf.Tensor | None = None,
     jitter: float | None = None,
     mu: float = 0.2,
+    solver_steps: int | None = None,
+    max_bisect: int = 50,
+    max_bracket: int = 30,
+    tol: float = 1e-6,
 ) -> tuple[tf.Tensor, tf.Tensor, float]:
     """Build a beta schedule from mode and mu."""
     mode = "linear" if mode is None else str(mode).lower()
@@ -62,14 +69,49 @@ def build_beta_schedule(
         if P0_inv is None or Info is None:
             raise ValueError("P0_inv and Info are required to build an optimal beta schedule")
         solver = OptimalBetaSolver(num_lambda, jitter=jitter)
+        solve_steps = num_lambda if solver_steps is None else int(solver_steps)
         beta, beta_dot, _ = solver.solve(
             P0_inv,
             Info,
             mu=mu,
-            num_lambda=num_lambda,
+            num_lambda=solve_steps,
+            tol=tol,
+            max_bisect=max_bisect,
+            max_bracket=max_bracket,
         )
+        if solve_steps != int(num_lambda):
+            beta, beta_dot = _resample_schedule(beta, beta_dot, int(num_lambda))
         return beta, beta_dot, 1.0 / float(num_lambda)
     raise ValueError("beta_schedule.mode must be 'linear' or 'optimal'")
+
+
+def _resample_schedule(
+    beta: tf.Tensor,
+    beta_dot: tf.Tensor,
+    target_steps: int,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    beta = _ensure_rank2(beta, tf.float32)
+    beta_dot = _ensure_rank2(beta_dot, tf.float32)
+    target_steps = int(target_steps)
+    src_steps = tf.shape(beta)[1]
+
+    def _resample():
+        src_steps_f = tf.cast(src_steps - 1, beta.dtype)
+        t = tf.linspace(tf.cast(0.0, beta.dtype), src_steps_f, target_steps)
+        idx0 = tf.cast(tf.floor(t), tf.int32)
+        idx1 = tf.minimum(idx0 + 1, src_steps - 1)
+        w = t - tf.floor(t)
+
+        b0 = tf.gather(beta, idx0, axis=1)
+        b1 = tf.gather(beta, idx1, axis=1)
+        beta_out = b0 + (b1 - b0) * w[tf.newaxis, :]
+
+        d0 = tf.gather(beta_dot, idx0, axis=1)
+        d1 = tf.gather(beta_dot, idx1, axis=1)
+        beta_dot_out = d0 + (d1 - d0) * w[tf.newaxis, :]
+        return beta_out, beta_dot_out
+
+    return tf.cond(tf.equal(src_steps, target_steps), lambda: (beta, beta_dot), _resample)
 
 
 def _cond_number_f(
@@ -119,7 +161,6 @@ class OptimalBetaSolver:
         self.num_lambda = int(num_lambda)
         self.jitter = jitter
 
-    @tf.function
     def solve(
         self,
         P0_inv,
@@ -248,7 +289,16 @@ class OptimalBetaSolver:
                     _ = tf.cond(tf.equal(i, 0), _print, lambda: 0)
                 return i + 1, beta, v
 
-            _, beta, _ = tf.while_loop(cond, body, [i0, beta, v])
+            _, beta, _ = tf.while_loop(
+                cond,
+                body,
+                [i0, beta, v],
+                shape_invariants=[
+                    tf.TensorShape([]),
+                    tf.TensorShape(None),
+                    tf.TensorShape(None),
+                ],
+            )
             return beta
 
         def residual(v0):
@@ -273,6 +323,12 @@ class OptimalBetaSolver:
             bracket_lo_cond,
             bracket_lo_body,
             [i0, v_lo, v_hi, r_lo],
+            shape_invariants=[
+                tf.TensorShape([]),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+            ],
         )
 
         # --- bracket v0_high until residual(v_hi) >= 0 ---
@@ -288,7 +344,17 @@ class OptimalBetaSolver:
             r_hi_new = residual(v_hi_new)
             return i + 1, v_lo, v_hi_new, r_hi_new
 
-        _, v_lo, v_hi, r_hi = tf.while_loop(bracket_cond, bracket_body, [i0, v_lo, v_hi, r_hi])
+        _, v_lo, v_hi, r_hi = tf.while_loop(
+            bracket_cond,
+            bracket_body,
+            [i0, v_lo, v_hi, r_hi],
+            shape_invariants=[
+                tf.TensorShape([]),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+            ],
+        )
 
         # --- bisection on v0 (fallback to linear if bracket fails) ---
         r_lo = residual(v_lo)
@@ -319,6 +385,13 @@ class OptimalBetaSolver:
                 bisect_cond,
                 bisect_body,
                 [k0, v_lo, v_hi, r_lo, r_hi],
+                shape_invariants=[
+                    tf.TensorShape([]),
+                    tf.TensorShape(None),
+                    tf.TensorShape(None),
+                    tf.TensorShape(None),
+                    tf.TensorShape(None),
+                ],
             )
 
             v0_star = 0.5 * (v_lo_f + v_hi_f)
@@ -356,6 +429,13 @@ class OptimalBetaSolver:
                 traj_cond,
                 traj_body,
                 [i0, beta0, v0, ta_beta, ta_v],
+                shape_invariants=[
+                    tf.TensorShape([]),
+                    tf.TensorShape(None),
+                    tf.TensorShape(None),
+                    None,
+                    None,
+                ],
             )
 
             beta_grid = ta_beta.stack()
