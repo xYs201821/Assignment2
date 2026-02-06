@@ -4,7 +4,7 @@ import tensorflow as tf
 
 from src.flows.flow_base import FlowBase
 from src.flows.beta_schedule import BetaScheduleConfig, build_beta_schedule
-from src.flows.diagnostics import EDHDiagnostics
+from src.flows.diagnostics import _cond_from_matrix, _cond_from_rect
 from src.utility import cholesky_solve, quadratic_matmul
 
 
@@ -48,21 +48,14 @@ class EDHFlow(FlowBase):
             mode=mode,
             mu=float(beta_schedule.mu),
             guard=beta_schedule.guard,
+            solver_steps=beta_schedule.solver_steps,
+            max_bisect=beta_schedule.max_bisect,
+            max_bracket=beta_schedule.max_bracket,
+            tol=beta_schedule.tol,
         )
-
-    def _inverse_from_cov(self, cov: tf.Tensor) -> tf.Tensor:
-        cov = tf.convert_to_tensor(cov, dtype=tf.float32)
-        eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
-        jitter_val = 1e-6 if self.jitter is None else float(self.jitter)
-        return cholesky_solve(cov, eye, jitter=jitter_val)
 
     def _flow_diag_keys(self):
         return (
-            "dx_p95_max",
-            "condS_log10_max",
-            "condH_log10_max",
-            "condJ_log10_max",
-            "flow_norm_mean_max",
             "condCov_log10",
             "logdet_cov",
         )
@@ -97,8 +90,8 @@ class EDHFlow(FlowBase):
         # Linear flow: dx/dlambda = A x + b.
         A = -0.5 * tf.linalg.matmul(K, H)
         I = tf.eye(tf.shape(A)[-1], batch_shape=tf.shape(A)[:-2], dtype=A.dtype)
-        b = tf.einsum("...ij,...jk,...k->...i", I + lam_b * A, K, y_tilde)
-        Am0 = tf.einsum("...ij,...jk,...k->...i", I + 2.0 * lam_b * A, A, m0)
+        b = tf.einsum("bij,bjk,bk->bi", I + lam_b * A, K, y_tilde)
+        Am0 = tf.einsum("bij,bjk,bk->bi", I + 2.0 * lam_b * A, A, m0)
         b = b + Am0
         return A, b, S
     
@@ -124,14 +117,15 @@ class EDHFlow(FlowBase):
         r_dim = tf.cast(self.ssm.r_dim, tf.int32)
         I = tf.eye(state_dim, batch_shape=batch_shape, dtype=mu.dtype)
 
+        guard_on = bool(self.beta_schedule.guard) and self.beta_schedule.mode == "optimal"
         if self.beta_schedule.mode == "optimal":
             r0_sched = tf.zeros(tf.concat([batch_shape, [r_dim]], axis=0), dtype=mu.dtype)
             H0, _ = self.jacobian_h_x(m0, r0_sched)
             H_r0, _ = self.jacobian_h_r(m0, r0_sched)
             R_eff0 = quadratic_matmul(H_r0, R, H_r0)
             R_inv0 = self._inverse_from_cov(R_eff0)
-            RinvJ = tf.einsum("...ij,...jk->...ik", R_inv0, H0)
-            Info = tf.einsum("...ji,...jk->...ik", H0, RinvJ)
+            RinvJ = tf.einsum("bij,bjk->bik", R_inv0, H0)
+            Info = tf.einsum("bji,bjk->bik", H0, RinvJ)
             P0_inv = self._inverse_from_cov(P)
             beta, beta_dot, dl = build_beta_schedule(
                 "optimal",
@@ -141,7 +135,19 @@ class EDHFlow(FlowBase):
                 Info=Info,
                 jitter=self.jitter,
                 mu=self.beta_schedule.mu,
+                solver_steps=self.beta_schedule.solver_steps,
+                max_bisect=self.beta_schedule.max_bisect,
+                max_bracket=self.beta_schedule.max_bracket,
+                tol=self.beta_schedule.tol,
             )
+            if guard_on:
+                beta_base, beta_dot_base, _ = build_beta_schedule(
+                    "linear",
+                    num_lambda=self.num_lambda,
+                    dtype=mu.dtype,
+                )
+                beta_base = tf.broadcast_to(beta_base, tf.shape(beta))
+                beta_dot_base = tf.broadcast_to(beta_dot_base, tf.shape(beta_dot))
         else:
             beta, beta_dot, dl = build_beta_schedule(
                 "linear",
@@ -153,53 +159,110 @@ class EDHFlow(FlowBase):
             self.num_lambda,
             message="beta schedule length must match num_lambda",
         )
-        dl_t = tf.cast(dl, mu.dtype)
         jitter_val = 1e-6 if self.jitter is None else float(self.jitter)
         eps = jitter_val if jitter_val > 0.0 else 1e-6
         eps_t = tf.cast(eps, mu.dtype)
         logdet = tf.zeros(tf.shape(mu)[:-2], dtype=tf.float32)
-        r0 = tf.zeros(tf.concat([batch_shape, [r_dim]], axis=0), dtype=tf.float32)
-        log10_base = tf.math.log(tf.cast(10.0, mu.dtype))
-        diag = EDHDiagnostics(self, batch_shape, eps_t, log10_base)
-        for i in range(self.num_lambda):
-            beta_j = tf.gather(beta, i, axis=1)
-            beta_dot_j = tf.gather(beta_dot, i, axis=1)
-            beta_j = tf.cast(beta_j, mu.dtype)
-            beta_dot_j = tf.cast(beta_dot_j, mu.dtype)
-            step_scale = dl_t * beta_dot_j
+        r0 = tf.zeros(tf.concat([batch_shape, [r_dim]], axis=0), dtype=mu.dtype)
+
+        for j in range(self.num_lambda):
+            beta_j = beta[:, j]
+            beta_dot_j = beta_dot[:, j]
             H, h_m = self.jacobian_h_x(m_bar, r0)
             H_r, _ = self.jacobian_h_r(m_bar, r0)
-            Hm = tf.einsum("...ij,...j->...i", H, m_bar)
+            Hm = tf.einsum("bij,bj->bi", H, m_bar)
             v = self.ssm.innovation(y, h_m)
             y_tilde = v + Hm
             R_eff = quadratic_matmul(H_r, R, H_r)
-            A, b, S = self._edh_flow_solution(beta_j, H, P, R_eff, y_tilde, m0, self.jitter)
-            Am = tf.einsum("...ij,...j->...i", A, m_bar)
+            if guard_on:
+                beta_base_j = beta_base[:, j]
+                beta_dot_base_j = beta_dot_base[:, j]
+                step_scale_opt = dl * beta_dot_j
+                step_scale_base = dl * beta_dot_base_j
+                A_opt, b_opt, _ = self._edh_flow_solution(
+                    beta_j,
+                    H,
+                    P,
+                    R_eff,
+                    y_tilde,
+                    m0,
+                    self.jitter,
+                )
+                A_base, b_base, _ = self._edh_flow_solution(
+                    beta_base_j,
+                    H,
+                    P,
+                    R_eff,
+                    y_tilde,
+                    m0,
+                    self.jitter,
+                )
+                J_opt = I + step_scale_opt[..., tf.newaxis, tf.newaxis] * A_opt
+                J_base = I + step_scale_base[..., tf.newaxis, tf.newaxis] * A_base
+                if self.jitter and self.jitter > 0.0:
+                    J_opt = J_opt + tf.cast(self.jitter, J_opt.dtype) * I
+                    J_base = J_base + tf.cast(self.jitter, J_base.dtype) * I
+                finite_J_opt = tf.reduce_all(tf.math.is_finite(J_opt), axis=[-2, -1])
+                finite_J_base = tf.reduce_all(tf.math.is_finite(J_base), axis=[-2, -1])
+                J_opt_safe = tf.where(finite_J_opt[..., tf.newaxis, tf.newaxis], J_opt, I)
+                J_base_safe = tf.where(finite_J_base[..., tf.newaxis, tf.newaxis], J_base, I)
+                condJ_opt = _cond_from_rect(J_opt_safe, eps_t)
+                condJ_base = _cond_from_rect(J_base_safe, eps_t)
+                finite_opt = tf.logical_and(tf.math.is_finite(condJ_opt), finite_J_opt)
+                finite_base = tf.logical_and(tf.math.is_finite(condJ_base), finite_J_base)
+                use_opt = tf.logical_and(
+                    finite_opt,
+                    tf.logical_or(~finite_base, condJ_opt <= condJ_base),
+                )
+                step_scale = tf.where(use_opt, step_scale_opt, step_scale_base)
+                A = tf.where(use_opt[..., tf.newaxis, tf.newaxis], A_opt, A_base)
+                b = tf.where(use_opt[..., tf.newaxis], b_opt, b_base)
+            else:
+                step_scale = dl * beta_dot_j
+                A, b, _ = self._edh_flow_solution(beta_j, H, P, R_eff, y_tilde, m0, self.jitter)
+            Am = tf.einsum("bij,bj->bi", A, m_bar)
             # Euler update for mean flow ODE: m_bar += delta * (A m_bar + b).
-            m_bar = m_bar + step_scale[..., tf.newaxis] * (Am + b)
+            m_bar_next = m_bar + step_scale[..., tf.newaxis] * (Am + b)
             J = I + step_scale[..., tf.newaxis, tf.newaxis] * A
             if self.jitter and self.jitter > 0.0:
                 J = J + tf.cast(self.jitter, J.dtype) * I
             sign, lad = tf.linalg.slogdet(J)
-            if self.debug:
-                tf.debugging.assert_greater(
-                    tf.abs(sign),
-                    0.0,
-                    message="EDH flow Jacobian is singular; reduce step size or check model.",
-                )
-            bad = tf.equal(sign, 0.0)
+            finite_A = tf.reduce_all(tf.math.is_finite(A), axis=[-2, -1])
+            finite_b = tf.reduce_all(tf.math.is_finite(b), axis=-1)
+            finite_step = tf.math.is_finite(step_scale)
+            finite_J = tf.reduce_all(tf.math.is_finite(J), axis=[-2, -1])
+            bad = tf.logical_or(tf.equal(sign, 0.0), tf.logical_not(finite_J))
+            bad = tf.logical_or(bad, tf.logical_not(finite_A))
+            bad = tf.logical_or(bad, tf.logical_not(finite_b))
+            bad = tf.logical_or(bad, tf.logical_not(finite_step))
+            bad = tf.logical_or(bad, tf.logical_not(tf.math.is_finite(lad)))
             lad = tf.where(bad, tf.zeros_like(lad), lad)
-            logdet += lad
-            flow = tf.einsum("...ij,...nj->...ni", A, mu) + b[..., tf.newaxis, :]
-            flow = tf.where(bad[..., tf.newaxis, tf.newaxis], tf.zeros_like(flow), flow)
+            logdet = logdet + lad
             # Particle transport with Euler discretization.
-            dx = step_scale[..., tf.newaxis, tf.newaxis] * flow
-            Ax = tf.einsum("...ij,...nj->...ni", A, mu)
+            Ax = tf.einsum("bij,bnj->bni", A, mu)
             mu_next = mu + step_scale[..., tf.newaxis, tf.newaxis] * (
                 Ax + b[..., tf.newaxis, :]
             )
+            m_bar = tf.where(bad[..., tf.newaxis], m_bar, m_bar_next)
             mu = tf.where(bad[..., tf.newaxis, tf.newaxis], mu, mu_next)
-            diag.update(H, J, S, flow, dx)
 
-        diagnostics = diag.finalize(mu, eps)
+        # Compute diagnostics outside the loop
+        log10_base = tf.math.log(10.0)
+        w_uniform = tf.ones(tf.shape(mu)[:-1], dtype=mu.dtype) / tf.cast(tf.shape(mu)[-2], mu.dtype)
+        cov = self.ssm.state_cov(mu, w_uniform)
+        # Ensure symmetric and add jitter for numerical stability
+        cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
+        jitter_val = tf.maximum(eps_t, tf.cast(1e-5, cov.dtype))
+        jitter_eye = jitter_val * tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
+        cov_stable = cov + jitter_eye
+        cond_cov = _cond_from_matrix(cov_stable, eps_t)
+        cond_cov_log10 = tf.math.log(cond_cov + eps_t) / log10_base
+        s = tf.linalg.svd(cov_stable, compute_uv=False)
+        s = tf.maximum(s, eps_t)
+        logdet_cov = tf.reduce_sum(tf.math.log(s), axis=-1)
+
+        diagnostics = {
+            "condCov_log10": cond_cov_log10,
+            "logdet_cov": logdet_cov,
+        }
         return mu, logdet, diagnostics

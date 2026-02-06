@@ -58,6 +58,10 @@ class StochasticParticleFlow(FlowBase):
             mode=mode,
             mu=float(beta_schedule.mu),
             guard=beta_schedule.guard,
+            solver_steps=beta_schedule.solver_steps,
+            max_bisect=beta_schedule.max_bisect,
+            max_bracket=beta_schedule.max_bracket,
+            tol=beta_schedule.tol,
         )
         self.h_fn = h_fn
         self.jacobian_fn = jacobian_fn
@@ -67,13 +71,6 @@ class StochasticParticleFlow(FlowBase):
     def _flow_supports_reweight(self):
         """Stochastic flow does not provide a valid Jacobian correction."""
         return False
-
-    def _inverse_from_cov(self, cov):
-        """Compute a stable inverse via Cholesky solve."""
-        cov = tf.convert_to_tensor(cov, dtype=tf.float32)
-        eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
-        jitter_val = 1e-6 if self.jitter is None else float(self.jitter)
-        return cholesky_solve(cov, eye, jitter=jitter_val)
 
     @staticmethod
     def _score_log_prior_gaussian(x, m0, P_inv):
@@ -87,12 +84,9 @@ class StochasticParticleFlow(FlowBase):
         return -tf.einsum("...ij,...nj->...ni", P_inv, V)
 
     def _likelihood_linearized(self, x, y, w=None):
-        x = tf.convert_to_tensor(x, tf.float32)
-        y = tf.convert_to_tensor(y, tf.float32)
-
-        num_particles = tf.shape(x)[-2]
-        obs_dim = tf.shape(y)[-1]
-
+        obs_dim = int(self.ssm.obs_dim)
+        state_dim = int(self.ssm.state_dim)
+        r_dim = int(self.ssm.r_dim)
         tf.debugging.assert_rank(
             y,
             2,
@@ -102,27 +96,24 @@ class StochasticParticleFlow(FlowBase):
         if w is None:
             x_mean = tf.reduce_mean(x, axis=-2)
         else:
-            w = tf.convert_to_tensor(w, dtype=x.dtype)
             w = tf.math.divide_no_nan(w, tf.reduce_sum(w, axis=-1, keepdims=True))
             x_mean = self.ssm.state_mean(x, w)
 
-        r_dim = tf.cast(self.ssm.r_dim, tf.int32)
         r0 = tf.zeros([tf.shape(x_mean)[0], r_dim], dtype=x.dtype)
 
         # shapes: [B, obs_dim, state_dim], [B, obs_dim]
         H_x, h_mean = self.jacobian_h_x(x_mean, r0)
         # shape: [B, obs_dim, r_dim]
         H_r, _ = self.jacobian_h_r(x_mean, r0)
-
         y_b = y[:, tf.newaxis, :]
-        x_resid = x - x_mean[..., tf.newaxis, :]
-        y_hat = h_mean[..., tf.newaxis, :] + tf.einsum("...ij,...nj->...ni", H_x, x_resid)
+        x_resid = x - x_mean[:, tf.newaxis, :]
+        y_hat = h_mean[:, tf.newaxis, :] + tf.einsum("bij,bnj->bni", H_x, x_resid)
 
         # residual  r = y - h_lin(x)
         r = self.ssm.innovation(y_b, y_hat)  # [B, num_particles, obs_dim]
 
         # effective  covariance
-        R = tf.convert_to_tensor(self.ssm.cov_eps_y, dtype=x.dtype)   # [r_dim, r_dim] or [...]
+        R = self.ssm.cov_eps_y
         R_eff = quadratic_matmul(H_r, R, H_r)
 
         return H_x, r, R_eff
@@ -133,12 +124,12 @@ class StochasticParticleFlow(FlowBase):
         R_inv = self._inverse_from_cov(R_eff)  # [B, obs_dim, obs_dim]
 
         # gh = J^T R^{-1} r
-        Rinv_r = tf.einsum("...ij,...nj->...ni", R_inv, r)           # [B, N, obs_dim]
-        gh = tf.einsum("...ji,...nj->...ni", J, Rinv_r)              # [B, N, dx]
+        Rinv_r = tf.einsum("bij,bnj->bni", R_inv, r)           # [B, N, obs_dim]
+        gh = tf.einsum("bji,bnj->bni", J, Rinv_r)              # [B, N, dx]
 
         # Info = J^T R^{-1} J
-        RinvJ = tf.einsum("...ij,...jk->...ik", R_inv, J)            # [B, obs_dim, dx]
-        Info = tf.einsum("...ji,...jk->...ik", J, RinvJ)             # [B, dx, dx]
+        RinvJ = tf.einsum("bij,bjk->bik", R_inv, J)            # [B, obs_dim, dx]
+        Info = tf.einsum("bji,bjk->bik", J, RinvJ)             # [B, dx, dx]
 
         return gh, Info
 
@@ -158,15 +149,9 @@ class StochasticParticleFlow(FlowBase):
         Returns:
         drift: [..., N, state] (λ-time drift)
         """
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
-        m0 = tf.convert_to_tensor(m0, dtype=x.dtype)
-        P_inv = tf.convert_to_tensor(P_inv, dtype=x.dtype)
-        beta = tf.cast(beta, x.dtype)
-        beta_dot = tf.cast(beta_dot, x.dtype)
-
         # prior score and info
         # P_inv = - Hess_p0
-        g0 = self._score_log_prior_gaussian(x, m0, P_inv)         # [..., N, dx]
+        g0 = self._score_log_prior_gaussian(x, m0, P_inv)         # [B, N, dx]
 
         # likelihood score + Info
         # Info = - Hess_h
@@ -174,16 +159,17 @@ class StochasticParticleFlow(FlowBase):
             gh, Info = self._likelihood_terms(x, y, w=w)               # gh: [B, N, dx], Info: [B, dx, dx]
 
         # intermediate score 
-        beta_gh = beta[..., tf.newaxis, tf.newaxis]
-        gp = g0 + beta_gh * gh                                    # [..., N, dx]
+        beta_gh = beta[:, tf.newaxis, tf.newaxis]
+        gp = g0 + beta_gh * gh                                    # [B, N, dx]
 
         # M = -Hess_p = P^{-1} + beta*Info, shared across particles
-        beta_info = beta[..., tf.newaxis, tf.newaxis]                            # [B, 1, 1]
+        beta_info = beta[:, tf.newaxis, tf.newaxis]                            # [B, 1, 1]
         M = P_inv + beta_info * Info                                             # [B, dx, dx]
 
         jitter_val = 1e-6 if self.jitter is None else float(self.jitter)
         M_sym = 0.5 * (M + tf.linalg.matrix_transpose(M))
-        eye = tf.eye(tf.shape(M_sym)[-1], batch_shape=tf.shape(M_sym)[:-2], dtype=M_sym.dtype)
+        state_dim = int(self.ssm.state_dim)
+        eye = tf.eye(state_dim, batch_shape=tf.shape(M_sym)[:-2], dtype=M_sym.dtype)
         M_robust = M_sym + tf.cast(jitter_val, M_sym.dtype) * eye
         L = tf.linalg.cholesky(M_robust)                                         # [B, dx, dx]
 
@@ -203,26 +189,25 @@ class StochasticParticleFlow(FlowBase):
         # diffusion Q  [..., dx, dx]
         if Q is None:
             if self.diffusion is None:
-                Q = tf.zeros([tf.shape(x)[-1], tf.shape(x)[-1]], dtype=x.dtype)
+                state_dim = int(self.ssm.state_dim)
+                Q = tf.zeros([state_dim, state_dim], dtype=x.dtype)
             else:
                 Q = tf.convert_to_tensor(self.diffusion, dtype=x.dtype)
 
-        Qgp = tf.einsum("ij,...nj->...ni", Q, gp)                 # [..., N, dx]
-        beta_dot_term = beta_dot[..., tf.newaxis, tf.newaxis]
+        Qgp = tf.einsum("ij,bnj->bni", Q, gp)                 # [B, N, dx]
+        beta_dot_term = beta_dot[:, tf.newaxis, tf.newaxis]
         drift = 0.5 * Qgp - 0.5 * beta_dot_term * Minv_Info_Minv_gp + beta_dot_term * Minv_gh
         return drift
 
+    @tf.function(reduce_retracing=True, jit_compile=False)
     def _flow_transport(self, x, y, m0, P, w=None):
         """Apply Euler-Maruyama integration over pseudo-time."""
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
-        m0 = tf.convert_to_tensor(m0, dtype=x.dtype)
-        P = tf.convert_to_tensor(P, dtype=x.dtype)
+        obs_dim = int(self.ssm.obs_dim)
+        state_dim = int(self.ssm.state_dim)
         P0_inv = self._inverse_from_cov(P)
 
         num_steps = tf.cast(self.num_lambda, tf.int32)
-        state_dim = tf.shape(x)[-1]
         batch = tf.shape(x)[0]
-        x_invar = tf.TensorShape([None, None, None])
         if self.diffusion is None:
             Q = tf.zeros([state_dim, state_dim], dtype=x.dtype)
             cholQ = None
@@ -246,6 +231,10 @@ class StochasticParticleFlow(FlowBase):
                 Info=Info0,
                 jitter=self.jitter,
                 mu=self.beta_schedule.mu,
+                solver_steps=self.beta_schedule.solver_steps,
+                max_bisect=self.beta_schedule.max_bisect,
+                max_bracket=self.beta_schedule.max_bracket,
+                tol=self.beta_schedule.tol,
             )
         else:
             beta, beta_dot, dl = build_beta_schedule(
@@ -253,8 +242,6 @@ class StochasticParticleFlow(FlowBase):
                 num_lambda=self.num_lambda,
                 dtype=x.dtype,
             )
-        beta = tf.convert_to_tensor(beta, dtype=x.dtype)
-        beta_dot = tf.convert_to_tensor(beta_dot, dtype=x.dtype)
         tf.debugging.assert_rank(
             beta,
             2,
@@ -270,8 +257,7 @@ class StochasticParticleFlow(FlowBase):
             self.num_lambda,
             message="beta schedule length must match num_lambda",
         )
-        guard_on = tf.cast(bool(self.beta_schedule.guard), tf.bool)
-        dl = tf.cast(dl, x.dtype)
+        guard_on = bool(self.beta_schedule.guard)
         sqrt_dl = tf.sqrt(dl)
         beta_base = tf.linspace(
             tf.cast(0.0, x.dtype),
@@ -281,17 +267,17 @@ class StochasticParticleFlow(FlowBase):
         beta_base = tf.broadcast_to(beta_base[tf.newaxis, :], tf.shape(beta))
         beta_dot_base = tf.ones_like(beta_base)
 
-        for j in tf.range(num_steps):
-            tf.autograph.experimental.set_loop_options(
-                shape_invariants=[(x, x_invar)],
-            )
-            beta_j = tf.gather(beta, j, axis=1)
-            beta_dot_j = tf.gather(beta_dot, j, axis=1)
-            beta_base_j = tf.gather(beta_base, j, axis=1)
-            beta_dot_base_j = tf.gather(beta_dot_base, j, axis=1)
+        def _cond(j, _x):
+            return j < self.num_lambda
+
+        def _body(j, x_loop):
+            beta_j = beta[:, j]
+            beta_dot_j = beta_dot[:, j]
+            beta_base_j = beta_base[:, j]
+            beta_dot_base_j = beta_dot_base[:, j]
             beta_eff = tf.broadcast_to(beta_j, [batch])
             beta_dot_eff = tf.broadcast_to(beta_dot_j, [batch])
-            gh, Info = self._likelihood_terms(x, y, w=w)
+            gh, Info = self._likelihood_terms(x_loop, y, w=w)
             beta_eff_col = beta_eff[:, tf.newaxis]
             beta_dot_eff_col = beta_dot_eff[:, tf.newaxis]
             beta_base_col = tf.broadcast_to(beta_base_j, [batch])[:, tf.newaxis]
@@ -302,7 +288,7 @@ class StochasticParticleFlow(FlowBase):
                 Q,
                 beta_eff_col,
                 beta_dot_eff_col,
-                dtype=x.dtype,
+                dtype=x_loop.dtype,
                 jitter=self.jitter,
             )
             cond_base = _cond_number_f(
@@ -311,7 +297,7 @@ class StochasticParticleFlow(FlowBase):
                 Q,
                 beta_base_col,
                 beta_dot_base_col,
-                dtype=x.dtype,
+                dtype=x_loop.dtype,
                 jitter=self.jitter,
             )
             cond_opt = tf.reshape(cond_opt, [batch])
@@ -322,13 +308,11 @@ class StochasticParticleFlow(FlowBase):
                 finite_opt,
                 tf.logical_or(~finite_base, cond_opt <= cond_base),
             )
-            use_opt = tf.logical_or(~guard_on, use_opt)
+            use_opt = tf.logical_or(tf.logical_not(guard_on), use_opt)
             beta_eff = tf.where(use_opt, beta_eff, tf.broadcast_to(beta_base_j, [batch]))
             beta_dot_eff = tf.where(use_opt, beta_dot_eff, tf.broadcast_to(beta_dot_base_j, [batch]))
-            #beta_eff = beta_eff + 0.5 * beta_dot_eff * dl # midpoint discretization
-            #beta_eff = tf.clip_by_value(beta_eff, 0.0, 1.0)
             drift = self._flow_drift(
-                x,
+                x_loop,
                 y,
                 m0,
                 P0_inv,
@@ -339,14 +323,26 @@ class StochasticParticleFlow(FlowBase):
                 Info=Info,
                 Q=Q,
             )
-
             if cholQ is None:
-                x = x + drift * dl
+                x_next = x_loop + drift * dl
             else:
-                xi = self.ssm.rng.normal(tf.shape(x), dtype=x.dtype)
+                xi = self.ssm.rng.normal(
+                    [batch, self.num_particles, state_dim],
+                    dtype=x_loop.dtype,
+                )
                 noise = tf.einsum("ij,bnj->bni", cholQ, xi) * sqrt_dl
-                x = x + drift * dl + noise
-            x = tf.ensure_shape(x, x_invar)
-        log_det = tf.zeros(tf.shape(x)[:-1], dtype=x.dtype)
+                x_next = x_loop + drift * dl + noise
+            return j + 1, x_next
+
+        x_invar = tf.TensorShape(None)
+        _, x = tf.while_loop(
+            _cond,
+            _body,
+            (tf.constant(0, dtype=tf.int32), x),
+            shape_invariants=(tf.TensorShape([]), x_invar),
+        )
+        x = tf.ensure_shape(x, [None, self.num_particles, state_dim])
+
+        log_det = tf.zeros([batch, self.num_particles], dtype=x.dtype)
         return x, log_det, None
         

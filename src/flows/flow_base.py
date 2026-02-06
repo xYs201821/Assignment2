@@ -52,6 +52,20 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         P = tf.einsum("...n,...ni,...nj->...ij", w, mu_resid, mu_resid)
         return m, P
 
+    def _inverse_from_cov(self, cov: tf.Tensor) -> tf.Tensor:
+        """Compute matrix inverse via Cholesky solve with jitter.
+
+        Args:
+            cov: Covariance matrix of shape [..., d, d]
+
+        Returns:
+            Inverse of cov with shape [..., d, d]
+        """
+        cov = tf.convert_to_tensor(cov, dtype=tf.float32)
+        eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
+        jitter_val = 1e-6 if self.jitter is None else float(self.jitter)
+        return cholesky_solve(cov, eye, jitter=jitter_val)
+
     def _normalize_step_modes(self, reweight, resample):
         """Normalize reweight/resample flags into integer modes."""
         if reweight is None:
