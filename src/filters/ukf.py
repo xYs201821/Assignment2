@@ -127,7 +127,6 @@ class UnscentedKalmanFilter(GaussianFilter):
 
         return y_mean, cov, X, Y, Wm, Wc
 
-    @tf.function
     def predict(self, m_prev, P_prev):
         """UKF prediction using augmented state with process noise.
 
@@ -152,7 +151,6 @@ class UnscentedKalmanFilter(GaussianFilter):
         )
         return m_pred, P_pred
 
-    @tf.function
     def update_joseph(self, m_pred, P_pred, y):
         """UKF update using sigma-point linearization.
 
@@ -198,7 +196,6 @@ class UnscentedKalmanFilter(GaussianFilter):
 
         return m_filt, P_filt
 
-    @tf.function
     def update_naive(self, m_pred, P_pred, y):
         """Alias for Joseph update (UKF covariance remains symmetric)."""
         return self.update_joseph(m_pred, P_pred, y)

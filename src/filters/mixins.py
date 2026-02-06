@@ -6,7 +6,6 @@ import tensorflow as tf
 class LinearizationMixin:
     """Provides Jacobian helpers for nonlinear models."""
 
-    @tf.function(reduce_retracing=True)
     def jacobian_f_x(self, x, q):
         """Jacobian of transition function with respect to state.
 
@@ -36,7 +35,6 @@ class LinearizationMixin:
         J = tf.reshape(J_flat, tf.concat([batch_shape, [y_dim, x_dim]], axis=0))
         return J, y
 
-    @tf.function(reduce_retracing=True)
     def jacobian_f_q(self, x, q):
         """Jacobian of transition function with respect to process noise.
 
@@ -66,7 +64,6 @@ class LinearizationMixin:
         J = tf.reshape(J_flat, tf.concat([batch_shape, [y_dim, q_dim]], axis=0))
         return J, y
 
-    @tf.function(reduce_retracing=True)
     def jacobian_h_x(self, x, r):
         """Jacobian of observation function with respect to state.
 
@@ -96,7 +93,6 @@ class LinearizationMixin:
         J = tf.reshape(J_flat, tf.concat([batch_shape, [y_dim, x_dim]], axis=0))
         return J, y
 
-    @tf.function(reduce_retracing=True)
     def jacobian_h_r(self, x, r):
         """Jacobian of observation function with respect to observation noise.
 

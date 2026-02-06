@@ -4,7 +4,7 @@ import tensorflow as tf
 
 from src.filters.base import GaussianFilter
 from src.filters.mixins import LinearizationMixin
-from src.utility import quadratic_matmul, tf_cond
+from src.utility import quadratic_matmul
 
 
 class ExtendedKalmanFilter(GaussianFilter, LinearizationMixin):
@@ -17,7 +17,6 @@ class ExtendedKalmanFilter(GaussianFilter, LinearizationMixin):
         self.P0 = self.ssm.P0
         self._maybe_print()
 
-    @tf.function(reduce_retracing=True)
     def predict(self, m_prev, P_prev): 
         """EKF predict using Jacobians of the transition function.
 
@@ -34,11 +33,8 @@ class ExtendedKalmanFilter(GaussianFilter, LinearizationMixin):
 
         # P = F_x P F_x^T + F_q Q F_q^T.
         P_pred = quadratic_matmul(F_x, P_prev, F_x) + quadratic_matmul(F_q, self.cov_eps_x, F_q)
-        tf.debugging.assert_all_finite(m_pred, "EKF predict produced NaN/Inf in m_pred")
-        tf.debugging.assert_all_finite(P_pred, "EKF predict produced NaN/Inf in P_pred")
         return m_pred, P_pred
 
-    @tf.function(reduce_retracing=True)
     def update_joseph(self, m_pred, P_pred, y):
         """EKF update using Joseph stabilized covariance.
 
@@ -65,7 +61,6 @@ class ExtendedKalmanFilter(GaussianFilter, LinearizationMixin):
 
         return m_filt, P_filt
 
-    @tf.function
     def update_naive(self, m_pred, P_pred, y):
         """EKF update using naive covariance update.
 
