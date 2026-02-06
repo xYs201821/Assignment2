@@ -2,7 +2,7 @@
 
 import tensorflow as tf
 
-from src.utility import cholesky_solve, quadratic_matmul, tf_cond
+from src.utility import cholesky_solve, quadratic_matmul
 
 FILTER_PRINT_INFO = {
     "BaseFilter": {
@@ -158,26 +158,19 @@ class GaussianFilter(BaseFilter):
         if type(self) is GaussianFilter:
             self._maybe_print()
 
-    def warmup(self, batch_size=1):
-        """Trace and compile the step function to avoid first-call overhead."""
-        dx = int(self.ssm.state_dim)
+    def warmup(self, batch_size=1, T=2, y=None):
+        """Trace and compile the filter function to avoid first-call overhead."""
         dy = int(self.ssm.obs_dim)
         dtype = tf.float32
 
-        m_spec = tf.TensorSpec(shape=[None, dx], dtype=dtype)
-        P_spec = tf.TensorSpec(shape=[None, dx, dx], dtype=dtype)
-        y_spec = tf.TensorSpec(shape=[None, dy], dtype=dtype)
+        if y is None:
+            y = tf.zeros([batch_size, T, dy], dtype)
+        else:
+            y = tf.convert_to_tensor(y, dtype=dtype)
+            if len(y.shape) == 2:
+                y = y[tf.newaxis, :]
+        _ = self.filter(y)
 
-        _ = self.step.get_concrete_function(m_spec, P_spec, y_spec)
-
-        m = tf.zeros([batch_size, dx], dtype)
-        P = tf.eye(dx, batch_shape=[batch_size], dtype=dtype)
-        y = tf.zeros([batch_size, dy], dtype)
-
-        _ = self.step(m, P, y)
-        _ = self.step(m, P, y)
-
-    @tf.function
     def predict(self, m_prev, P_prev):
         """Predict next-step mean/covariance.
 
@@ -190,7 +183,6 @@ class GaussianFilter(BaseFilter):
         """
         raise NotImplementedError
 
-    @tf.function
     def update_joseph(self, m_pred, P_pred, y):
         """Measurement update using Joseph stabilized covariance update.
 
@@ -204,7 +196,6 @@ class GaussianFilter(BaseFilter):
         """
         raise NotImplementedError
 
-    @tf.function
     def update_naive(self, m_pred, P_pred, y):
         """Measurement update using the naive covariance formula.
 
@@ -218,7 +209,6 @@ class GaussianFilter(BaseFilter):
         """
         raise NotImplementedError
 
-    @tf.function
     def step(self, m_prev, P_prev, y):
         """Apply update then predict to advance one time step.
 
@@ -236,8 +226,9 @@ class GaussianFilter(BaseFilter):
         m_pred, P_pred = self.predict(m_filt, P_filt)
         return m_filt, P_filt, m_pred, P_pred
 
-    def filter(self, y, m0=None, P0=None, memory_sampler=None):
-        """Filter a full observation sequence and return diagnostics.
+    @tf.function(reduce_retracing=True)
+    def filter(self, y, m0=None, P0=None):
+        """Filter a full observation sequence.
 
         Shapes:
           y: [T, dy] or [B, T, dy]
@@ -248,61 +239,61 @@ class GaussianFilter(BaseFilter):
           P_filt: [B, T, dx, dx]
           m_pred: [B, T, dx]
           P_pred: [B, T, dx, dx]
-          cond_P: [B, T]
-          step_time_s: [B, T]
         """
         y = tf.convert_to_tensor(y, dtype=tf.float32)
         if len(y.shape) == 2:
             y = y[tf.newaxis, :]
         batch_size = tf.shape(y)[0]
-        T = int(y.shape[1])
-        m_pred = tf.convert_to_tensor(m0 if m0 is not None else self.ssm.m0, dtype=tf.float32)
-        if len(m_pred.shape) == 1:
-            m_pred = m_pred[tf.newaxis, :]
-            m_pred = tf.tile(m_pred, [batch_size, 1])
-        P_pred = tf.convert_to_tensor(P0 if P0 is not None else self.ssm.P0, dtype=tf.float32)
-        if len(P_pred.shape) == 2:
-            P_pred = P_pred[tf.newaxis, :, :]
-            P_pred = tf.tile(P_pred, [batch_size, 1, 1])
+        T = tf.shape(y)[1]
+        m_init = tf.convert_to_tensor(m0 if m0 is not None else self.ssm.m0, dtype=tf.float32)
+        if len(m_init.shape) == 1:
+            m_init = m_init[tf.newaxis, :]
+            m_init = tf.tile(m_init, [batch_size, 1])
+        P_init = tf.convert_to_tensor(P0 if P0 is not None else self.ssm.P0, dtype=tf.float32)
+        if len(P_init.shape) == 2:
+            P_init = P_init[tf.newaxis, :, :]
+            P_init = tf.tile(P_init, [batch_size, 1, 1])
 
-        m_filt_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        P_filt_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        m_pred_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        P_pred_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        cond_P_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        step_time_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        mem_rss_ta, mem_gpu_ta = self._init_memory_traces(T, memory_sampler)
+        m_filt_ta = tf.TensorArray(dtype=tf.float32, size=T, dynamic_size=False)
+        P_filt_ta = tf.TensorArray(dtype=tf.float32, size=T, dynamic_size=False)
+        m_pred_ta = tf.TensorArray(dtype=tf.float32, size=T, dynamic_size=False)
+        P_pred_ta = tf.TensorArray(dtype=tf.float32, size=T, dynamic_size=False)
 
-        for t in range(T):
-            t_start = tf.timestamp()
+        m_invar = tf.TensorShape(None)
+        P_invar = tf.TensorShape(None)
+
+        def _cond(t, _state):
+            return t < T
+
+        def _body(t, state):
+            m_pred, P_pred, m_filt_ta, P_filt_ta, m_pred_ta, P_pred_ta = state
             y_t = y[:, t, :]
 
             m_pred_ta = m_pred_ta.write(t, m_pred)
             P_pred_ta = P_pred_ta.write(t, P_pred)
 
-            m_filt, P_filt, m_pred, P_pred = self.step(m_pred, P_pred, y_t)
-
+            m_filt, P_filt, m_pred_next, P_pred_next = self.step(m_pred, P_pred, y_t)
             m_filt_ta = m_filt_ta.write(t, m_filt)
             P_filt_ta = P_filt_ta.write(t, P_filt)
-            cond_P_ta = cond_P_ta.write(t, tf_cond(P_filt))
-            step_time = tf.cast(tf.timestamp() - t_start, tf.float32)
-            step_time_ta = step_time_ta.write(t, step_time)
-            mem_rss_ta, mem_gpu_ta = self._record_memory(
-                t,
-                memory_sampler,
-                mem_rss_ta,
-                mem_gpu_ta,
-            )
 
-        out = {
+            return t + 1, (m_pred_next, P_pred_next, m_filt_ta, P_filt_ta, m_pred_ta, P_pred_ta)
+
+        _, (_, _, m_filt_ta, P_filt_ta, m_pred_ta, P_pred_ta) = tf.while_loop(
+            _cond,
+            _body,
+            (tf.constant(0), (m_init, P_init, m_filt_ta, P_filt_ta, m_pred_ta, P_pred_ta)),
+            shape_invariants=(
+                tf.TensorShape([]),
+                (m_invar, P_invar, None, None, None, None),
+            ),
+        )
+
+        return {
             "m_filt": self._stack_and_permute(m_filt_ta, tail_dims=1),
             "P_filt": self._stack_and_permute(P_filt_ta, tail_dims=2),
             "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
             "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
-            "cond_P": self._stack_and_permute(cond_P_ta, tail_dims=0),
-            "step_time_s": self._stack_and_permute(step_time_ta, tail_dims=0),
         }
-        return self._finalize_memory(out, mem_rss_ta, mem_gpu_ta)
 
     @staticmethod
     def _kalman_gain(C, P, R):

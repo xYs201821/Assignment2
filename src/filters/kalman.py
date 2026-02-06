@@ -3,7 +3,7 @@
 import tensorflow as tf
 
 from src.filters.base import GaussianFilter
-from src.utility import cholesky_solve, quadratic_matmul, tf_cond
+from src.utility import cholesky_solve, quadratic_matmul
 
 
 class KalmanFilter(GaussianFilter):
@@ -18,7 +18,6 @@ class KalmanFilter(GaussianFilter):
         self.P0 = self.ssm.P0
         self._maybe_print()
 
-    @tf.function
     def predict(self, m_prev, P_prev):
         """Kalman predict: m = A m, P = A P A^T + Q.
 
@@ -33,7 +32,6 @@ class KalmanFilter(GaussianFilter):
         P_pred = quadratic_matmul(self.A, P_prev, self.A) + self.cov_eps_x
         return m_pred, P_pred
 
-    @tf.function
     def update_joseph(self, m_pred, P_pred, y):
         """Kalman update using Joseph stabilized covariance.
 
@@ -55,7 +53,6 @@ class KalmanFilter(GaussianFilter):
 
         return m_filt, P_filt
 
-    @tf.function
     def update_naive(self, m_pred, P_pred, y):
         """Kalman update using the naive covariance formula.
 
@@ -81,7 +78,7 @@ class KalmanFilter(GaussianFilter):
         """Default update entry point (Joseph form)."""
         return self.update_joseph(m_pred, P_pred, y)
 
-    def filter(self, y, joseph=True, m0=None, P0=None, memory_sampler=None):
+    def filter(self, y, joseph=True, m0=None, P0=None):
         """Filter a sequence with optional Joseph form selection.
 
         Shapes:
@@ -94,59 +91,9 @@ class KalmanFilter(GaussianFilter):
           m_pred: [B, T, dx]
           P_pred: [B, T, dx, dx]
         """
+        # Set update method before entering the compiled graph
         self.update = self.update_joseph if joseph else self.update_naive
-        y = tf.convert_to_tensor(y, dtype=tf.float32)
-        if len(y.shape) == 2:
-            y = y[tf.newaxis, :]
-        batch_size = tf.shape(y)[0]
-        T = tf.shape(y)[1]
-        m_pred = tf.convert_to_tensor(m0 if m0 is not None else self.ssm.m0, dtype=tf.float32)
-        if len(m_pred.shape) == 1:
-            m_pred = m_pred[tf.newaxis, :]
-            m_pred = tf.tile(m_pred, [batch_size, 1])
-        P_pred = tf.convert_to_tensor(P0 if P0 is not None else self.ssm.P0, dtype=tf.float32)
-        if len(P_pred.shape) == 2:
-            P_pred = P_pred[tf.newaxis, :, :]
-            P_pred = tf.tile(P_pred, [batch_size, 1, 1])
-
-        m_filt_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        P_filt_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        m_pred_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        P_pred_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        cond_P_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        step_time_ta = tf.TensorArray(dtype=tf.float32, size=T)
-        mem_rss_ta, mem_gpu_ta = self._init_memory_traces(T, memory_sampler)
-
-        for t in tf.range(T):
-            t_start = tf.timestamp()
-            y_t = y[:, t, :]
-
-            m_pred_ta = m_pred_ta.write(t, m_pred)
-            P_pred_ta = P_pred_ta.write(t, P_pred)
-
-            m_filt, P_filt, m_pred, P_pred = self.step(m_pred, P_pred, y_t)
-
-            m_filt_ta = m_filt_ta.write(t, m_filt)
-            P_filt_ta = P_filt_ta.write(t, P_filt)
-            cond_P_ta = cond_P_ta.write(t, tf_cond(P_filt))
-            step_time = tf.cast(tf.timestamp() - t_start, tf.float32)
-            step_time_ta = step_time_ta.write(t, step_time)
-            mem_rss_ta, mem_gpu_ta = self._record_memory(
-                t,
-                memory_sampler,
-                mem_rss_ta,
-                mem_gpu_ta,
-            )
-
-        out = {
-            "m_filt": self._stack_and_permute(m_filt_ta, tail_dims=1),
-            "P_filt": self._stack_and_permute(P_filt_ta, tail_dims=2),
-            "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
-            "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
-            "cond_P": self._stack_and_permute(cond_P_ta, tail_dims=0),
-            "step_time_s": self._stack_and_permute(step_time_ta, tail_dims=0),
-        }
-        return self._finalize_memory(out, mem_rss_ta, mem_gpu_ta)
+        return super().filter(y, m0=m0, P0=P0)
 
     @staticmethod
     def _kalman_gain(C, P, R):

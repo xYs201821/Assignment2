@@ -24,20 +24,12 @@ class BootstrapParticleFilter(ParticleFilter):
         if resample is not None:
             self.resample = self._normalize_reweight(resample)
 
-    def warmup(self, batch_size=1, resample="auto"):
-        """Trace the step function to reduce first-call overhead."""
-        x_spec = tf.TensorSpec(shape=[batch_size, self.num_particles, self.ssm.state_dim], dtype=tf.float32)
-        y_spec = tf.TensorSpec(shape=[batch_size, self.ssm.obs_dim], dtype=tf.float32)
-        log_w_spec = tf.TensorSpec(shape=[batch_size, self.num_particles], dtype=tf.float32)
-        resample = self._normalize_reweight(resample)
-        _ = self.step.get_concrete_function(x_spec, log_w_spec, y_spec, resample=resample)
+    def warmup(self, batch_size=1, T=2, resample=1, y=None):
+        """Trace the filter function to reduce first-call overhead."""
+        if y is None:
+            y = tf.zeros([batch_size, T, self.ssm.obs_dim], dtype=tf.float32)
+        _ = self.filter(y, resample=resample)
 
-        x = tf.zeros([batch_size, self.num_particles, self.ssm.state_dim], dtype=tf.float32)
-        log_w = tf.zeros([batch_size, self.num_particles], dtype=tf.float32)
-        y = tf.zeros([batch_size, self.ssm.obs_dim], dtype=tf.float32)
-        _ = self.step(x, log_w, y, resample=resample)
-
-    @tf.function
     def step(self, x_prev, log_w_prev, y_t, resample="auto"):
         """Bootstrap PF step: propagate, weight, and resample.
 
@@ -104,11 +96,10 @@ class BootstrapParticleFilter(ParticleFilter):
         y,
         num_particles=None,
         ess_threshold=None,
-        resample="auto",
+        resample=1,
         init_dist=None,
         init_seed=None,
         init_particles=None,
-        memory_sampler=None,
     ):
         """Run the bootstrap particle filter over a sequence.
 
@@ -120,31 +111,39 @@ class BootstrapParticleFilter(ParticleFilter):
           diagnostics: dict of per-step tensors
           parent_seq: [B, T, N]
         """
-        self.update_params(num_particles, ess_threshold)
         y = self._normalize_y(y)
-        resample = self._normalize_reweight(resample)
 
-        T = int(y.shape[1])
-        x_prev, log_w, parent_indices = self._init_particles(
+        # Initialize particles outside tf.function to avoid retracing
+        x_init, log_w_init, _ = self._init_particles(
             y,
             init_dist,
             init_seed=init_seed,
             init_particles=init_particles,
         )
 
-        x_ta = tf.TensorArray(tf.float32, size=T)
-        x_pred_ta = tf.TensorArray(tf.float32, size=T)
-        w_ta = tf.TensorArray(tf.float32, size=T)
-        w_pre_ta = tf.TensorArray(tf.float32, size=T)
-        w_prev_ta = tf.TensorArray(tf.float32, size=T)
-        m_pred_ta = tf.TensorArray(tf.float32, size=T)
-        P_pred_ta = tf.TensorArray(tf.float32, size=T)
-        parent_ta = tf.TensorArray(tf.int32, size=T)
-        step_time_ta = tf.TensorArray(tf.float32, size=T)
-        mem_rss_ta, mem_gpu_ta = self._init_memory_traces(T, memory_sampler)
+        return self._filter_loop(y, x_init, log_w_init, resample)
 
-        for t in range(T):
-            t_start = tf.timestamp()
+    @tf.function(reduce_retracing=True)
+    def _filter_loop(self, y, x_prev, log_w, resample):
+        """Core filter loop (tf.function compiled)."""
+        T = tf.shape(y)[1]
+
+        x_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        x_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        w_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        w_prev_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        m_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        P_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        parent_ta = tf.TensorArray(tf.int32, size=T, dynamic_size=False)
+
+        def _cond(t, _state):
+            return t < T
+
+        def _body(t, state):
+            x_prev, log_w, tas = state
+            x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta = tas
+
             y_t = y[:, t, :]
             w_prev = tf.exp(log_w)
             w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
@@ -155,6 +154,7 @@ class BootstrapParticleFilter(ParticleFilter):
                 resample=resample,
             )
             x_prev = x
+
             x_pred_ta = x_pred_ta.write(t, x_pred)
             x_ta = x_ta.write(t, x)
             w_ta = w_ta.write(t, w)
@@ -163,27 +163,27 @@ class BootstrapParticleFilter(ParticleFilter):
             m_pred_ta = m_pred_ta.write(t, m_pred)
             P_pred_ta = P_pred_ta.write(t, P_pred)
             parent_ta = parent_ta.write(t, parent_indices)
-            step_time = tf.cast(tf.timestamp() - t_start, tf.float32)
-            step_time_ta = step_time_ta.write(t, step_time)
 
-            mem_rss_ta, mem_gpu_ta = self._record_memory(
-                t,
-                memory_sampler,
-                mem_rss_ta,
-                mem_gpu_ta,
-            )
+            tas = (x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta)
+            return t + 1, (x_prev, log_w, tas)
+
+        tas = (x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta)
+        _, (_, _, tas) = tf.while_loop(
+            _cond,
+            _body,
+            (tf.constant(0), (x_prev, log_w, tas)),
+        )
+        x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta = tas
 
         x_seq = self._stack_and_permute(x_ta, tail_dims=2)
         w_seq = self._stack_and_permute(w_ta, tail_dims=1)
         parent_seq = self._stack_and_permute(parent_ta, tail_dims=1)
 
         diagnostics = {
-            "step_time_s": self._stack_and_permute(step_time_ta, tail_dims=0),
             "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
             "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
             "x_pred": self._stack_and_permute(x_pred_ta, tail_dims=2),
             "w_pre": self._stack_and_permute(w_pre_ta, tail_dims=1),
             "w_prev": self._stack_and_permute(w_prev_ta, tail_dims=1),
         }
-        diagnostics = self._finalize_memory(diagnostics, mem_rss_ta, mem_gpu_ta)
         return x_seq, w_seq, diagnostics, parent_seq

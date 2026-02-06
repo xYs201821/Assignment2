@@ -6,6 +6,7 @@ import tensorflow as tf
 
 from src.filters.particle import ParticleFilter
 from src.filters.mixins import LinearizationMixin
+from src.utility import cholesky_solve
 
 
 class FlowBase(ParticleFilter, LinearizationMixin):
@@ -31,6 +32,8 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         self.init_from_particles = init_from_particles
         self.debug = bool(debug)
         self.jitter = jitter
+        # Bind a per-instance tf.function to avoid cross-instance retracing warnings.
+        self._filter_loop = tf.function(self._filter_loop_impl, reduce_retracing=True)
 
     def _prior_from_sample(self, mu_tilde, w=None):
         """Compute weighted prior mean/covariance from particles.
@@ -158,29 +161,14 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         x_next, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P, w=w)
         return x_next, log_q0 - log_det, m_pred, P_pred
 
-    def warmup(self, batch_size=1, reweight="auto", resample="never"):
-        """Trace the step function to reduce first-call overhead."""
-        x_spec = tf.TensorSpec(
-            shape=[None, self.num_particles, self.ssm.state_dim],
-            dtype=tf.float32,
-        )
-        y_spec = tf.TensorSpec(shape=[None, self.ssm.obs_dim], dtype=tf.float32)
-        log_w_spec = tf.TensorSpec(shape=[None, self.num_particles], dtype=tf.float32)
-        reweight, resample = self._normalize_step_modes(reweight, resample)
-        _ = self.step.get_concrete_function(
-            x_spec,
-            log_w_spec,
-            y_spec,
-            reweight=reweight,
-            resample=resample,
-        )
+    def warmup(self, batch_size=1, T=2, reweight=0, resample=0, y=None):
+        """Trace the filter function to reduce first-call overhead."""
+        if y is None:
+            y = tf.zeros([batch_size, T, self.ssm.obs_dim], dtype=tf.float32)
+        else:
+            y = self._normalize_y(y)
+        _ = self.filter(y, reweight=reweight, resample=resample)
 
-        x = tf.zeros([batch_size, self.num_particles, self.ssm.state_dim], dtype=tf.float32)
-        log_w = tf.zeros([batch_size, self.num_particles], dtype=tf.float32)
-        y = tf.zeros([batch_size, self.ssm.obs_dim], dtype=tf.float32)
-        _ = self.step(x, log_w, y, reweight=reweight, resample=resample)
-
-    @tf.function(reduce_retracing=True)
     def step(
         self,
         x_prev,
@@ -290,14 +278,13 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             flow_diag,
         )
 
-    @tf.function(reduce_retracing=True)
     def filter(
         self,
         y,
         num_particles=None,
         ess_threshold=None,
-        reweight="auto",
-        resample="never",
+        reweight=0,
+        resample=0,
         init_dist=None,
         init_seed=None,
         init_particles=None,
@@ -312,38 +299,37 @@ class FlowBase(ParticleFilter, LinearizationMixin):
           diagnostics: dict of per-step tensors
           parent_seq: [B, T, N]
         """
-        self.update_params(num_particles, ess_threshold)
         y = self._normalize_y(y)
-        if reweight is None:
-            reweight = self.default_reweight
-        if resample is None:
-            resample = self.default_resample
-        reweight = self._normalize_reweight(reweight)
-        resample = self._normalize_reweight(resample)
 
-        T = tf.shape(y)[1]
-        x_prev, log_w, parent_indices = self._init_particles(
+        # Initialize particles outside tf.function to avoid retracing
+        x_init, log_w_init, _ = self._init_particles(
             y,
             init_dist,
             init_seed=init_seed,
             init_particles=init_particles,
         )
 
-        x_ta = tf.TensorArray(tf.float32, size=T)
-        x_pred_ta = tf.TensorArray(tf.float32, size=T)
-        w_ta = tf.TensorArray(tf.float32, size=T)
-        w_pre_ta = tf.TensorArray(tf.float32, size=T)
-        w_prev_ta = tf.TensorArray(tf.float32, size=T)
-        m_pred_ta = tf.TensorArray(tf.float32, size=T)
-        P_pred_ta = tf.TensorArray(tf.float32, size=T)
-        parent_ta = tf.TensorArray(tf.int32, size=T)
-        step_time_ta = tf.TensorArray(tf.float32, size=T)
-        x_pre_ta = tf.TensorArray(tf.float32, size=T)
-        flow_diag_keys = list(self._flow_diag_keys())
-        flow_diag_ta = tuple(tf.TensorArray(tf.float32, size=T) for _ in flow_diag_keys)
-        x_invar = x_prev.shape
-        log_w_invar = log_w.shape
+        # Normalize reweight/resample to int to reduce retracing variations
+        reweight = self._normalize_reweight(reweight)
+        resample = self._normalize_reweight(resample)
 
+        return self._filter_loop(y, x_init, log_w_init, reweight, resample)
+
+    def _filter_loop_impl(self, y, x_prev, log_w, reweight, resample):
+        """Core filter loop (tf.function compiled)."""
+        T = tf.shape(y)[1]
+
+        x_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        x_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        w_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        w_prev_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        m_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        P_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        parent_ta = tf.TensorArray(tf.int32, size=T, dynamic_size=False)
+        x_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        flow_diag_keys = list(self._flow_diag_keys())
+        flow_diag_ta = tuple(tf.TensorArray(tf.float32, size=T, dynamic_size=False) for _ in flow_diag_keys)
         def _write_flow_diag(flow_diag_ta, flow_diag, t):
             if not flow_diag_keys:
                 return flow_diag_ta
@@ -352,13 +338,13 @@ class FlowBase(ParticleFilter, LinearizationMixin):
                 for ta, key in zip(flow_diag_ta, flow_diag_keys)
             )
 
-        def _cond(t, _state): return t < T
+        def _cond(t, _state):
+            return t < T
 
         def _body(t, state):
             x_prev, log_w, tas = state
-            x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, step_time_ta, x_pre_ta, flow_diag_ta = tas
+            x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, x_pre_ta, flow_diag_ta = tas
 
-            t_start = tf.timestamp()
             y_t = y[..., t, :]
             w_prev = tf.exp(log_w)
             w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
@@ -380,8 +366,6 @@ class FlowBase(ParticleFilter, LinearizationMixin):
                 reweight=reweight,
                 resample=resample,
             )
-            x = tf.ensure_shape(x, x_invar)
-            log_w = tf.ensure_shape(log_w, log_w_invar)
             x_prev = x
 
             x_pred_ta = x_pred_ta.write(t, x_pred)
@@ -395,26 +379,28 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             x_pre_ta = x_pre_ta.write(t, x_pre)
             flow_diag_ta = _write_flow_diag(flow_diag_ta, flow_diag, t)
 
-            step_time = tf.cast(tf.timestamp() - t_start, tf.float32)
-            step_time_ta = step_time_ta.write(t, step_time)
-
-            tas = (x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, step_time_ta, x_pre_ta, flow_diag_ta)
+            tas = (x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, x_pre_ta, flow_diag_ta)
             return t + 1, (x_prev, log_w, tas)
 
-        tas = (x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, step_time_ta, x_pre_ta, flow_diag_ta)
+        tas = (x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, x_pre_ta, flow_diag_ta)
+        loop_state_invariants = (
+            tf.TensorShape(None),
+            tf.TensorShape(None),
+            (None, None, None, None, None, None, None, None, None, (None,) * len(flow_diag_keys)),
+        )
         _, (x_prev, log_w, tas) = tf.while_loop(
             _cond,
             _body,
             (tf.constant(0), (x_prev, log_w, tas)),
+            shape_invariants=(tf.TensorShape([]), loop_state_invariants),
         )
-        x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, step_time_ta, x_pre_ta, flow_diag_ta = tas
+        x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, x_pre_ta, flow_diag_ta = tas
 
         x_seq = self._stack_and_permute(x_ta, tail_dims=2)
         w_seq = self._stack_and_permute(w_ta, tail_dims=1)
         parent_seq = self._stack_and_permute(parent_ta, tail_dims=1)
 
         diagnostics = {
-            "step_time_s": self._stack_and_permute(step_time_ta, tail_dims=0),
             "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
             "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
             "x_pred": self._stack_and_permute(x_pred_ta, tail_dims=2),

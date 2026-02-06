@@ -105,11 +105,16 @@ class ParticleFilter(BaseFilter):
                 dist = self.ssm.initial_state_dist(shape)
                 x = tf.cast(dist.sample(seed=seed), dtype=tf.float32)
         else:
-            if not callable(init_dist):
-                raise TypeError("init_dist must be a callable: init_dist(shape) -> tfd.Distribution")
-            dist = init_dist(tf.concat([batch_shape, [N]], axis=0))
             sample_seed = self.ssm._tfp_seed() if seed is None else seed
-            x = tf.cast(dist.sample(seed=sample_seed), dtype=tf.float32)
+            if hasattr(init_dist, "sample") and callable(init_dist.sample):
+                x = tf.cast(init_dist.sample(tf.concat([batch_shape, [N]], axis=0), seed=sample_seed), dtype=tf.float32)
+            elif callable(init_dist):
+                dist = init_dist(tf.concat([batch_shape, [N]], axis=0))
+                if not hasattr(dist, "sample"):
+                    raise TypeError("init_dist callable must return an object with .sample(seed=...)")
+                x = tf.cast(dist.sample(seed=sample_seed), dtype=tf.float32)
+            else:
+                raise TypeError("init_dist must provide a .sample(shape, seed) method or be a callable returning a distribution")
         log_w = -tf.math.log(tf.cast(N, tf.float32)) * tf.ones(tf.concat([batch_shape, [N]], axis=0), tf.float32)
         parent_indices = tf.broadcast_to(
             tf.range(N, dtype=tf.int32),
