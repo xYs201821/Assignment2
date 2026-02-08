@@ -35,7 +35,7 @@ class _RangeBearingObservationDist:
 class RangeBearingSSM(SSM):
     """2D range/bearing observation model driven by a motion model."""
 
-    def __init__(self, motion_model, cov_eps_y, jitter=1e-12, seed=42):
+    def __init__(self, motion_model, cov_eps_y, jitter=1e-12, seed=42, jacobian_r_min=None):
         """Initialize with a motion model and observation covariance."""
         super().__init__(seed)
         assert isinstance(motion_model, MotionModel)
@@ -53,6 +53,9 @@ class RangeBearingSSM(SSM):
             loc=tf.zeros([self.obs_dim], dtype=tf.float32),
             scale_tril=self.Lr,
         )
+        if jacobian_r_min is None:
+            jacobian_r_min = tf.sqrt(tf.maximum(self.jitter, tf.cast(1e-6, tf.float32)))
+        self.jacobian_r_min = tf.convert_to_tensor(jacobian_r_min, dtype=tf.float32)
 
     @staticmethod
     def _wrap_angle(bearing):
@@ -141,6 +144,58 @@ class RangeBearingSSM(SSM):
         bearing = tf.atan2(py_safe, px_safe)
         y = tf.stack([rng, bearing], axis=-1)
         return y
+
+    def jacobian_h_x(self, x, r):
+        """Analytic Jacobian of observation with radius clipping.
+
+        Shapes:
+          x: [..., dx]
+          r: [..., dr] (unused, additive noise)
+        Returns:
+          J_x(h): [..., dy, dx]
+          h(x,r): [..., dy]
+        """
+        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        px = x[..., 0]
+        py = x[..., 1]
+        r2 = px**2 + py**2
+        r_min = tf.maximum(
+            tf.cast(self.jacobian_r_min, x.dtype),
+            tf.cast(1e-6, x.dtype),
+        )
+        r2_safe = tf.maximum(r2, r_min * r_min)
+        r_safe = tf.sqrt(r2_safe)
+
+        dr_dpx = px / r_safe
+        dr_dpy = py / r_safe
+        dth_dpx = -py / r2_safe
+        dth_dpy = px / r2_safe
+
+        batch_shape = tf.shape(px)
+        dx = tf.shape(x)[-1]
+        tail = dx - 2
+        zeros_tail = tf.zeros(
+            tf.concat([batch_shape, tf.expand_dims(tail, 0)], axis=0),
+            dtype=x.dtype,
+        )
+
+        row_r = tf.concat(
+            [dr_dpx[..., tf.newaxis], dr_dpy[..., tf.newaxis], zeros_tail],
+            axis=-1,
+        )
+        row_th = tf.concat(
+            [dth_dpx[..., tf.newaxis], dth_dpy[..., tf.newaxis], zeros_tail],
+            axis=-1,
+        )
+        J = tf.stack([row_r, row_th], axis=-2)
+        return J, self.h(x)
+
+    def jacobian_h_r(self, x, r):
+        """Jacobian of observation w.r.t. additive noise (identity)."""
+        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        batch_shape = tf.shape(x)[:-1]
+        eye = tf.eye(self.obs_dim, batch_shape=batch_shape, dtype=tf.float32)
+        return eye, self.h(x)
 
     def innovation(self, y, y_pred):
         """Innovation.

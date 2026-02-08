@@ -304,26 +304,24 @@ class SSM(tf.Module):
 class LinearGaussianSSM(SSM):
     """Linear Gaussian state-space model."""
 
-    def __init__(self, A, B, C, D, m0, P0, jitter=1e-6, seed=42):
+    def __init__(self, A, B, C, D, m0, P0, jitter=1e-6, seed=42, trainable=False):
         """Initialize linear model matrices and noise covariances."""
         super().__init__(seed)
         self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
-        self.A = tf.convert_to_tensor(A, dtype=tf.float32)
-        self.B = tf.convert_to_tensor(B, dtype=tf.float32)
-        self.C = tf.convert_to_tensor(C, dtype=tf.float32)
-        self.D = tf.convert_to_tensor(D, dtype=tf.float32)
+        self.trainable = bool(trainable)
+        self.A = self._as_parameter(A, "A")
+        self.B = self._as_parameter(B, "B")
+        self.C = self._as_parameter(C, "C")
+        self.D = self._as_parameter(D, "D")
+        self.m0 = self._as_parameter(m0, "m0")
+        self.P0 = self._as_parameter(P0, "P0")
 
-        self.m0 = tf.convert_to_tensor(m0, dtype=tf.float32)
-        self.P0 = tf.convert_to_tensor(P0, dtype=tf.float32)
-
-        # Process/measurement noise covariances from linear factors.
-        self.cov_eps_x = tf.linalg.matmul(self.B, self.B, adjoint_b=True) 
-        self.cov_eps_x = self.cov_eps_x + self.jitter * tf.eye(self.state_dim, dtype=tf.float32)
-        self.cov_eps_y = tf.linalg.matmul(self.D, self.D, adjoint_b=True) 
-        self.cov_eps_y = self.cov_eps_y + self.jitter * tf.eye(self.obs_dim, dtype=tf.float32)
-        self.L0 = tf.linalg.cholesky(self.P0 + self.jitter * tf.eye(self.state_dim, dtype=tf.float32))
-        self.Lq = tf.linalg.cholesky(self.cov_eps_x)
-        self.Lr = tf.linalg.cholesky(self.cov_eps_y)
+    def _as_parameter(self, value, name):
+        """Store model parameters as tensors or trainable variables."""
+        tensor = tf.convert_to_tensor(value, dtype=tf.float32)
+        if self.trainable:
+            return tf.Variable(tensor, trainable=True, name=name)
+        return tensor
 
     @property
     def state_dim(self):
@@ -333,7 +331,7 @@ class LinearGaussianSSM(SSM):
     @property
     def obs_dim(self):
         """Observation dimension."""
-        return int(self.cov_eps_y.shape[-1])
+        return int(self.C.shape[-2])
 
     @property
     def q_dim(self):
@@ -344,6 +342,39 @@ class LinearGaussianSSM(SSM):
     def r_dim(self):
         """Observation noise dimension."""
         return int(self.D.shape[-1])
+
+    @property
+    def cov_eps_x(self):
+        """Process noise covariance Q = B B^T + jitter I."""
+        B = tf.convert_to_tensor(self.B, dtype=tf.float32)
+        Q = tf.linalg.matmul(B, B, adjoint_b=True)
+        I = tf.eye(tf.shape(Q)[-1], dtype=Q.dtype)
+        return Q + self.jitter * I
+
+    @property
+    def cov_eps_y(self):
+        """Observation noise covariance R = D D^T + jitter I."""
+        D = tf.convert_to_tensor(self.D, dtype=tf.float32)
+        R = tf.linalg.matmul(D, D, adjoint_b=True)
+        I = tf.eye(tf.shape(R)[-1], dtype=R.dtype)
+        return R + self.jitter * I
+
+    @property
+    def L0(self):
+        """Cholesky factor of initial covariance."""
+        P0 = tf.convert_to_tensor(self.P0, dtype=tf.float32)
+        I = tf.eye(tf.shape(P0)[-1], dtype=P0.dtype)
+        return tf.linalg.cholesky(P0 + self.jitter * I)
+
+    @property
+    def Lq(self):
+        """Cholesky factor of process covariance."""
+        return tf.linalg.cholesky(self.cov_eps_x)
+
+    @property
+    def Lr(self):
+        """Cholesky factor of observation covariance."""
+        return tf.linalg.cholesky(self.cov_eps_y)
 
     def initial_state_dist(self, shape, **kwargs):
         """Initial Gaussian state distribution.
