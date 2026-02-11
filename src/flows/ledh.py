@@ -278,7 +278,6 @@ class LEDHFlow(FlowBase):
             mu_next = mu + step_scale[..., tf.newaxis] * (Ax + b)
             mu = tf.where(bad[..., tf.newaxis], mu, mu_next)
 
-        # Compute diagnostics outside the loop
         log10_base = tf.math.log(10.0)
         w_uniform = tf.ones(tf.shape(mu)[:-1], dtype=mu.dtype) / tf.cast(tf.shape(mu)[-2], mu.dtype)
         cov = self.ssm.state_cov(mu, w_uniform)
@@ -289,7 +288,6 @@ class LEDHFlow(FlowBase):
         cov_stable = cov + jitter_eye
         cond_cov = _cond_from_matrix(cov_stable, eps_t)
         cond_cov_log10 = tf.math.log(cond_cov + eps_t) / log10_base
-        # Use SVD for logdet computation (more stable than eigvalsh)
         s = tf.linalg.svd(cov_stable, compute_uv=False)
         s = tf.maximum(s, eps_t)
         logdet_cov = tf.reduce_sum(tf.math.log(s), axis=-1)

@@ -249,7 +249,6 @@ class OptimalBetaSolver:
             return v, mu * dkappa_dbeta(beta)
 
         def rk4_step(beta, v):
-            # ode integrator
             k1b, k1v = ode_rhs(beta, v)
             k2b, k2v = ode_rhs(beta + 0.5 * h * k1b, v + 0.5 * h * k1v)
             k3b, k3v = ode_rhs(beta + 0.5 * h * k2b, v + 0.5 * h * k2v)
@@ -304,7 +303,6 @@ class OptimalBetaSolver:
         def residual(v0):
             return integrate_endpoint(v0) - target_beta
 
-        # --- bracket v0_low until residual(v_lo) <= 0 ---
         r_lo = residual(v_lo)
         i0 = tf.constant(0, dtype=tf.int32)
 
@@ -331,7 +329,6 @@ class OptimalBetaSolver:
             ],
         )
 
-        # --- bracket v0_high until residual(v_hi) >= 0 ---
         r_hi = residual(v_hi)
         i0 = tf.constant(0, dtype=tf.int32)
 
@@ -356,7 +353,6 @@ class OptimalBetaSolver:
             ],
         )
 
-        # --- bisection on v0 (fallback to linear if bracket fails) ---
         r_lo = residual(v_lo)
         bracket_ok = tf.logical_and(
             tf.reduce_all(r_lo <= 0.0),
@@ -396,7 +392,6 @@ class OptimalBetaSolver:
 
             v0_star = 0.5 * (v_lo_f + v_hi_f)
 
-            # --- integrate full trajectory with v0_star ---
             beta0 = tf.zeros_like(v0_star)
             v0 = v0_star
             ta_beta = tf.TensorArray(compute_dtype, size=num_steps + 1)

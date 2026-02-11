@@ -113,7 +113,6 @@ class BootstrapParticleFilter(ParticleFilter):
         """
         y = self._normalize_y(y)
 
-        # Initialize particles outside tf.function to avoid retracing
         x_init, log_w_init, _ = self._init_particles(
             y,
             init_dist,

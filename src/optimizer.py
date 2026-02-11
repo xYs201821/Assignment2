@@ -22,7 +22,6 @@ class FixStepSize:
         self.lr = learning_rate
 
     def init_state(self, shape):
-        # initialize state to zero
         return tf.zeros(shape, dtype=tf.float32)
 
     @tf.function
@@ -36,7 +35,6 @@ class FunctionalAdagrad:
         self.eps = tf.convert_to_tensor(epsilon, dtype=tf.float32)
 
     def init_state(self, shape):
-        # initialize state to zero
         return tf.zeros(shape, dtype=tf.float32)
 
     @tf.function
@@ -60,8 +58,7 @@ class FunctionalAdam:
         self.eps = epsilon
 
     def init_state(self, shape):
-        # adam: momentum and variance
-        return (tf.zeros(shape), tf.zeros(shape), tf.constant(1.0)) # 最后一个是 step 计数
+        return (tf.zeros(shape), tf.zeros(shape), tf.constant(1.0))
 
     @tf.function
     def apply(self, x, grads, state):

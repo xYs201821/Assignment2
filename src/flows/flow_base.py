@@ -120,7 +120,6 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         log_q = log_q0 - log_det
         return log_w_prev + tf.cast(loglik + log_prior - log_q, tf.float32)
 
-    # --- Abstract flow transport ---
     def _flow_transport(self, mu_tilde, y, m0, P, **kwargs):
         """Transport particles through a flow; return (x_next, log_det, diag).
 
@@ -315,7 +314,6 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         """
         y = self._normalize_y(y)
 
-        # Initialize particles outside tf.function to avoid retracing
         x_init, log_w_init, _ = self._init_particles(
             y,
             init_dist,
@@ -323,7 +321,6 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             init_particles=init_particles,
         )
 
-        # Normalize reweight/resample to int to reduce retracing variations
         reweight = self._normalize_reweight(reweight)
         resample = self._normalize_reweight(resample)
 

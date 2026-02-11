@@ -91,7 +91,6 @@ class KalmanFilter(GaussianFilter):
           m_pred: [B, T, dx]
           P_pred: [B, T, dx, dx]
         """
-        # Set update method before entering the compiled graph
         self.update = self.update_joseph if joseph else self.update_naive
         return super().filter(y, m0=m0, P0=P0)
 

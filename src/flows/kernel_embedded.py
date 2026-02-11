@@ -576,12 +576,12 @@ class KernelParticleFlow(FlowBase):
             # band_inv ~ (alpha * B)^{-1} for scalar kernel.
             band_inv = cholesky_solve(aB, eye, jitter=self.jitter)
         else:
-            band_inv = tf.zeros([1, 1], dtype=tf.float32)  # placeholder
+            band_inv = tf.zeros([1, 1], dtype=tf.float32)
         
         if use_optimizer:
             opt_state = self.optimizer.init_state(tf.shape(x))
         else:
-            opt_state = (tf.zeros([1], dtype=tf.float32),)  # placeholder tuple
+            opt_state = (tf.zeros([1], dtype=tf.float32),)
         
         ds = tf.ones(batch_shape, dtype=tf.float32) * tf.cast(self.ds_init, tf.float32)
         max_flow_norm_val = tf.cast(self.max_flow_norm if self.max_flow_norm is not None else -1.0, tf.float32)
@@ -591,7 +591,6 @@ class KernelParticleFlow(FlowBase):
 
         stopped = tf.zeros(batch_shape, dtype=tf.bool)
 
-        # Use Python for loop to avoid nested tf.while_loop shape issues
         for _ in range(self.num_lambda):
             # Compute gradients
             if use_dist_grad:
@@ -637,7 +636,6 @@ class KernelParticleFlow(FlowBase):
             update_eff, stopped = self._step_control(update, flow_norm, stopped, self.flow_tol)
             x = x + update_eff
 
-        # Compute diagnostics outside the loop (not part of the main computation graph)
         log10_base = tf.math.log(tf.cast(10.0, tf.float32))
         w_uniform = tf.ones(tf.shape(x)[:-1], dtype=x.dtype) / tf.cast(tf.shape(x)[-2], x.dtype)
         cov = self.ssm.state_cov(x, w_uniform)
@@ -648,7 +646,6 @@ class KernelParticleFlow(FlowBase):
         cov_stable = cov + jitter_eye
         cond_cov = _cond_from_matrix(cov_stable, eps_val)
         cond_cov_log10 = tf.math.log(cond_cov + eps_val) / log10_base
-        # Use SVD for logdet computation (more stable than eigvalsh)
         s = tf.linalg.svd(cov_stable, compute_uv=False)
         s = tf.maximum(s, eps_val)
         logdet_cov = tf.reduce_sum(tf.math.log(s), axis=-1)
