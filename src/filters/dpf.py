@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import tensorflow as tf
+import tensorflow_probability as tfp
 
 from src.filters.particle import ParticleFilter
+
+tfd = tfp.distributions
 
 
 class _BootstrapProposal:
@@ -81,10 +84,151 @@ class DPFBase(ParticleFilter):
         x_pred = tf.convert_to_tensor(x_pred, dtype=tf.float32)
 
         if log_q is None and hasattr(proposal, "log_prob"):
-            log_q = proposal.log_prob(self.ssm, x_pred, x_prev, y_t)
+            try:
+                log_q = proposal.log_prob(self.ssm, x_pred, x_prev, y_t)
+            except (NotImplementedError, AttributeError):
+                # Some SSMs may not expose transition_dist/log_prob; in that case
+                # keep bootstrap semantics (no proposal correction).
+                log_q = None
         if log_q is not None:
             log_q = tf.convert_to_tensor(log_q, dtype=tf.float32)
         return x_pred, log_q
+
+    @staticmethod
+    def _regularized_cholesky(cov: tf.Tensor, jitter: float = 1e-6) -> tf.Tensor:
+        cov = tf.convert_to_tensor(cov, dtype=tf.float32)
+        cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
+        eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
+        return tf.linalg.cholesky(cov + tf.cast(jitter, cov.dtype) * eye)
+
+    def _linearized_observation_cov(self, x_pred: tf.Tensor, cov_r: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        if not callable(getattr(self.ssm, "h_with_noise", None)):
+            raise NotImplementedError("h_with_noise is required for linearized observation fallback.")
+
+        x_pred = tf.convert_to_tensor(x_pred, dtype=tf.float32)
+        cov_r = tf.convert_to_tensor(cov_r, dtype=tf.float32)
+        shape = tf.shape(x_pred)
+        x_flat = tf.reshape(x_pred, [shape[0] * shape[1], shape[2]])
+        r0 = tf.zeros([tf.shape(x_flat)[0], int(self.r_dim)], dtype=x_flat.dtype)
+
+        ssm_jac = getattr(self.ssm, "jacobian_h_r", None)
+        if callable(ssm_jac):
+            H_r_flat, y_loc_flat = ssm_jac(x_flat, r0)
+        else:
+            with tf.GradientTape() as tape:
+                tape.watch(r0)
+                y_loc_flat = self.ssm.h_with_noise(x_flat, r0)
+            H_r_flat = tape.batch_jacobian(y_loc_flat, r0)
+
+        H_r_flat = tf.convert_to_tensor(H_r_flat, dtype=tf.float32)
+        y_loc_flat = tf.convert_to_tensor(y_loc_flat, dtype=tf.float32)
+        cov_eff_flat = tf.linalg.matmul(tf.linalg.matmul(H_r_flat, cov_r), H_r_flat, transpose_b=True)
+
+        y_loc = tf.reshape(y_loc_flat, [shape[0], shape[1], tf.shape(y_loc_flat)[-1]])
+        cov_eff = tf.reshape(
+            cov_eff_flat,
+            [shape[0], shape[1], tf.shape(cov_eff_flat)[-2], tf.shape(cov_eff_flat)[-1]],
+        )
+        return y_loc, cov_eff
+
+    def _linearized_transition_cov(self, x_prev: tf.Tensor, cov_q: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+        if not callable(getattr(self.ssm, "f_with_noise", None)):
+            raise NotImplementedError("f_with_noise is required for linearized transition fallback.")
+
+        x_prev = tf.convert_to_tensor(x_prev, dtype=tf.float32)
+        cov_q = tf.convert_to_tensor(cov_q, dtype=tf.float32)
+        shape = tf.shape(x_prev)
+        x_flat = tf.reshape(x_prev, [shape[0] * shape[1], shape[2]])
+        q0 = tf.zeros([tf.shape(x_flat)[0], int(self.q_dim)], dtype=x_flat.dtype)
+
+        ssm_jac = getattr(self.ssm, "jacobian_f_q", None)
+        if callable(ssm_jac):
+            F_q_flat, x_loc_flat = ssm_jac(x_flat, q0)
+        else:
+            with tf.GradientTape() as tape:
+                tape.watch(q0)
+                x_loc_flat = self.ssm.f_with_noise(x_flat, q0)
+            F_q_flat = tape.batch_jacobian(x_loc_flat, q0)
+
+        F_q_flat = tf.convert_to_tensor(F_q_flat, dtype=tf.float32)
+        x_loc_flat = tf.convert_to_tensor(x_loc_flat, dtype=tf.float32)
+        cov_eff_flat = tf.linalg.matmul(tf.linalg.matmul(F_q_flat, cov_q), F_q_flat, transpose_b=True)
+
+        x_loc = tf.reshape(x_loc_flat, [shape[0], shape[1], tf.shape(x_loc_flat)[-1]])
+        cov_eff = tf.reshape(
+            cov_eff_flat,
+            [shape[0], shape[1], tf.shape(cov_eff_flat)[-2], tf.shape(cov_eff_flat)[-1]],
+        )
+        return x_loc, cov_eff
+
+    def _observation_log_prob(self, x_pred: tf.Tensor, y_t: tf.Tensor) -> tf.Tensor:
+        # Preferred path: exact model likelihood from observation_dist.
+        try:
+            obs_dist = self.ssm.observation_dist(x_pred)
+            if obs_dist is not None:
+                return tf.cast(obs_dist.log_prob(y_t[..., tf.newaxis, :]), tf.float32)
+        except (NotImplementedError, AttributeError):
+            pass
+
+        # Fallback: first-order Gaussianization using h/h_with_noise and cov_eps_y.
+        if not callable(getattr(self.ssm, "h", None)):
+            raise NotImplementedError(
+                "observation_dist is unavailable and fallback requires ssm.h (and noise covariance)."
+            )
+        cov_r = getattr(self.ssm, "cov_eps_y", None)
+        if cov_r is None:
+            raise NotImplementedError(
+                "observation_dist is unavailable and fallback requires ssm.cov_eps_y."
+            )
+
+        y_obs = tf.convert_to_tensor(y_t, dtype=tf.float32)[..., tf.newaxis, :]
+        y_loc = tf.cast(self.ssm.h(x_pred), tf.float32)
+
+        try:
+            y_loc_lin, cov_eff = self._linearized_observation_cov(x_pred, cov_r)
+            y_loc = y_loc_lin
+        except Exception:  # noqa: BLE001
+            cov_eff = tf.convert_to_tensor(cov_r, dtype=tf.float32)
+
+        innovation_fn = getattr(self.ssm, "innovation", None)
+        if callable(innovation_fn):
+            innov = tf.cast(innovation_fn(y_obs, y_loc), tf.float32)
+            zero = tf.zeros_like(y_loc)
+            scale = self._regularized_cholesky(cov_eff)
+            return tf.cast(tfd.MultivariateNormalTriL(loc=zero, scale_tril=scale).log_prob(innov), tf.float32)
+
+        scale = self._regularized_cholesky(cov_eff)
+        return tf.cast(tfd.MultivariateNormalTriL(loc=y_loc, scale_tril=scale).log_prob(y_obs), tf.float32)
+
+    def _transition_log_prob(self, x_prev: tf.Tensor, x_pred: tf.Tensor) -> tf.Tensor:
+        # Preferred path: exact transition density.
+        try:
+            trans_dist = self.ssm.transition_dist(x_prev)
+            if trans_dist is not None:
+                return tf.cast(trans_dist.log_prob(x_pred), tf.float32)
+        except (NotImplementedError, AttributeError):
+            pass
+
+        # Fallback: first-order Gaussianization using f/f_with_noise and cov_eps_x.
+        if not callable(getattr(self.ssm, "f", None)):
+            raise NotImplementedError(
+                "transition_dist is unavailable and fallback requires ssm.f (and noise covariance)."
+            )
+        cov_q = getattr(self.ssm, "cov_eps_x", None)
+        if cov_q is None:
+            raise NotImplementedError(
+                "transition_dist is unavailable and fallback requires ssm.cov_eps_x."
+            )
+
+        x_loc = tf.cast(self.ssm.f(x_prev), tf.float32)
+        try:
+            x_loc_lin, cov_eff = self._linearized_transition_cov(x_prev, cov_q)
+            x_loc = x_loc_lin
+        except Exception:  # noqa: BLE001
+            cov_eff = tf.convert_to_tensor(cov_q, dtype=tf.float32)
+
+        scale = self._regularized_cholesky(cov_eff)
+        return tf.cast(tfd.MultivariateNormalTriL(loc=x_loc, scale_tril=scale).log_prob(x_pred), tf.float32)
 
     def warmup(self, batch_size=1, T=2, resample=None, y=None):
         """Trace filter graph to reduce first-call overhead."""
@@ -131,7 +275,7 @@ class DPFBase(ParticleFilter):
         m_pred = self.ssm.state_mean(x_pred, w_prev)
         P_pred = self.ssm.state_cov(x_pred, w_prev)
 
-        loglik = self.ssm.observation_dist(x_pred).log_prob(y_t[..., tf.newaxis, :])
+        loglik = self._observation_log_prob(x_pred, y_t)
         log_w = log_w_prev + tf.cast(loglik, log_w_prev.dtype)
         if log_q is not None:
             tf.debugging.assert_equal(
@@ -139,7 +283,7 @@ class DPFBase(ParticleFilter):
                 tf.shape(log_w_prev),
                 message="proposal log_q must have shape [B, N].",
             )
-            log_f = self.ssm.transition_dist(x_prev).log_prob(x_pred)
+            log_f = self._transition_log_prob(x_prev, x_pred)
             log_w = log_w + tf.cast(log_f - log_q, log_w_prev.dtype)
         log_w_norm, w_pre, logz_t = self._log_normalize(log_w)
         ess = self.ess(w_pre)
