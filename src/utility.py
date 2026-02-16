@@ -1,7 +1,6 @@
 """Utility math helpers and plotting routines."""
 
 import tensorflow as tf
-from matplotlib import pyplot as plt
 import numpy as np
 import tensorflow_probability as tfp
 
@@ -18,12 +17,14 @@ def tf_cond(M, jitter=1e-6):
     tf.debugging.assert_all_finite(M, "tf_cond received NaN/Inf in input matrix")
     M_sym = (M + tf.linalg.matrix_transpose(M)) / 2.0
     eye = tf.eye(tf.shape(M_sym)[-1], batch_shape=tf.shape(M_sym)[:-2], dtype=M_sym.dtype)
-    M_sym = M_sym + eye * jitter
+    jitter_val = tf.maximum(jitter, tf.cast(1e-5, M_sym.dtype))
+    M_sym = M_sym + eye * jitter_val
     M_sym = tf.where(tf.math.is_finite(M_sym), M_sym, tf.zeros_like(M_sym))
-    evals = tf.linalg.eigvalsh(M_sym)
-    e_max = tf.reduce_max(evals, axis=-1)
-    e_min = tf.reduce_min(evals, axis=-1)
-    return e_max / (e_min + jitter)
+    # Use SVD instead of eigvalsh for better numerical stability
+    s = tf.linalg.svd(M_sym, compute_uv=False)
+    s_max = tf.reduce_max(s, axis=-1)
+    s_min = tf.reduce_min(s, axis=-1)
+    return s_max / (s_min + jitter_val)
 
 def quadratic_matmul(A, B, C):
     """
@@ -60,14 +61,22 @@ def block_diag(A, B):
 
     A = tf.convert_to_tensor(A, dtype=tf.float32)
     B = tf.convert_to_tensor(B, dtype=tf.float32)
-    if A.shape.rank == 2:
-        A = A[tf.newaxis, :, :]
-    if B.shape.rank == 2:
-        B = B[tf.newaxis, :, :]
+    A = tf.cond(
+        tf.equal(tf.rank(A), 2),
+        lambda: A[tf.newaxis, :, :],
+        lambda: A,
+    )
+    B = tf.cond(
+        tf.equal(tf.rank(B), 2),
+        lambda: B[tf.newaxis, :, :],
+        lambda: B,
+    )
     batch = tf.shape(A)[0]
-    if tf.shape(B)[0] != batch:
-        B = tf.broadcast_to(B, [batch, tf.shape(B)[1], tf.shape(B)[2]])
-
+    B = tf.cond(
+        tf.not_equal(tf.shape(B)[0], batch),
+        lambda: tf.broadcast_to(B, [batch, tf.shape(B)[1], tf.shape(B)[2]]),
+        lambda: B,
+    )
     a = tf.shape(A)[1]
     b = tf.shape(B)[1]
     Z_ab = tf.zeros([batch, a, b], dtype=tf.float32)
@@ -78,10 +87,8 @@ def block_diag(A, B):
 
 def plot_ssm_trajectory(ssm, T=200, seed=None, title=None):
     """Simulate and plot one trajectory for a state-space model."""
-    # ---- simulate ----
+    from matplotlib import pyplot as plt
     x_traj, y_traj = ssm.simulate(T=T, batch_size=1, seed=seed)
-
-    # remove batch dimension → shapes:
     # x: [T, dx], y: [T, dy]
     x_traj = x_traj[0].numpy()
     y_traj = y_traj[0].numpy()
@@ -90,11 +97,9 @@ def plot_ssm_trajectory(ssm, T=200, seed=None, title=None):
     dy = ssm.obs_dim
     t = np.arange(T)
 
-    # ---- total number of subplots ----
     n_plots = dx + dy
     plt.figure(figsize=(12, 3 * n_plots))
 
-    # ---- plot state components ----
     for i in range(dx):
         plt.subplot(n_plots, 1, i + 1)
         plt.plot(t, x_traj[:, i], label=f"x[{i}]")
@@ -103,7 +108,6 @@ def plot_ssm_trajectory(ssm, T=200, seed=None, title=None):
         plt.title(f"State dimension x[{i}]")
         plt.grid(True)
 
-    # ---- plot observation components ----
     for j in range(dy):
         plt.subplot(n_plots, 1, dx + j + 1)
         plt.plot(t, y_traj[:, j], color="black", label=f"y[{j}]")
@@ -137,8 +141,10 @@ def is_psd(P, tol=1e-7):
     Returns:
       is_psd: bool
     """
-    eigvals = tf.linalg.eigvalsh(P)
-    return tf.reduce_min(eigvals) >= -tol
+    P = tf.convert_to_tensor(P)
+    P_sym = 0.5 * (P + tf.linalg.matrix_transpose(P))
+    eigvals = tf.linalg.eigvalsh(P_sym)
+    return tf.reduce_min(eigvals, axis=-1) >= -tol
 
 def tfp_lgssm(observations, ssm, mode="filter"):
     """Ground Truth for kalman filter"""

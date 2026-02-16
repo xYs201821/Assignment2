@@ -1,16 +1,10 @@
 from __future__ import annotations
 
 import os
-import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
-import numpy as np
 import psutil
 import tensorflow as tf
-
-
-def now() -> float:
-    return time.perf_counter()
 
 
 class MemorySampler:
@@ -30,28 +24,3 @@ class MemorySampler:
             except Exception:
                 gpu = None
         return rss, gpu
-
-
-def summarize_step_times(step_times: np.ndarray) -> Dict[str, float]:
-    arr = np.asarray(step_times, dtype=np.float32)
-    if arr.size == 0:
-        return {"total_s": 0.0, "mean_s": 0.0, "p95_s": 0.0}
-    return {
-        "total_s": float(arr.sum()),
-        "mean_s": float(arr.mean()),
-        "p95_s": float(np.percentile(arr, 95)),
-    }
-
-
-def summarize_rss(rss_bytes: np.ndarray) -> Dict[str, float]:
-    arr = np.asarray(rss_bytes, dtype=np.float64)
-    if arr.size == 0:
-        return {"peak_rss_mb": 0.0}
-    return {"peak_rss_mb": float(np.max(arr) / (1024.0 * 1024.0))}
-
-
-def summarize_gpu(gpu_bytes: np.ndarray) -> Dict[str, float]:
-    arr = np.asarray(gpu_bytes, dtype=np.float64)
-    if arr.size == 0:
-        return {"peak_gpu_mb": 0.0}
-    return {"peak_gpu_mb": float(np.max(arr) / (1024.0 * 1024.0))}

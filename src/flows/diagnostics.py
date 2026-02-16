@@ -24,11 +24,15 @@ def _percentile(values: tf.Tensor, q: float) -> tf.Tensor:
 def _cond_from_matrix(mat: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
     """Condition number estimate for symmetric matrices."""
     mat = 0.5 * (mat + tf.linalg.matrix_transpose(mat))
-    eigvals = tf.linalg.eigvalsh(mat)
-    eig_min = tf.reduce_min(eigvals, axis=-1)
-    eig_max = tf.reduce_max(eigvals, axis=-1)
-    eig_min = tf.maximum(eig_min, eps)
-    return eig_max / (eig_min + eps)
+    jitter_val = tf.maximum(eps, tf.cast(1e-5, mat.dtype))
+    jitter_eye = jitter_val * tf.eye(tf.shape(mat)[-1], batch_shape=tf.shape(mat)[:-2], dtype=mat.dtype)
+    mat_stable = mat + jitter_eye
+    
+    s = tf.linalg.svd(mat_stable, compute_uv=False)
+    s_max = tf.reduce_max(s, axis=-1)
+    s_min = tf.reduce_min(s, axis=-1)
+    s_min = tf.maximum(s_min, eps)
+    return s_max / (s_min + eps)
 
 
 def _cond_from_rect(mat: tf.Tensor, eps: tf.Tensor) -> tf.Tensor:
@@ -60,11 +64,17 @@ class _FlowDiagnosticsBase:
     def _finalize_cov(self, x: tf.Tensor, eps_float: tf.Tensor | float):
         w_uniform = _uniform_weights(x)
         cov = self.flow.ssm.state_cov(x, w_uniform)
-        cond_cov = _cond_from_matrix(cov, self.eps)
+        # Ensure symmetric and add jitter for numerical stability
+        cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
+        eps_t = tf.cast(eps_float, cov.dtype)
+        jitter_val = tf.maximum(eps_t, tf.cast(1e-5, cov.dtype))
+        jitter_eye = jitter_val * tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
+        cov_stable = cov + jitter_eye
+        cond_cov = _cond_from_matrix(cov_stable, self.eps)
         cond_cov_log10 = tf.math.log(cond_cov + self.eps) / self.log10_base
-        eigvals = tf.linalg.eigvalsh(cov)
-        eigvals = tf.maximum(eigvals, tf.cast(eps_float, eigvals.dtype))
-        logdet_cov = tf.reduce_sum(tf.math.log(eigvals), axis=-1)
+        s = tf.linalg.svd(cov_stable, compute_uv=False)
+        s = tf.maximum(s, eps_t)
+        logdet_cov = tf.reduce_sum(tf.math.log(s), axis=-1)
         return cond_cov_log10, logdet_cov
 
     def finalize(self, x: tf.Tensor, eps_float: tf.Tensor | float):

@@ -211,7 +211,11 @@ def coverage_from_particles(
         x_true = x_true[np.newaxis, ...]
     if particles.ndim == 3:
         particles = particles[np.newaxis, ...]
-    _, T, N, dx = particles.shape
+    if weights is not None:
+        weights = np.asarray(weights)
+        if weights.ndim == 2:
+            weights = weights[np.newaxis, ...]
+    batch, T, N, dx = particles.shape
     out = {float(k): 0.0 for k in sigmas}
     total = T * dx
     for k in sigmas:
@@ -219,20 +223,23 @@ def coverage_from_particles(
         alpha = 0.5 * (1.0 - math.erf(k / math.sqrt(2.0)))
         lo_q = alpha
         hi_q = 1.0 - alpha
-        count = 0
-        for t in range(T):
-            for d in range(dx):
-                vals = particles[0, t, :, d]
-                if weights is not None:
-                    w = np.asarray(weights)[0, t, :]
-                    lo = weighted_quantile(vals, w, lo_q)
-                    hi = weighted_quantile(vals, w, hi_q)
-                else:
-                    lo = np.quantile(vals, lo_q)
-                    hi = np.quantile(vals, hi_q)
-                if lo <= x_true[0, t, d] <= hi:
-                    count += 1
-        out[k] = count / float(total)
+        per_batch = np.zeros(batch, dtype=np.float32)
+        for b in range(batch):
+            count = 0
+            for t in range(T):
+                for d in range(dx):
+                    vals = particles[b, t, :, d]
+                    if weights is not None:
+                        w = weights[b, t, :]
+                        lo = weighted_quantile(vals, w, lo_q)
+                        hi = weighted_quantile(vals, w, hi_q)
+                    else:
+                        lo = np.quantile(vals, lo_q)
+                        hi = np.quantile(vals, hi_q)
+                    if lo <= x_true[b, t, d] <= hi:
+                        count += 1
+            per_batch[b] = count / float(total)
+        out[k] = float(np.mean(per_batch))
     return out
 
 
@@ -249,7 +256,6 @@ def _assignment_min_cost(cost: np.ndarray) -> Tuple[float, Tuple[int, ...]]:
                 best = val
                 best_perm = perm
         return float(best), tuple(best_perm)
-    # Fallback: greedy matching (simple but not optimal for large n)
     used = set()
     total = 0.0
     perm = [-1] * n
@@ -302,6 +308,68 @@ def best_match_rmse(x_true: np.ndarray, x_est: np.ndarray) -> float:
     else:
         matched = cost.T[np.arange(m), perm]
     return float(np.sqrt(np.mean(np.square(matched))))
+
+
+def extract_multitarget_positions(x: np.ndarray, num_targets: int) -> np.ndarray:
+    """Extract 2D positions from multitarget state layout [..., 4*num_targets].
+
+    The state order per target is assumed to be [px, py, vx, vy].
+    """
+    x = np.asarray(x)
+    if x.ndim == 2:
+        x = x[np.newaxis, ...]
+    if x.ndim != 3:
+        raise ValueError("x must have shape [B, T, 4*num_targets] or [T, 4*num_targets].")
+    expected = 4 * int(num_targets)
+    if x.shape[-1] != expected:
+        raise ValueError(f"last dim must be {expected}, got {x.shape[-1]}.")
+    x = x.reshape(x.shape[0], x.shape[1], num_targets, 4)
+    return x[..., 0:2]
+
+
+def multitarget_metrics(
+    x_true: Any,
+    mean: Any,
+    num_targets: int,
+    ospa_cutoff: float,
+    ospa_p: float,
+    ospa_percentiles: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    """Aggregate OSPA and best-match RMSE metrics for multi-target trajectories."""
+    x_true_np = np.asarray(x_true)
+    mean_np = np.asarray(mean)
+    if x_true_np.ndim == 2:
+        x_true_np = x_true_np[np.newaxis, ...]
+    if mean_np.ndim == 2:
+        mean_np = mean_np[np.newaxis, ...]
+    pos_true = extract_multitarget_positions(x_true_np, num_targets)
+    pos_est = extract_multitarget_positions(mean_np, num_targets)
+
+    batch_size, T, _, _ = pos_true.shape
+    ospa_vals = np.zeros((batch_size, T), dtype=np.float32)
+    match_vals = np.zeros((batch_size, T), dtype=np.float32)
+    for b in range(batch_size):
+        for t in range(T):
+            ospa_vals[b, t] = ospa_distance(
+                pos_true[b, t],
+                pos_est[b, t],
+                cutoff=ospa_cutoff,
+                p=ospa_p,
+            )
+            match_vals[b, t] = best_match_rmse(pos_true[b, t], pos_est[b, t])
+
+    metrics: Dict[str, Any] = {
+        "ospa": float(np.mean(ospa_vals)),
+        "ospa_final": float(np.mean(ospa_vals[:, -1])),
+        "best_match_rmse": float(np.mean(match_vals)),
+        "best_match_rmse_final": float(np.mean(match_vals[:, -1])),
+        "diverged": int(not np.isfinite(mean_np).all()),
+    }
+    if ospa_percentiles:
+        for pct in ospa_percentiles:
+            key = f"ospa_p{int(round(float(pct)))}"
+            metrics[key] = float(np.percentile(ospa_vals, pct))
+    return metrics
 
 
 def split_obs_indices(ssm, state_dim: int) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -410,11 +478,24 @@ def evaluate(
 
     if cfg.get("nll"):
         if is_gaussian:
-            nll_t = nll_from_gaussian(ssm, y_obs_t, mean, cov)
-        elif x_particles is not None and w is not None:
-            nll_t = nll_from_particles(ssm, y_obs_t, x_particles, w)
+            mean_nll = outputs.get("m_pred", mean)
+            cov_nll = outputs.get("P_pred", cov)
+            nll_t = nll_from_gaussian(ssm, y_obs_t, mean_nll, cov_nll)
         else:
-            nll_t = nll_from_gaussian(ssm, y_obs_t, mean, cov)
+            diagnostics = outputs.get("diagnostics")
+            x_pred = outputs.get("x_pred")
+            w_prev = outputs.get("w_prev")
+            if isinstance(diagnostics, dict):
+                if x_pred is None:
+                    x_pred = diagnostics.get("x_pred")
+                if w_prev is None:
+                    w_prev = diagnostics.get("w_prev")
+            if x_pred is not None and w_prev is not None:
+                nll_t = nll_from_particles(ssm, y_obs_t, x_pred, w_prev)
+            elif x_particles is not None and w is not None:
+                nll_t = nll_from_particles(ssm, y_obs_t, x_particles, w)
+            else:
+                nll_t = nll_from_gaussian(ssm, y_obs_t, mean, cov)
         metrics["nll"] = float(tf.reduce_mean(nll_t).numpy())
 
     if cfg.get("nees") and cov is not None:
