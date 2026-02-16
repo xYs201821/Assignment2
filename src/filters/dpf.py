@@ -424,7 +424,11 @@ class DPFBase(ParticleFilter):
                 y_t,
                 resample=resample,
             )
-            x_prev = x_t
+            if bool(getattr(self, "stop_grad_through_time", False)):
+                x_prev = tf.stop_gradient(x_t)
+                log_w = tf.stop_gradient(log_w)
+            else:
+                x_prev = x_t
             logz_total = logz_total + logz_t
 
             x_pred_ta = x_pred_ta.write(t, x_pred)
