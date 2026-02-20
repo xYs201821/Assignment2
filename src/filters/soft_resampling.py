@@ -72,33 +72,30 @@ class SoftResamplingDPF(DPFBase):
         log_w: tf.Tensor,
         lam: tf.Tensor | None = None,
     ):
-        """Soft-resampling by mixing normalized weights with a uniform proposal."""
+        """
+        Soft-resampling by mixing normalized weights with a uniform proposal.
+        """
         if lam is None:
             lam = self.lam
         lam = tf.cast(lam, x.dtype)
+        log_lam = tf.math.log(tf.clip_by_value(lam, tf.constant(1e-6, x.dtype), tf.constant(1.0, x.dtype)))
         log_uniform = -tf.math.log(tf.cast(self.num_particles, x.dtype))
         log_one_minus_lam = tf.math.log(tf.maximum(1.0 - lam, tf.constant(1e-6, x.dtype)))
 
         log_q = tf.reduce_logsumexp(
             tf.stack(
                 [
-                    tf.math.log(lam) + log_w,
+                    log_lam + log_w,
                     log_one_minus_lam + log_uniform + tf.zeros_like(log_w),
                 ],
                 axis=0,
             ),
             axis=0,
         )
-        q = tf.exp(log_q)
-
-        parent_indices = tf.map_fn(
-            lambda q_b: categorical_sample(
-                tf.stop_gradient(q_b),
-                num_samples=self.num_particles,
-                replacement=True,
-            ),
-            q,
-            fn_output_signature=tf.TensorSpec(shape=(self.num_particles,), dtype=tf.int32),
+        parent_indices = tf.random.categorical(
+            tf.stop_gradient(log_q),
+            num_samples=tf.cast(self.num_particles, tf.int32),
+            dtype=tf.int32,
         )
 
         x_new = self.resample_particles(x, parent_indices)
