@@ -4,6 +4,8 @@ import argparse
 import os
 import sys
 import time
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
@@ -17,7 +19,6 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
-from tqdm.auto import tqdm
 from absl import logging as absl_logging
 
 absl_logging.set_verbosity(absl_logging.ERROR)
@@ -72,7 +73,28 @@ SUMMARY_KEYS = (
 
 
 def _log(message: str) -> None:
-    tqdm.write(message)
+    print(message, flush=True)
+
+
+def _current_gpu_memory_mb() -> tuple[float | None, float | None]:
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        if not gpus:
+            return None, None
+        info = tf.config.experimental.get_memory_info("GPU:0")
+        current = info.get("current")
+        peak = info.get("peak")
+        current_mb = float(current) / (1024.0 * 1024.0) if current is not None else None
+        peak_mb = float(peak) / (1024.0 * 1024.0) if peak is not None else None
+        return current_mb, peak_mb
+    except Exception:
+        return None, None
+
+
+def _format_memory_mb(value: float | None) -> str:
+    if value is None or not np.isfinite(value):
+        return "NA"
+    return f"{value:.1f}MB"
 
 
 def _parse_args(default_config: Path = DEFAULT_CONFIG_PATH) -> argparse.Namespace:
@@ -127,6 +149,17 @@ def _parse_args(default_config: Path = DEFAULT_CONFIG_PATH) -> argparse.Namespac
         type=int,
         default=None,
         help="Override dpf.num_particles.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of seeds to run in parallel (one subprocess per seed). "
+            "Each subprocess has its own TF global state, avoiding RNG races. "
+            "Default: 1 (serial)."
+        ),
     )
     return parser.parse_args()
 
@@ -760,8 +793,8 @@ def _run_baseline_method(
         proposal=proposal,
     )
     _log(
-        f"[seed={seed}][baseline] fixed-phi baseline with phi=1 "
-        "(no training)."
+        f"[seed={seed}][baseline] "
+        "fixed-phi baseline with phi=1 (no training)."
     )
     _reset_filter_rng(fit_ssm, rng_base + 11)
     t_eval_init = time.perf_counter()
@@ -829,15 +862,9 @@ def _train_dpf(
     x_true_t = tf.convert_to_tensor(x_true, dtype=tf.float32)
 
     train_t0 = time.perf_counter()
-    step_iter = tqdm(
-        range(steps),
-        total=steps,
-        desc=f"seed={seed}:{method}",
-        unit="step",
-        dynamic_ncols=True,
-        leave=False,
-    )
-    for step in step_iter:
+    step_time_hist: deque[float] = deque(maxlen=max(1, int(log_every)))
+    for step in range(steps):
+        step_t0 = time.perf_counter()
         loss_terms = []
         rmse_terms = []
         ess_terms = []
@@ -899,6 +926,9 @@ def _train_dpf(
         grad_hist_ta = grad_hist_ta.write(step, tf.cast(grad_norm, tf.float32))
         grad_raw_hist_ta = grad_raw_hist_ta.write(step, tf.cast(raw_grad_norm, tf.float32))
         phi_rmse_hist_ta = phi_rmse_hist_ta.write(step, phi_rmse_step)
+
+        step_sec = float(time.perf_counter() - step_t0)
+        step_time_hist.append(step_sec)
         if log_every > 0 and (
             step == 0 or (step + 1) % log_every == 0 or (step + 1) == steps
         ):
@@ -908,22 +938,21 @@ def _train_dpf(
             phi_rmse_step_val = float(phi_rmse_step.numpy())
             grad_raw_step = float(raw_grad_norm.numpy())
             grad_step = float(grad_norm.numpy())
-            step_iter.set_postfix_str(
-                "loss="
-                f"{loss_step:.5f} "
-                "rmse="
-                f"{rmse_step:.5f} "
-                "phi="
-                f"{phi_rmse_step_val:.5f} "
-                "ess="
-                f"{ess_step:.2f} "
-                "g="
-                f"{grad_step:.4f} "
-                "g_raw="
-                f"{grad_raw_step:.4f} "
-                "mc="
-                f"{mc_samples}",
-                refresh=False,
+            avg_step_sec = float(np.mean(step_time_hist))
+            gpu_mem_cur_mb, gpu_mem_peak_mb = _current_gpu_memory_mb()
+            _log(
+                f"[seed={seed}][{method}] "
+                f"step {step + 1}/{steps} "
+                f"loss={loss_step:.5f} "
+                f"rmse={rmse_step:.5f} "
+                f"phi={phi_rmse_step_val:.5f} "
+                f"ess={ess_step:.2f} "
+                f"g={grad_step:.4f} "
+                f"g_raw={grad_raw_step:.4f} "
+                f"mc={mc_samples} "
+                f"gpu_mem={_format_memory_mb(gpu_mem_cur_mb)} "
+                f"gpu_peak={_format_memory_mb(gpu_mem_peak_mb)} "
+                f"step_avg={avg_step_sec:.3f}s"
             )
     runtime_train_sec = float(time.perf_counter() - train_t0)
     runtime_train_per_step_sec = float(runtime_train_sec / max(steps, 1))
@@ -999,8 +1028,8 @@ def _run_trainable_dpf_method(
         dpf.resampler_net.trainable = not freeze_resampler
         if pretrained_weights_used is not None:
             _log(
-                f"[seed={seed}][{method}] loaded pretrained resampler "
-                f"weights: {pretrained_weights_used}"
+                f"[seed={seed}][{method}] "
+                f"loaded pretrained resampler weights: {pretrained_weights_used}"
             )
 
     proposal_vars, resampler_vars, train_vars = _select_train_var_groups(
@@ -1031,11 +1060,14 @@ def _run_trainable_dpf_method(
     if resampler_vars:
         resampler_optimizer = _build_optimizer(train_cfg_eff, lr_override=resampler_lr)
         _log(
-            f"[seed={seed}][{method}] proposal_lr={proposal_lr:.3e} "
-            f"resampler_lr={resampler_lr:.3e}"
+            f"[seed={seed}][{method}] "
+            f"proposal_lr={proposal_lr:.3e} resampler_lr={resampler_lr:.3e}"
         )
     else:
-        _log(f"[seed={seed}][{method}] proposal_lr={proposal_lr:.3e}")
+        _log(
+            f"[seed={seed}][{method}] "
+            f"proposal_lr={proposal_lr:.3e}"
+        )
 
     _reset_filter_rng(fit_ssm, rng_base + 11)
     t_eval_init = time.perf_counter()
@@ -1318,12 +1350,91 @@ def _build_method_summary(
     }
 
 
+def _run_all_methods_for_seed(
+    seed: int,
+    methods: List[str],
+    exp_cfg: Dict[str, Any],
+    model_cfg: Dict[str, Any],
+    train_cfg: Dict[str, Any],
+    dpf_cfg: Dict[str, Any],
+    proposal_cfg: Dict[str, Any],
+    experiment_name: str,
+    out_root: str,
+    save_traces: bool,
+) -> Dict[str, Any]:
+    """Top-level worker: run every method for one seed in a subprocess.
+
+    Must be a module-level function so ProcessPoolExecutor can pickle it.
+    Each subprocess gets its own TF global state (no tf.random.set_seed races)
+    and builds its own fit_ssm via _run_single_seed -> _build_seed_context.
+    Because the same seed value is used, sim data (x_true, y_obs) is identical
+    across methods — the common-random-number property is preserved.
+    """
+    import sys as _sys
+
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ["GRPC_VERBOSITY"] = "ERROR"
+
+    # The NUMA / GPU-device C++ messages bypass Python logging and write
+    # directly to fd 2.  Redirect fd 2 to /dev/null while TF initialises
+    # the GPU, then restore it so that real stderr still works afterwards.
+    _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    _saved_fd2 = os.dup(2)
+    _saved_stderr = _sys.stderr
+    os.dup2(_devnull_fd, 2)
+    _sys.stderr = open(os.devnull, "w")
+    os.close(_devnull_fd)
+    try:
+        import tensorflow as _tf
+        from absl import logging as _absl_logging
+        _absl_logging.set_verbosity(_absl_logging.ERROR)
+        _absl_logging.set_stderrthreshold("error")
+        for _gpu in _tf.config.list_physical_devices("GPU"):
+            _tf.config.experimental.set_memory_growth(_gpu, True)
+        _tf.constant(0)  # trigger GPU context init now, while fd 2 is muted
+    finally:
+        _sys.stderr.close()
+        _sys.stderr = _saved_stderr
+        os.dup2(_saved_fd2, 2)
+        os.close(_saved_fd2)
+
+    out_root_path = Path(out_root)
+    seed_results: Dict[str, Dict[str, Any]] = {}
+    _log(f"[seed={seed}] started with methods={methods}")
+    for method in methods:
+        _log(f"[seed={seed}][{method}] starting")
+        result = _run_single_seed(
+            seed,
+            exp_cfg,
+            model_cfg,
+            train_cfg,
+            dpf_cfg,
+            proposal_cfg,
+            method=method,
+            experiment_name=experiment_name,
+            experiment_dir=out_root_path,
+        )
+        seed_results[method] = result
+        if save_traces:
+            _persist_trace(
+                out_root=out_root_path,
+                experiment_name=experiment_name,
+                seed=seed,
+                method=method,
+                result=result,
+            )
+        _log(f"[seed={seed}][{method}] finished")
+    _log(f"[seed={seed}] all methods finished")
+    return {"seed": seed, "results": seed_results}
+
+
 def run_lgssm_dpf_backprop(
     cfg: Dict[str, Any],
     config_path: Path,
     tag: str,
     *,
     exp_name: str | None = None,
+    num_workers: int = 1,
 ) -> None:
     exp_cfg = cfg_section(cfg, "experiment")
     model_cfg = cfg_section(cfg, "model")
@@ -1341,57 +1452,107 @@ def run_lgssm_dpf_backprop(
     save_traces = bool(exp_cfg.get("save_traces", True))
     methods = _resolve_dpf_methods(dpf_cfg)
 
+    n_workers = max(1, int(num_workers))
     _log(f"[{tag}] config={config_path}")
     _log(f"[{tag}] exp_name={experiment_name}")
     _log(f"[{tag}] output_root={out_root}")
     _log(f"[{tag}] seeds={seeds}")
     _log(f"[{tag}] methods={methods}")
+    _log(f"[{tag}] num_workers={n_workers}")
 
     per_seed: Dict[str, List[Dict[str, Any]]] = {method: [] for method in methods}
     metrics_across_seeds: Dict[str, List[Dict[str, Any]]] = {
         method: [] for method in methods
     }
-    for seed in seeds:
-        per_seed_metrics: Dict[str, Dict[str, Any]] = {}
-        for method in methods:
-            result = _run_single_seed(
-                seed,
-                exp_cfg,
-                model_cfg,
-                train_cfg,
-                dpf_cfg,
-                proposal_cfg,
-                method=method,
-                experiment_name=experiment_name,
-                experiment_dir=out_root,
-            )
-            per_seed[method].append(result)
-            final_metrics = _result_stage_metrics(result, "final")
-            per_seed_metrics[method] = final_metrics
-            metrics_across_seeds[method].append(final_metrics)
 
-            _log_method_result(
-                tag=tag,
-                seed=seed,
-                method=method,
-                result=result,
-            )
-
-            if save_traces:
-                _persist_trace(
-                    out_root=out_root,
-                    experiment_name=experiment_name,
-                    seed=seed,
+    if n_workers <= 1:
+        # Serial path — identical to the original behaviour.
+        for seed in seeds:
+            per_seed_metrics: Dict[str, Dict[str, Any]] = {}
+            for method in methods:
+                result = _run_single_seed(
+                    seed,
+                    exp_cfg,
+                    model_cfg,
+                    train_cfg,
+                    dpf_cfg,
+                    proposal_cfg,
                     method=method,
-                    result=result,
+                    experiment_name=experiment_name,
+                    experiment_dir=out_root,
                 )
+                per_seed[method].append(result)
+                final_metrics = _result_stage_metrics(result, "final")
+                per_seed_metrics[method] = final_metrics
+                metrics_across_seeds[method].append(final_metrics)
 
-        print_separator(f"{tag} seed{seed} summary")
-        print_method_summary_table(
-            per_seed_metrics,
-            method_order=tuple(methods),
-            keys=SUMMARY_KEYS,
+                _log_method_result(tag=tag, seed=seed, method=method, result=result)
+
+                if save_traces:
+                    _persist_trace(
+                        out_root=out_root,
+                        experiment_name=experiment_name,
+                        seed=seed,
+                        method=method,
+                        result=result,
+                    )
+
+            print_separator(f"{tag} seed{seed} summary")
+            print_method_summary_table(
+                per_seed_metrics,
+                method_order=tuple(methods),
+                keys=SUMMARY_KEYS,
+            )
+    else:
+        # Parallel path: one subprocess per seed, each seed runs all methods
+        # sequentially inside its own process.
+        # Each process has its own TF global state, so tf.random.set_seed()
+        # calls cannot race across seeds.
+        _log(f"[{tag}] launching {len(seeds)} seeds across {n_workers} workers ...")
+        worker_kwargs = dict(
+            methods=methods,
+            exp_cfg=exp_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            dpf_cfg=dpf_cfg,
+            proposal_cfg=proposal_cfg,
+            experiment_name=experiment_name,
+            out_root=str(out_root),
+            save_traces=save_traces,
         )
+        seed_outputs: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        with ProcessPoolExecutor(max_workers=n_workers) as pool:
+            futures = {
+                pool.submit(_run_all_methods_for_seed, seed, **worker_kwargs): seed
+                for seed in seeds
+            }
+            for fut in as_completed(futures):
+                seed = futures[fut]
+                try:
+                    worker_out = fut.result()
+                except Exception as exc:
+                    _log(f"[{tag}] seed={seed} FAILED: {exc}")
+                    raise
+                seed_outputs[seed] = worker_out["results"]
+                _log(f"[{tag}] seed={seed} finished.")
+
+        # Reassemble in original seed order for reproducible summaries.
+        for seed in seeds:
+            per_seed_metrics = {}
+            for method in methods:
+                result = seed_outputs[seed][method]
+                per_seed[method].append(result)
+                final_metrics = _result_stage_metrics(result, "final")
+                per_seed_metrics[method] = final_metrics
+                metrics_across_seeds[method].append(final_metrics)
+                _log_method_result(tag=tag, seed=seed, method=method, result=result)
+
+            print_separator(f"{tag} seed{seed} summary")
+            print_method_summary_table(
+                per_seed_metrics,
+                method_order=tuple(methods),
+                keys=SUMMARY_KEYS,
+            )
 
     method_summary_new = _build_method_summary(
         per_seed=per_seed,
@@ -1456,6 +1617,7 @@ def main() -> None:
         config_path=args.config,
         tag="exp3_lgssm_dpf_backprop",
         exp_name=exp_name,
+        num_workers=args.num_workers,
     )
 
 
