@@ -1,6 +1,7 @@
 from src.filters import (
     BaseFilter,
     DPFBase,
+    DiffusionResamplingDPF,
     ExtendedKalmanFilter,
     GaussianFilter,
     KalmanFilter,
@@ -21,6 +22,7 @@ __all__ = [
     "ParticleFilter",
     "BootstrapParticleFilter",
     "DPFBase",
+    "DiffusionResamplingDPF",
     "SoftResamplingDPF",
     "OTResamplingDPF",
     "ParticleTransformerDPF",

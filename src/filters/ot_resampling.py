@@ -15,31 +15,16 @@ def pairwise_distance(
     """Pairwise distances with an optional custom metric function.
 
     Shapes:
-      x: [B, N, dx] or [N, dx]
-      y: [B, M, dx] or [M, dx] (defaults to x)
+      x: [B, N, dx]
+      y: [B, M, dx]
       metric_fn: callable receiving broadcasted tensors
         x_exp=[B, N, 1, dx], y_exp=[B, 1, M, dx] and returning [B, N, M].
         If None, uses squared Euclidean distance.
     Returns:
-      dist: [B, N, M] or [N, M]
+      dist: [B, N, M]
     """
-    x = tf.convert_to_tensor(x, dtype=tf.float32)
-    x_rank2 = x.shape.rank == 2
-    if x_rank2:
-        x = x[tf.newaxis, ...]
-    if x.shape.rank != 3:
-        raise ValueError("x must have shape [B, N, dx] or [N, dx].")
-
     if y is None:
         y = x
-        y_rank2 = x_rank2
-    else:
-        y = tf.convert_to_tensor(y, dtype=x.dtype)
-        y_rank2 = y.shape.rank == 2
-        if y_rank2:
-            y = y[tf.newaxis, ...]
-        if y.shape.rank != 3:
-            raise ValueError("y must have shape [B, M, dx] or [M, dx].")
 
     if metric_fn is None:
         x_sq = tf.reduce_sum(tf.square(x), axis=-1, keepdims=True)
@@ -49,17 +34,7 @@ def pairwise_distance(
     else:
         x_exp = x[:, :, tf.newaxis, :]
         y_exp = y[:, tf.newaxis, :, :]
-        dist = tf.convert_to_tensor(metric_fn(x_exp, y_exp), dtype=x.dtype)
-        if dist.shape.rank != 3:
-            raise ValueError("metric_fn must return a tensor with shape [B, N, M].")
-        tf.debugging.assert_equal(
-            tf.shape(dist),
-            tf.stack([tf.shape(x)[0], tf.shape(x)[1], tf.shape(y)[1]]),
-            message="metric_fn output shape must be [B, N, M].",
-        )
-
-    if x_rank2 and y_rank2:
-        return dist[0]
+        dist = metric_fn(x_exp, y_exp)
     return dist
 
 
@@ -104,27 +79,13 @@ def ot_resample_barycentric(
     """OT resampling with barycentric projection to equal-weight particles.
 
     Shapes:
-      x: [B, N, dx] or [N, dx]
-      log_w: [B, N] or [N]
+      x: [B, N, dx]
+      log_w: [B, N]
     Returns:
-      x_new: [B, N, dx] or [N, dx]
-      log_w_new: [B, N] or [N] (uniform)
-      parent_indices: [B, N] or [N] (argmax lineage proxy)
+      x_new: [B, N, dx]
+      log_w_new: [B, N] (uniform)
+      parent_indices: [B, N] (argmax lineage proxy)
     """
-    x = tf.convert_to_tensor(x, dtype=tf.float32)
-    squeeze_batch = False
-    if x.shape.rank == 2:
-        x = x[tf.newaxis, ...]
-        squeeze_batch = True
-    if x.shape.rank != 3:
-        raise ValueError("x must have shape [B, N, dx] or [N, dx].")
-
-    log_w = tf.convert_to_tensor(log_w, dtype=x.dtype)
-    if log_w.shape.rank == 1:
-        log_w = log_w[tf.newaxis, ...]
-    if log_w.shape.rank != 2:
-        raise ValueError("log_w must have shape [B, N] or [N].")
-
     log_w = log_w - tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
     num_particles = tf.shape(x)[-2]
     log_uniform = -tf.math.log(tf.cast(num_particles, x.dtype))
@@ -136,14 +97,11 @@ def ot_resample_barycentric(
 
     col_mass = tf.reduce_sum(plan, axis=-2)  # [B, N]
     weighted_sum = tf.einsum("bij,bid->bjd", plan, x)
-    jitter_t = tf.convert_to_tensor(jitter, dtype=x.dtype)
+    jitter_t = tf.cast(jitter, x.dtype)
     x_new = weighted_sum / tf.maximum(col_mass[..., tf.newaxis], jitter_t)
 
     log_w_new = tf.fill(tf.shape(log_w), log_uniform)
     parent_indices = tf.argmax(plan, axis=-2, output_type=tf.int32)
-
-    if squeeze_batch:
-        return x_new[0], log_w_new[0], parent_indices[0]
     return x_new, log_w_new, parent_indices
 
 
@@ -235,48 +193,50 @@ class OTResamplingDPF(DPFBase):
         metric_fn=None,
     ):
         """Class method interface for OT barycentric resampling."""
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
-        squeeze_batch = False
-        if x.shape.rank == 2:
-            x = x[tf.newaxis, ...]
-            squeeze_batch = True
-        if x.shape.rank != 3:
-            raise ValueError("x must have shape [B, N, dx] or [N, dx].")
-
-        log_w = tf.convert_to_tensor(log_w, dtype=x.dtype)
-        if log_w.shape.rank == 1:
-            log_w = log_w[tf.newaxis, ...]
-        if log_w.shape.rank != 2:
-            raise ValueError("log_w must have shape [B, N] or [N].")
-
         eps = self.ot_epsilon if epsilon is None else tf.cast(epsilon, x.dtype)
         iters = self.ot_num_iters if num_iters is None else int(num_iters)
-        jit = self.ot_jitter if jitter is None else tf.cast(jitter, x.dtype)
 
         log_w = log_w - tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
         num_particles = tf.shape(x)[-2]
         log_uniform = -tf.math.log(tf.cast(num_particles, x.dtype))
         log_b = tf.fill(tf.shape(log_w), log_uniform)
 
-        cost = self.pairwise_distance(x, metric_fn=metric_fn)
+        if metric_fn is None:
+            x_sq = tf.reduce_sum(tf.square(x), axis=-1, keepdims=True)
+            cost = x_sq - 2.0 * tf.matmul(x, x, transpose_b=True) + tf.transpose(x_sq, perm=[0, 2, 1])
+            cost = tf.maximum(cost, tf.zeros_like(cost))
+        else:
+            x_exp = x[:, :, tf.newaxis, :]
+            y_exp = x[:, tf.newaxis, :, :]
+            cost = metric_fn(x_exp, y_exp)
+
         log_plan = self.sinkhorn_log_plan(log_w, log_b, cost, epsilon=eps, num_iters=iters)
         plan = tf.exp(log_plan)
 
-        col_mass = tf.reduce_sum(plan, axis=-2)  # [B, N]
-        weighted_sum = tf.einsum("bij,bid->bjd", plan, x)
-        x_new = weighted_sum / tf.maximum(col_mass[..., tf.newaxis], tf.cast(jit, x.dtype))
+        # Barycentric projection via model-aware state_mean for each target column.
+        b = tf.shape(x)[0]
+        n_src = tf.shape(x)[1]
+        dx = tf.shape(x)[2]
+        n_tgt = tf.shape(plan)[2]
+
+        w_cols = tf.transpose(plan, perm=[0, 2, 1])  # [B, N_tgt, N_src]
+        x_tiled = tf.broadcast_to(x[:, tf.newaxis, :, :], [b, n_tgt, n_src, dx])
+        x_flat = tf.reshape(x_tiled, [b * n_tgt, n_src, dx])
+        w_flat = tf.reshape(w_cols, [b * n_tgt, n_src])
+        x_new = self.ssm.state_mean(x_flat, w_flat)
+        x_new = tf.reshape(x_new, [b, n_tgt, dx])
+        x_new = tf.ensure_shape(x_new, x.shape)
 
         log_w_new = tf.fill(tf.shape(log_w), log_uniform)
         parent_indices = tf.argmax(plan, axis=-2, output_type=tf.int32)
-
-        if squeeze_batch:
-            return x_new[0], log_w_new[0], parent_indices[0]
         return x_new, log_w_new, parent_indices
 
     def resample_step(self, x: tf.Tensor, log_w: tf.Tensor):
         return self.ot_resample_barycentric(
-            x,
-            log_w,
+            x=x,
+            log_w=log_w,
+            epsilon=self.ot_epsilon,
+            num_iters=self.ot_num_iters,
         )
 
     def filter(

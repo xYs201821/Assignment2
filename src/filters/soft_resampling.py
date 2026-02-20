@@ -11,9 +11,6 @@ def categorical_sample(prob: tf.Tensor, num_samples: int, replacement: bool = Tr
     """Sample categorical indices from a single probability vector."""
     if not replacement:
         raise NotImplementedError("Only replacement=True is implemented.")
-    prob = tf.convert_to_tensor(prob, dtype=tf.float32)
-    if prob.shape.rank != 1:
-        raise ValueError("categorical_sample expects shape [N].")
     prob = tf.math.divide_no_nan(prob, tf.reduce_sum(prob))
     logits = tf.math.log(tf.clip_by_value(prob, 1e-12, 1.0))
     draws = tf.random.categorical(logits[tf.newaxis, :], num_samples=tf.cast(num_samples, tf.int32))
@@ -76,8 +73,6 @@ class SoftResamplingDPF(DPFBase):
         lam: tf.Tensor | None = None,
     ):
         """Soft-resampling by mixing normalized weights with a uniform proposal."""
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
-        log_w = tf.convert_to_tensor(log_w, dtype=x.dtype)
         if lam is None:
             lam = self.lam
         lam = tf.cast(lam, x.dtype)

@@ -257,23 +257,15 @@ class DPFBase(ParticleFilter):
           log_w_prev: [B, N]
           y_t: [B, dy]
         Returns:
-          x_pred: [B, N, dx]
+          x_pre: [B, N, dx]
           x_t: [B, N, dx]
           log_w_final: [B, N]
           w_final: [B, N]
           parent_indices: [B, N]
-          m_pred: [B, dx]
-          P_pred: [B, dx, dx]
-          w_pre: [B, N]
+          log_w_pre: [B, N]
           logz_t: [B]
-          ess: [B]
-          resampled: [B] bool
         """
         x_pred, log_q = self._sample_proposal(x_prev, y_t)
-        w_prev = tf.exp(log_w_prev)
-        w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
-        m_pred = self.ssm.state_mean(x_pred, w_prev)
-        P_pred = self.ssm.state_cov(x_pred, w_prev)
 
         loglik = self._observation_log_prob(x_pred, y_t)
         log_w = log_w_prev + tf.cast(loglik, log_w_prev.dtype)
@@ -296,8 +288,20 @@ class DPFBase(ParticleFilter):
             else:
                 mask_do_rs = ess < (self.ess_threshold * N_float)
 
-            x_rs, log_w_rs, rs_indices = self.resample_step(x_pred, log_w_norm)
             no_rs_indices = self._identity_parent_indices(x_pred)
+            should_resample = tf.reduce_any(mask_do_rs)
+
+            def _run_resample():
+                return self.resample_step(x_pred, log_w_norm)
+
+            def _skip_resample():
+                return x_pred, log_w_norm, no_rs_indices
+
+            x_rs, log_w_rs, rs_indices = tf.cond(
+                should_resample,
+                _run_resample,
+                _skip_resample,
+            )
 
             mask_w = mask_do_rs[..., tf.newaxis]
             mask_x = mask_do_rs[..., tf.newaxis, tf.newaxis]
@@ -308,21 +312,17 @@ class DPFBase(ParticleFilter):
             parent_indices = self._identity_parent_indices(x_pred)
             x_t = x_pred
             log_w_final = log_w_norm
-            mask_do_rs = tf.zeros_like(ess, dtype=tf.bool)
 
         w_final = tf.exp(log_w_final)
+        log_w_pre = log_w_norm
         return (
             x_pred,
             x_t,
             log_w_final,
             w_final,
             parent_indices,
-            m_pred,
-            P_pred,
-            w_pre,
+            log_w_pre,
             logz_t,
-            ess,
-            mask_do_rs,
         )
 
     def filter(
@@ -370,54 +370,38 @@ class DPFBase(ParticleFilter):
         T = tf.shape(y)[1]
 
         x_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        x_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        x_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
         w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        w_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        w_prev_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        m_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        P_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        log_w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        log_w_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
         parent_ta = tf.TensorArray(tf.int32, size=T, dynamic_size=False)
-        ess_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
         logz_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        resampled_ta = tf.TensorArray(tf.bool, size=T, dynamic_size=False)
-
-        logz_total = tf.zeros(tf.shape(log_w)[:-1], dtype=log_w.dtype)
 
         def _cond(t, _state):
             return t < T
 
         def _body(t, state):
-            x_prev, log_w, logz_total, tas = state
+            x_prev, log_w, tas = state
             (
                 x_ta,
-                x_pred_ta,
+                x_pre_ta,
                 w_ta,
-                w_pre_ta,
-                w_prev_ta,
-                m_pred_ta,
-                P_pred_ta,
+                log_w_ta,
+                log_w_pre_ta,
                 parent_ta,
-                ess_ta,
                 logz_ta,
-                resampled_ta,
             ) = tas
 
             y_t = y[:, t, :]
-            w_prev = tf.exp(log_w)
-            w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
 
             (
-                x_pred,
+                x_pre,
                 x_t,
                 log_w,
                 w,
                 parent_indices,
-                m_pred,
-                P_pred,
-                w_pre,
+                log_w_pre,
                 logz_t,
-                ess,
-                resampled,
             ) = self.step(
                 x_prev,
                 log_w,
@@ -429,81 +413,65 @@ class DPFBase(ParticleFilter):
                 log_w = tf.stop_gradient(log_w)
             else:
                 x_prev = x_t
-            logz_total = logz_total + logz_t
 
-            x_pred_ta = x_pred_ta.write(t, x_pred)
+            x_pre_ta = x_pre_ta.write(t, x_pre)
             x_ta = x_ta.write(t, x_t)
             w_ta = w_ta.write(t, w)
-            w_pre_ta = w_pre_ta.write(t, w_pre)
-            w_prev_ta = w_prev_ta.write(t, w_prev)
-            m_pred_ta = m_pred_ta.write(t, m_pred)
-            P_pred_ta = P_pred_ta.write(t, P_pred)
+            log_w_ta = log_w_ta.write(t, log_w)
+            log_w_pre_ta = log_w_pre_ta.write(t, log_w_pre)
             parent_ta = parent_ta.write(t, parent_indices)
-            ess_ta = ess_ta.write(t, ess)
             logz_ta = logz_ta.write(t, logz_t)
-            resampled_ta = resampled_ta.write(t, resampled)
 
             tas = (
                 x_ta,
-                x_pred_ta,
+                x_pre_ta,
                 w_ta,
-                w_pre_ta,
-                w_prev_ta,
-                m_pred_ta,
-                P_pred_ta,
+                log_w_ta,
+                log_w_pre_ta,
                 parent_ta,
-                ess_ta,
                 logz_ta,
-                resampled_ta,
             )
-            return t + 1, (x_prev, log_w, logz_total, tas)
+            return t + 1, (x_prev, log_w, tas)
 
         tas = (
             x_ta,
-            x_pred_ta,
+            x_pre_ta,
             w_ta,
-            w_pre_ta,
-            w_prev_ta,
-            m_pred_ta,
-            P_pred_ta,
+            log_w_ta,
+            log_w_pre_ta,
             parent_ta,
-            ess_ta,
             logz_ta,
-            resampled_ta,
         )
-        _, (_, _, logz_total, tas) = tf.while_loop(
+        _, (_, _, tas) = tf.while_loop(
             _cond,
             _body,
-            (tf.constant(0), (x_prev, log_w, logz_total, tas)),
+            (tf.constant(0), (x_prev, log_w, tas)),
         )
         (
             x_ta,
-            x_pred_ta,
+            x_pre_ta,
             w_ta,
-            w_pre_ta,
-            w_prev_ta,
-            m_pred_ta,
-            P_pred_ta,
+            log_w_ta,
+            log_w_pre_ta,
             parent_ta,
-            ess_ta,
             logz_ta,
-            resampled_ta,
         ) = tas
 
         x_seq = self._stack_and_permute(x_ta, tail_dims=2)
         w_seq = self._stack_and_permute(w_ta, tail_dims=1)
+        log_w_seq = self._stack_and_permute(log_w_ta, tail_dims=1)
+        x_pre_seq = self._stack_and_permute(x_pre_ta, tail_dims=2)
+        log_w_pre_seq = self._stack_and_permute(log_w_pre_ta, tail_dims=1)
         parent_seq = self._stack_and_permute(parent_ta, tail_dims=1)
+        logz_seq = self._stack_and_permute(logz_ta, tail_dims=0)
 
         diagnostics = {
-            "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
-            "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
-            "x_pred": self._stack_and_permute(x_pred_ta, tail_dims=2),
-            "w_pre": self._stack_and_permute(w_pre_ta, tail_dims=1),
-            "w_prev": self._stack_and_permute(w_prev_ta, tail_dims=1),
-            "ess": self._stack_and_permute(ess_ta, tail_dims=0),
-            "logZ_t": self._stack_and_permute(logz_ta, tail_dims=0),
-            "resampled": self._stack_and_permute(resampled_ta, tail_dims=0),
-            "logZ_total": logz_total,
+            "x": x_seq,
+            "log_w": log_w_seq,
+            "log_z": logz_seq,
+            "x_pre": x_pre_seq,
+            "log_w_pre": log_w_pre_seq,
+            "parent_index": parent_seq,
         }
         return x_seq, w_seq, diagnostics, parent_seq
 

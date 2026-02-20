@@ -1,7 +1,5 @@
 """Shared base class for particle flow filters."""
 
-from typing import Dict
-
 import tensorflow as tf
 
 from src.filters.particle import ParticleFilter
@@ -158,8 +156,6 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         Returns:
           x_next: [B, N, dx]
           log_q: [B, N]
-          m_pred: [B, dx]
-          P_pred: [B, dx, dx]
         """
         mu_tilde, log_q0 = self._propagate_particles(x_prev, seed=seed)
         if w is None:
@@ -167,12 +163,10 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         else:
             w = tf.convert_to_tensor(w, dtype=mu_tilde.dtype)
         w = tf.math.divide_no_nan(w, tf.reduce_sum(w, axis=-1, keepdims=True))
-        m_pred = self.ssm.state_mean(mu_tilde, w)
-        P_pred = self.ssm.state_cov(mu_tilde, w)
         m, P = self._prior_from_sample(mu_tilde, w)
 
         x_next, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P, w=w)
-        return x_next, log_q0 - log_det, m_pred, P_pred
+        return x_next, log_q0 - log_det
 
     def warmup(self, batch_size=1, T=2, reweight=0, resample=0, y=None):
         """Trace the filter function to reduce first-call overhead."""
@@ -198,16 +192,13 @@ class FlowBase(ParticleFilter, LinearizationMixin):
           log_w_prev: [B, N]
           y_t: [B, dy]
         Returns:
-          x_pred: [B, N, dx]
+          x_pre: [B, N, dx]
           x_t: [B, N, dx]
           log_w_final: [B, N]
           w_final: [B, N]
           parent_indices: [B, N]
-          m_pred: [B, dx]
-          P_pred: [B, dx, dx]
-          x_pre: [B, N, dx]
-          w_pre: [B, N]
-          flow_diag: dict or None
+          log_w_pre: [B, N]
+          logz_t: [B]
         """
         reweight, resample = self._normalize_step_modes(reweight, resample)
         if reweight != 0 and not self._flow_supports_reweight():
@@ -226,11 +217,9 @@ class FlowBase(ParticleFilter, LinearizationMixin):
 
         w_prev = tf.exp(log_w_prev)
         w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
-        m_pred = self.ssm.state_mean(mu_tilde, w_prev)
-        P_pred = self.ssm.state_cov(mu_tilde, w_prev)
 
         m, P = self._prior_from_sample(mu_tilde, w_prev)
-        x_t, log_det, flow_diag = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
+        x_t, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
 
         # Importance reweighting with flow Jacobian correction (if supported).
         log_w = self._flow_reweight(
@@ -245,19 +234,18 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             reweight,
         )
 
-        log_w_norm, w, _ = self._log_normalize(log_w)
+        log_w_norm, w_pre, logz_t = self._log_normalize(log_w)
         x_pre = x_t
-        w_pre = w
 
         if resample in (1, 2):
-            ess = self.ess(w)
+            ess = self.ess(w_pre)
             N_float = tf.cast(self.num_particles, tf.float32)
             if resample == 2:
                 mask_do_rs = tf.ones_like(ess, dtype=tf.bool)
             else:
                 mask_do_rs = ess < (self.ess_threshold * N_float)
 
-            rs_indices = self.systematic_resample(w, self.ssm.rng)
+            rs_indices = self.systematic_resample(w_pre, self.ssm.rng)
             batch_shape_out = tf.shape(x_t)[:-2]
             no_rs_indices = tf.broadcast_to(
                 tf.range(self.num_particles, dtype=tf.int32),
@@ -269,7 +257,6 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             x_t = self.resample_particles(x_t, parent_indices)
             log_w_reset = -tf.math.log(N_float) * tf.ones_like(log_w_norm)
             log_w_final = tf.where(mask_do_rs, log_w_reset, log_w_norm)
-            w_final = tf.exp(log_w_final)
         else:
             batch_shape_out = tf.shape(x_t)[:-2]
             parent_indices = tf.broadcast_to(
@@ -277,18 +264,16 @@ class FlowBase(ParticleFilter, LinearizationMixin):
                 tf.concat([batch_shape_out, [self.num_particles]], axis=0),
             )
             log_w_final = log_w_norm
-            w_final = w
+        w_final = tf.exp(log_w_final)
+        log_w_pre = log_w_norm
         return (
-            mu_tilde,
+            x_pre,
             x_t,
             log_w_final,
             w_final,
             parent_indices,
-            m_pred,
-            P_pred,
-            x_pre,
-            w_pre,
-            flow_diag,
+            log_w_pre,
+            logz_t,
         )
 
     def filter(
@@ -331,45 +316,37 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         T = tf.shape(y)[1]
 
         x_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        x_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        w_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        w_prev_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        m_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        P_pred_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        parent_ta = tf.TensorArray(tf.int32, size=T, dynamic_size=False)
         x_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        flow_diag_keys = list(self._flow_diag_keys())
-        flow_diag_ta = tuple(tf.TensorArray(tf.float32, size=T, dynamic_size=False) for _ in flow_diag_keys)
-        def _write_flow_diag(flow_diag_ta, flow_diag, t):
-            if not flow_diag_keys:
-                return flow_diag_ta
-            return tuple(
-                ta.write(t, tf.cast(flow_diag[key], tf.float32))
-                for ta, key in zip(flow_diag_ta, flow_diag_keys)
-            )
+        w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        log_w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        log_w_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        parent_ta = tf.TensorArray(tf.int32, size=T, dynamic_size=False)
+        logz_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
 
         def _cond(t, _state):
             return t < T
 
         def _body(t, state):
             x_prev, log_w, tas = state
-            x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, x_pre_ta, flow_diag_ta = tas
-
-            y_t = y[..., t, :]
-            w_prev = tf.exp(log_w)
-            w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
             (
-                x_pred,
+                x_ta,
+                x_pre_ta,
+                w_ta,
+                log_w_ta,
+                log_w_pre_ta,
+                parent_ta,
+                logz_ta,
+            ) = tas
+
+            y_t = y[:, t, :]
+            (
+                x_pre,
                 x,
                 log_w,
                 w,
                 parent_indices,
-                m_pred,
-                P_pred,
-                x_pre,
-                w_pre,
-                flow_diag,
+                log_w_pre,
+                logz_t,
             ) = self.step(
                 x_prev,
                 log_w,
@@ -379,47 +356,69 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             )
             x_prev = x
 
-            x_pred_ta = x_pred_ta.write(t, x_pred)
+            x_pre_ta = x_pre_ta.write(t, x_pre)
             x_ta = x_ta.write(t, x)
             w_ta = w_ta.write(t, w)
-            w_pre_ta = w_pre_ta.write(t, w_pre)
-            w_prev_ta = w_prev_ta.write(t, w_prev)
-            m_pred_ta = m_pred_ta.write(t, m_pred)
-            P_pred_ta = P_pred_ta.write(t, P_pred)
+            log_w_ta = log_w_ta.write(t, log_w)
+            log_w_pre_ta = log_w_pre_ta.write(t, log_w_pre)
             parent_ta = parent_ta.write(t, parent_indices)
-            x_pre_ta = x_pre_ta.write(t, x_pre)
-            flow_diag_ta = _write_flow_diag(flow_diag_ta, flow_diag, t)
+            logz_ta = logz_ta.write(t, logz_t)
 
-            tas = (x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, x_pre_ta, flow_diag_ta)
+            tas = (
+                x_ta,
+                x_pre_ta,
+                w_ta,
+                log_w_ta,
+                log_w_pre_ta,
+                parent_ta,
+                logz_ta,
+            )
             return t + 1, (x_prev, log_w, tas)
 
-        tas = (x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, x_pre_ta, flow_diag_ta)
+        tas = (
+            x_ta,
+            x_pre_ta,
+            w_ta,
+            log_w_ta,
+            log_w_pre_ta,
+            parent_ta,
+            logz_ta,
+        )
         loop_state_invariants = (
             tf.TensorShape(None),
             tf.TensorShape(None),
-            (None, None, None, None, None, None, None, None, None, (None,) * len(flow_diag_keys)),
+            (None, None, None, None, None, None, None),
         )
-        _, (x_prev, log_w, tas) = tf.while_loop(
+        _, (_, _, tas) = tf.while_loop(
             _cond,
             _body,
             (tf.constant(0), (x_prev, log_w, tas)),
             shape_invariants=(tf.TensorShape([]), loop_state_invariants),
         )
-        x_ta, x_pred_ta, w_ta, w_pre_ta, w_prev_ta, m_pred_ta, P_pred_ta, parent_ta, x_pre_ta, flow_diag_ta = tas
+        (
+            x_ta,
+            x_pre_ta,
+            w_ta,
+            log_w_ta,
+            log_w_pre_ta,
+            parent_ta,
+            logz_ta,
+        ) = tas
 
         x_seq = self._stack_and_permute(x_ta, tail_dims=2)
         w_seq = self._stack_and_permute(w_ta, tail_dims=1)
+        log_w_seq = self._stack_and_permute(log_w_ta, tail_dims=1)
+        x_pre_seq = self._stack_and_permute(x_pre_ta, tail_dims=2)
+        log_w_pre_seq = self._stack_and_permute(log_w_pre_ta, tail_dims=1)
         parent_seq = self._stack_and_permute(parent_ta, tail_dims=1)
+        logz_seq = self._stack_and_permute(logz_ta, tail_dims=0)
 
         diagnostics = {
-            "m_pred": self._stack_and_permute(m_pred_ta, tail_dims=1),
-            "P_pred": self._stack_and_permute(P_pred_ta, tail_dims=2),
-            "x_pred": self._stack_and_permute(x_pred_ta, tail_dims=2),
-            "x_pre": self._stack_and_permute(x_pre_ta, tail_dims=2),
-            "w_pre": self._stack_and_permute(w_pre_ta, tail_dims=1),
-            "w_prev": self._stack_and_permute(w_prev_ta, tail_dims=1),
+            "x": x_seq,
+            "log_w": log_w_seq,
+            "log_z": logz_seq,
+            "x_pre": x_pre_seq,
+            "log_w_pre": log_w_pre_seq,
+            "parent_index": parent_seq,
         }
-        if flow_diag_keys:
-            for key, ta in zip(flow_diag_keys, flow_diag_ta):
-                diagnostics[key] = self._stack_and_permute(ta, tail_dims=0)
         return x_seq, w_seq, diagnostics, parent_seq
