@@ -13,25 +13,21 @@ def test_dpf_step_uses_default_bootstrap_proposal(lgssm_1d):
     log_w_prev = tf.fill([2, 16], -tf.math.log(tf.constant(16.0, dtype=tf.float32)))
     y_t = tf.random.normal([2, 1], dtype=tf.float32)
 
-    x_pred, x_t, log_w, w, parent, m_pred, P_pred, w_pre, logz_t, ess, resampled = dpf.step(
+    x_pre, x_t, log_w, w, parent, log_w_pre, logz_t = dpf.step(
         x_prev,
         log_w_prev,
         y_t,
         resample="never",
     )
 
-    assert x_pred.shape == (2, 16, 1)
+    assert x_pre.shape == (2, 16, 1)
     assert x_t.shape == (2, 16, 1)
     assert log_w.shape == (2, 16)
     assert w.shape == (2, 16)
     assert parent.shape == (2, 16)
-    assert m_pred.shape == (2, 1)
-    assert P_pred.shape == (2, 1, 1)
-    assert w_pre.shape == (2, 16)
+    assert log_w_pre.shape == (2, 16)
     assert logz_t.shape == (2,)
-    assert ess.shape == (2,)
-    assert resampled.shape == (2,)
-    assert_all_finite(x_pred, x_t, log_w, w, m_pred, P_pred, w_pre, logz_t, ess)
+    assert_all_finite(x_pre, x_t, log_w, w, log_w_pre, logz_t)
 
 
 def test_dpf_step_supports_callable_proposal_with_log_q(lgssm_1d):
@@ -52,9 +48,9 @@ def test_dpf_step_supports_callable_proposal_with_log_q(lgssm_1d):
     log_w_prev = tf.fill([1, 12], -tf.math.log(tf.constant(12.0, dtype=tf.float32)))
     y_t = tf.constant([[1.5]], dtype=tf.float32)
 
-    x_pred, *_ = dpf.step(x_prev, log_w_prev, y_t, resample="never")
+    x_pre, *_ = dpf.step(x_prev, log_w_prev, y_t, resample="never")
     expected = x_prev + 0.2 * y_t[:, tf.newaxis, :1]
-    tf.debugging.assert_near(x_pred, expected, atol=1e-6, rtol=1e-6)
+    tf.debugging.assert_near(x_pre, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_dpf_filter_supports_object_proposal(lgssm_1d):
@@ -74,4 +70,4 @@ def test_dpf_filter_supports_object_proposal(lgssm_1d):
     first_step_particles = x_seq[:, 0, :, 0]
     first_obs = y_traj[:, 0, 0][:, tf.newaxis]
     tf.debugging.assert_near(first_step_particles, first_obs, atol=1e-6, rtol=1e-6)
-    assert_all_finite(x_seq, w_seq, diagnostics["logZ_t"], diagnostics["logZ_total"])
+    assert_all_finite(x_seq, w_seq, diagnostics["log_z"], diagnostics["log_w_pre"])

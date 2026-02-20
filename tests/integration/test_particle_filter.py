@@ -3,12 +3,17 @@ import tensorflow as tf
 
 from src.filter import BootstrapParticleFilter, ExtendedKalmanFilter, UnscentedKalmanFilter
 from src.utility import weighted_mean
-from tests.testhelper import assert_all_finite, assert_step_time_shape
+from tests.testhelper import (
+    assert_all_finite,
+    assert_weights_valid,
+    assert_particles_shape,
+)
 
 pytestmark = pytest.mark.integration
 
 
 def test_particle_filter_runs_sv(sv_model):
+    """Bootstrap PF should run on stochastic volatility model."""
     T = 40
     batch_size = 2
 
@@ -20,21 +25,12 @@ def test_particle_filter_runs_sv(sv_model):
     dx = sv_model.state_dim
     N = pf.num_particles
 
-    assert x_particles.shape == (batch_size, T, N, dx)
-    assert w.shape == (batch_size, T, N)
+    assert_particles_shape(x_particles, batch_size, T, N, dx)
+    assert_weights_valid(w, batch_size, T, N)
     assert parent_indices.shape == (batch_size, T, N)
-    assert_step_time_shape(diagnostics["step_time_s"], T)
 
     ess = 1.0 / tf.reduce_sum(tf.square(w), axis=-1)
-    assert_all_finite(x_particles, w, ess, diagnostics["step_time_s"])
-
-    tf.debugging.assert_near(
-        tf.reduce_sum(w, axis=-1),
-        tf.ones([batch_size, T], dtype=w.dtype),
-        atol=1e-5,
-        rtol=1e-5,
-    )
-    tf.debugging.assert_greater_equal(tf.reduce_min(w), 0.0)
+    assert_all_finite(x_particles, w, ess)
 
 
 def test_particle_filter_sv_compares(sv_model):

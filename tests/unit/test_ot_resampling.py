@@ -76,14 +76,14 @@ def test_ot_resample_barycentric_outputs_uniform_weights_and_preserves_mean(lgss
     tf.debugging.assert_near(mean_out, mean_in, atol=2e-3, rtol=2e-3)
 
 
-def test_ot_resample_barycentric_supports_rank2_inputs(lgssm_1d):
+def test_ot_resample_barycentric_outputs_valid_for_batched_inputs(lgssm_1d):
     dpf = OTResamplingDPF(lgssm_1d, num_particles=3, resample="always")
-    x = tf.constant([[0.0], [1.0], [4.0]], dtype=tf.float32)
-    log_w = tf.math.log(tf.constant([0.7, 0.2, 0.1], dtype=tf.float32))
+    x = tf.constant([[[0.0], [1.0], [4.0]]], dtype=tf.float32)
+    log_w = tf.math.log(tf.constant([[0.7, 0.2, 0.1]], dtype=tf.float32))
 
     x_new, log_w_new, parent = dpf.ot_resample_barycentric(x, log_w)
 
     assert x_new.shape == x.shape
     assert log_w_new.shape == log_w.shape
-    assert parent.shape == (3,)
+    assert parent.shape == (1, 3)
     assert np.isfinite(np.asarray(x_new)).all()

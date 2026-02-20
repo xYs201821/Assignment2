@@ -1,7 +1,7 @@
 import numpy as np
 import tensorflow as tf
 
-from experiments.exp_dai22 import BearingOnlySSM
+from experiments.dai22.exp_dai22 import BearingOnlySSM
 
 
 def test_bearingonly_ssm_output_shapes():

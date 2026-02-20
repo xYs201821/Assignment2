@@ -4,6 +4,7 @@ import tensorflow as tf
 from src.filters.ot_resampling import OTResamplingDPF
 from tests.testhelper import (
     assert_all_finite,
+    assert_diagnostics_keys,
     assert_particles_shape,
     assert_weights_valid,
 )
@@ -33,11 +34,12 @@ def test_ot_resampling_dpf_runs_lgssm(lgssm_2d):
     assert_particles_shape(x_particles, batch_size, T, N, dx)
     assert_weights_valid(w, batch_size, T, N)
     assert parent_indices.shape == (batch_size, T, N)
-    assert diagnostics["resampled"].shape == (batch_size, T)
-    tf.debugging.assert_equal(diagnostics["resampled"], tf.ones([batch_size, T], dtype=tf.bool))
+    assert_diagnostics_keys(diagnostics, ["x", "log_w", "log_z", "x_pre", "log_w_pre", "parent_index"])
+    tf.debugging.assert_equal(diagnostics["parent_index"].shape, (batch_size, T, N))
 
-    ess = diagnostics["ess"]
-    assert_all_finite(x_particles, w, ess, diagnostics["logZ_t"], diagnostics["logZ_total"])
+    expected_w = tf.fill([batch_size, T, N], 1.0 / float(N))
+    tf.debugging.assert_near(w, expected_w, atol=1e-6, rtol=1e-6)
+    assert_all_finite(x_particles, w, diagnostics["log_z"], diagnostics["log_w_pre"])
 
 
 def test_ot_resampling_dpf_auto_mode_emits_valid_diagnostics(lgssm_1d):
@@ -59,8 +61,8 @@ def test_ot_resampling_dpf_auto_mode_emits_valid_diagnostics(lgssm_1d):
     assert x_particles.shape == (batch_size, T, 64, 1)
     assert w.shape == (batch_size, T, 64)
     assert parent_indices.shape == (batch_size, T, 64)
-    assert diagnostics["resampled"].dtype == tf.bool
-    assert diagnostics["resampled"].shape == (batch_size, T)
+    assert_diagnostics_keys(diagnostics, ["x", "log_w", "log_z", "x_pre", "log_w_pre", "parent_index"])
+    assert diagnostics["parent_index"].shape == (batch_size, T, 64)
 
     tf.debugging.assert_near(
         tf.reduce_sum(w, axis=-1),
@@ -68,7 +70,7 @@ def test_ot_resampling_dpf_auto_mode_emits_valid_diagnostics(lgssm_1d):
         atol=1e-5,
         rtol=1e-5,
     )
-    assert_all_finite(diagnostics["ess"], diagnostics["logZ_t"], diagnostics["logZ_total"])
+    assert_all_finite(diagnostics["log_z"], diagnostics["log_w_pre"])
 
 
 def test_ot_resampling_dpf_supports_runtime_proposal(lgssm_1d):
@@ -100,9 +102,9 @@ def test_ot_resampling_dpf_supports_runtime_proposal(lgssm_1d):
     assert x_particles.shape == (batch_size, T, 48, 1)
     assert w.shape == (batch_size, T, 48)
     assert parent_indices.shape == (batch_size, T, 48)
-    assert diagnostics["x_pred"].shape == (batch_size, T, 48, 1)
+    assert diagnostics["x_pre"].shape == (batch_size, T, 48, 1)
 
-    first_step_particles = diagnostics["x_pred"][:, 0, :, 0]
+    first_step_particles = diagnostics["x_pre"][:, 0, :, 0]
     first_obs = y_traj[:, 0, 0][:, tf.newaxis]
     tf.debugging.assert_near(first_step_particles, first_obs, atol=1e-6, rtol=1e-6)
-    assert_all_finite(x_particles, w, diagnostics["logZ_t"], diagnostics["logZ_total"])
+    assert_all_finite(x_particles, w, diagnostics["log_z"], diagnostics["log_w_pre"])
