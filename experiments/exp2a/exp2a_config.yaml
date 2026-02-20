@@ -2,10 +2,11 @@ experiment:
   output_root: results/exp2a_stochastic_vol
   T: 30
   batch_size: 100
-  seeds: [42, ]
+  seeds: [42]
   pair_particles: true
   calc_ekf_jacobian_error: false
   plot_show: false
+  eager: false
 model:
   alpha: 0.99
   mu: 0.1
@@ -13,10 +14,15 @@ model:
   obs_eps: 1e-16
   betas: [2.0]
   sigmas: [0.6]
-  obs_modes: [logy2, ]
+  obs_modes: [logy2]
 filters:
+  # `filters.*` is the canonical filter config namespace.
   methods:
     [edh, ledh, edh(pfpf), ledh(pfpf), edh(pfpf_opt), ledh(pfpf_opt), edh(opt), ledh(opt)]
+  model:
+    # Optional filter-side model.
+    # sigmas: [0.7]         # scalar/list, same rules as exp2b sweep
+    # obs_eps: 1e-12
   ukf:
     alpha: 1e-1
     beta: 2.0

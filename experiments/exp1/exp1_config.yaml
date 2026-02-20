@@ -2,8 +2,8 @@ experiment:
   output_root: results/exp1_linear_gaussian
   T: 20
   batch_size: 50
-  seeds: [42, ]
-  dims: [64,]
+  seeds: [42]
+  dims: [36]
   dy_ratio: 0.25
   plot_kflow_marginals: false
   plot_kflow_seed0_only: false
@@ -32,9 +32,22 @@ model:
   alpha1: 1.0
   beta: 20.0
   sigma_z: [0.5]
-  p0_scale: 1.0
+  p0_scale: 10.
 filters:
-  methods: [kf, pf, edh(pfpf), ledh(pfpf)]
+  # `filters.*` is the canonical filter config namespace.
+  methods:
+    [
+      edh(pfpf),
+      ledh(pfpf),
+      edh(pfpf_opt),
+      ledh(pfpf_opt),
+      stochastic_pf,
+    ]
+  model:
+    # Optional filter-side observation-noise sweep.
+    # length 1 => shared for all model.sigma_z;
+    # length == len(model.sigma_z) => one-by-one mapping.
+    # sigma_z: [0.6]
   ukf:
     alpha: 1e-1
     beta: 2.0
@@ -46,9 +59,25 @@ filters:
     reweight: always
   flow:
     num_particles: [500]
-    num_lambda: 100
+    num_lambda: 200
     ess_threshold: 0.5
     reweight: never
+    beta_schedule_opt:
+      mode: optimal
+      mu: 0.2
+      guard: true
+  stochastic_pf:
+    num_particles: 500
+    num_lambda: 200
+    ess_threshold: 0.5
+    reweight: never
+    resample: never
+    diffusion: 0.01
+    beta_schedule:
+      mode: optimal
+      mu: 0.2
+      guard: true
+    jitter: 1e-6
   kflow:
     optimizer: [adam]
     optimizer_eps: [1e-6]

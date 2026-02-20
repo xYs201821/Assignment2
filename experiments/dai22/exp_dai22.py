@@ -7,7 +7,7 @@ import csv
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -202,7 +202,9 @@ def main() -> None:
         reweight="never",
         beta_schedule=BetaScheduleConfig(mode="linear"),
     )
-    flow_base_transport = tf.function(flow_base._flow_transport)
+    flow_base_transport = tf.function(flow_base._flow_transport, reduce_retracing=True)
+    _ = flow_base_transport(x0_tf[:1], y_tf[:1], m0_tf[:1], P0_tf[:1])
+    ssm.rng = tf.random.Generator.from_seed(int(args.seed))
     x_post_base, _, _ = flow_base_transport(
         x0_tf,
         y_tf,
@@ -217,9 +219,11 @@ def main() -> None:
         num_particles=args.num_particles,
         diffusion=Q,
         reweight="never",
-        beta_schedule=BetaScheduleConfig(mode="optimal", mu=args.mu, guard="cond_f"),
+        beta_schedule=BetaScheduleConfig(mode="optimal", mu=args.mu, guard=True),
     )
-    flow_opt_transport = tf.function(flow_opt._flow_transport)
+    flow_opt_transport = tf.function(flow_opt._flow_transport, reduce_retracing=True)
+    _ = flow_opt_transport(x0_tf[:1], y_tf[:1], m0_tf[:1], P0_tf[:1])
+    ssm.rng = tf.random.Generator.from_seed(int(args.seed))
     x_post_opt, _, _ = flow_opt_transport(
         x0_tf,
         y_tf,

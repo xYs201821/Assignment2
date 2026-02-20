@@ -315,6 +315,30 @@ class LinearGaussianSSM(SSM):
         self.D = self._as_parameter(D, "D")
         self.m0 = self._as_parameter(m0, "m0")
         self.P0 = self._as_parameter(P0, "P0")
+        self.cov_eps_x = None
+        self.cov_eps_y = None
+        self.L0 = None
+        self.Lq = None
+        self.Lr = None
+        self.update_params()
+
+    def _refresh_covariances(self) -> None:
+        """Recompute covariances and Cholesky factors from current parameters."""
+        B = tf.convert_to_tensor(self.B, dtype=tf.float32)
+        D = tf.convert_to_tensor(self.D, dtype=tf.float32)
+        P0 = tf.convert_to_tensor(self.P0, dtype=tf.float32)
+
+        Q = tf.linalg.matmul(B, B, adjoint_b=True)
+        R = tf.linalg.matmul(D, D, adjoint_b=True)
+        Iq = tf.eye(tf.shape(Q)[-1], dtype=Q.dtype)
+        Ir = tf.eye(tf.shape(R)[-1], dtype=R.dtype)
+        Ip0 = tf.eye(tf.shape(P0)[-1], dtype=P0.dtype)
+
+        self.cov_eps_x = Q + self.jitter * Iq
+        self.cov_eps_y = R + self.jitter * Ir
+        self.L0 = tf.linalg.cholesky(P0 + self.jitter * Ip0)
+        self.Lq = tf.linalg.cholesky(self.cov_eps_x)
+        self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 
     def _as_parameter(self, value, name):
         """Store model parameters as tensors or trainable variables."""
@@ -322,6 +346,41 @@ class LinearGaussianSSM(SSM):
         if self.trainable:
             return tf.Variable(tensor, trainable=True, name=name)
         return tensor
+
+    def _set_parameter(self, name, value):
+        """Update a model parameter while preserving trainable variables when possible."""
+        if value is None:
+            return
+        tensor = tf.convert_to_tensor(value, dtype=tf.float32)
+        if self.trainable:
+            current = getattr(self, name, None)
+            if isinstance(current, tf.Variable) and current.shape == tensor.shape:
+                current.assign(tensor)
+            else:
+                setattr(self, name, tf.Variable(tensor, trainable=True, name=name))
+        else:
+            setattr(self, name, tensor)
+
+    def update_params(
+        self,
+        A=None,
+        B=None,
+        C=None,
+        D=None,
+        m0=None,
+        P0=None,
+        jitter=None,
+    ):
+        """Update model parameters and refresh derived covariances/factors."""
+        if jitter is not None:
+            self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
+        self._set_parameter("A", A)
+        self._set_parameter("B", B)
+        self._set_parameter("C", C)
+        self._set_parameter("D", D)
+        self._set_parameter("m0", m0)
+        self._set_parameter("P0", P0)
+        self._refresh_covariances()
 
     @property
     def state_dim(self):
@@ -342,39 +401,6 @@ class LinearGaussianSSM(SSM):
     def r_dim(self):
         """Observation noise dimension."""
         return int(self.D.shape[-1])
-
-    @property
-    def cov_eps_x(self):
-        """Process noise covariance Q = B B^T + jitter I."""
-        B = tf.convert_to_tensor(self.B, dtype=tf.float32)
-        Q = tf.linalg.matmul(B, B, adjoint_b=True)
-        I = tf.eye(tf.shape(Q)[-1], dtype=Q.dtype)
-        return Q + self.jitter * I
-
-    @property
-    def cov_eps_y(self):
-        """Observation noise covariance R = D D^T + jitter I."""
-        D = tf.convert_to_tensor(self.D, dtype=tf.float32)
-        R = tf.linalg.matmul(D, D, adjoint_b=True)
-        I = tf.eye(tf.shape(R)[-1], dtype=R.dtype)
-        return R + self.jitter * I
-
-    @property
-    def L0(self):
-        """Cholesky factor of initial covariance."""
-        P0 = tf.convert_to_tensor(self.P0, dtype=tf.float32)
-        I = tf.eye(tf.shape(P0)[-1], dtype=P0.dtype)
-        return tf.linalg.cholesky(P0 + self.jitter * I)
-
-    @property
-    def Lq(self):
-        """Cholesky factor of process covariance."""
-        return tf.linalg.cholesky(self.cov_eps_x)
-
-    @property
-    def Lr(self):
-        """Cholesky factor of observation covariance."""
-        return tf.linalg.cholesky(self.cov_eps_y)
 
     def initial_state_dist(self, shape, **kwargs):
         """Initial Gaussian state distribution.

@@ -1,0 +1,42 @@
+experiment:
+  output_root: results/exp3_transformer_pretrain
+  seeds: [0,]
+  T: 40
+  batch_size: 256
+  save_traces: false
+
+model:
+  state_dim: 25
+  obs_dim: 1
+  a_decay: 0.42
+  process_var: 1.0
+  obs_var: 1.0
+  p0_scale: 10.0
+  m0_value: 0.5
+
+proposal:
+  init_delta: 1.5
+  init_gamma: 1.5
+  init_noise_std: 0.05
+
+collect:
+  num_particles: 25
+  ess_threshold: 0.5
+
+train:
+  steps: 400
+  batch_size: 256
+  lr: 1.0e-3
+  log_every: 50
+  # loss: energy | gmm | hybrid
+  loss: hybrid
+  gmm_sigma: 1.0
+  gmm_symmetric: true
+  # Used only when loss=hybrid; total = alpha*energy + (1-alpha)*gmm
+  loss_mix_alpha: 0.7
+  d_model: 128
+  hidden: 128
+  num_heads: 4
+  num_encoder_layers: 2
+  num_decoder_layers: 1
+  dropout_rate: 0.1

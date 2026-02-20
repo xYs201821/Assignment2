@@ -2,28 +2,52 @@ from __future__ import annotations
 
 import argparse
 import sys
-from itertools import cycle, product
+from itertools import cycle
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import tensorflow as tf
-import yaml
 
-from experiments.exp_helper import (
+from experiments.common.exp_helper import (
+    SUMMARY_KEYS,
     aggregate_metrics_by_method,
     print_method_summary_table,
     print_metrics_compare,
     print_separator,
     record_metrics,
 )
-from experiments.exp_utils import build_init_dist, ensure_dir, save_npz, set_seed, tag_from_cfg
-from experiments.filter_cfg import build_filter_cfg
-from experiments.runner import run_filter
+from experiments.common.exp_utils import (
+    as_list,
+    build_init_dist,
+    cfg_section,
+    cfg_subsection,
+    ess_threshold_for_method,
+    ensure_dir,
+    ess_from_weights,
+    expand_sweep_values,
+    first_non_null,
+    get_summary_keys_and_prefixes,
+    is_particle_like_method,
+    load_config,
+    parse_percentile_band,
+    parse_positive_int_or_none,
+    particle_pairs,
+    resolve_filter_model_cfg,
+    resolve_plot_controls,
+    resolve_optional_float_list,
+    save_npz,
+    select_pre_resample_weights,
+    set_seed,
+    tag_from_cfg,
+)
+from experiments.common.filter_cfg import build_filter_cfg
+from experiments.common.plot_utils import plot_stability_over_time, plot_ess_over_time
+from experiments.common.runner import run_filter
 from src.metrics import rmse
 from src.motion_model import ConstantVelocityMotionModel
 from src.ssm import RangeBearingSSM
@@ -38,6 +62,7 @@ def build_ssm(
     cov_eps_x: np.ndarray,
     jitter: float,
     seed: int,
+    jacobian_r_min: Optional[float] = None,
 ) -> RangeBearingSSM:
     motion_model = ConstantVelocityMotionModel(
         dt=dt,
@@ -46,7 +71,13 @@ def build_ssm(
         jitter=jitter,
     )
     cov_eps_y = np.diag([sigma_r**2, sigma_theta ** 2]).astype(np.float32)
-    return RangeBearingSSM(motion_model=motion_model, cov_eps_y=cov_eps_y, jitter=jitter, seed=seed)
+    return RangeBearingSSM(
+        motion_model=motion_model,
+        cov_eps_y=cov_eps_y,
+        jitter=jitter,
+        seed=seed,
+        jacobian_r_min=jacobian_r_min,
+    )
 
 
 def build_initial_state(dist: float, init_cfg: Dict[str, Any]) -> np.ndarray:
@@ -73,6 +104,18 @@ def build_initial_cov(init_cfg: Dict[str, Any]) -> np.ndarray:
         diag = [1.0, 1.0, 0.5, 0.5]
     diag = np.array(diag, dtype=np.float32)
     return np.diag(diag)
+
+
+def build_initial_cov_filter(init_cfg: Dict[str, Any]) -> np.ndarray:
+    """Optional filter-specific initial covariance."""
+    P0 = init_cfg.get("P0_filter")
+    if P0 is not None:
+        return np.array(P0, dtype=np.float32)
+    diag = init_cfg.get("P0_diag_filter")
+    if diag is not None:
+        diag = np.array(diag, dtype=np.float32)
+        return np.diag(diag)
+    return build_initial_cov(init_cfg)
 
 
 def build_init_particles(
@@ -134,16 +177,7 @@ def _plot_state_trajectory(
     plt.close(fig)
 
 
-def _ess_from_weights(w: np.ndarray) -> Optional[np.ndarray]:
-    w_np = np.asarray(w, dtype=np.float64)
-    if w_np.ndim == 2:
-        w_np = w_np[np.newaxis, ...]
-    if w_np.ndim != 3:
-        return None
-    w_sum = np.sum(w_np, axis=-1, keepdims=True)
-    w_norm = np.divide(w_np, w_sum, out=np.zeros_like(w_np), where=w_sum > 0)
-    ess_t = 1.0 / np.sum(np.square(w_norm), axis=-1)
-    return ess_t
+# ess_from_weights moved to exp_utils.ess_from_weights
 
 
 def _impoverishment_from_parents(parents: np.ndarray) -> Optional[np.ndarray]:
@@ -160,127 +194,6 @@ def _impoverishment_from_parents(parents: np.ndarray) -> Optional[np.ndarray]:
         for t in range(T):
             unique_frac[b, t] = np.unique(parents_np[b, t]).size / float(N)
     return 1.0 - unique_frac
-
-
-def _plot_ess_over_time(
-    path: Path,
-    w: np.ndarray,
-    ess_threshold: Optional[float] = None,
-    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
-    show: bool = False,
-    title: Optional[str] = None,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    ess_t = _ess_from_weights(w)
-    if ess_t is None:
-        return
-    T = ess_t.shape[1]
-    t = np.arange(T)
-
-    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
-    ess_mean = np.mean(ess_t, axis=0)
-    ax.plot(t, ess_mean, color="C0", linewidth=1.6, label="ESS mean")
-    if ess_t.shape[0] > 1 and band_percentiles is not None:
-        p_lo, p_hi = band_percentiles
-        ess_lo = np.percentile(ess_t, p_lo, axis=0)
-        ess_hi = np.percentile(ess_t, p_hi, axis=0)
-        ax.fill_between(
-            t,
-            ess_lo,
-            ess_hi,
-            color="C0",
-            alpha=0.2,
-            label=f"ESS p{int(p_lo)}-p{int(p_hi)}",
-        )
-    if ess_threshold is not None:
-        N = np.asarray(w).shape[-1]
-        ax.axhline(
-            ess_threshold * float(N),
-            color="C3",
-            linestyle="--",
-            linewidth=1.0,
-            label="ESS threshold",
-        )
-    ax.set_xlabel("time")
-    ax.set_ylabel("ESS")
-    ax.grid(True, linestyle=":")
-    ax.legend(fontsize=8, loc="best")
-
-    if title:
-        fig.suptitle(title)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    if show:
-        plt.show()
-    plt.close(fig)
-
-
-def _plot_stability_series(
-    path: Path,
-    values: np.ndarray,
-    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
-    show: bool = False,
-    title: Optional[str] = None,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    arr = np.asarray(values)
-    if arr.ndim == 1:
-        mean = arr
-        lo = hi = None
-    else:
-        flat = arr.reshape(-1, arr.shape[-1])
-        mean = np.mean(flat, axis=0)
-        if band_percentiles is None:
-            lo = hi = None
-        else:
-            p_lo, p_hi = band_percentiles
-            lo = np.percentile(flat, p_lo, axis=0)
-            hi = np.percentile(flat, p_hi, axis=0)
-
-    t = np.arange(mean.shape[0])
-    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
-    ax.plot(t, mean, color="C0", linewidth=1.6)
-    if lo is not None and hi is not None:
-        ax.fill_between(t, lo, hi, color="C0", alpha=0.25, linewidth=0)
-    ax.set_xlabel("time")
-    ax.grid(True, linestyle=":")
-    if title:
-        ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    if show:
-        plt.show()
-    plt.close(fig)
-
-
-def _plot_stability_over_time(
-    output_dir: Path,
-    diagnostics: Dict[str, Any],
-    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
-    show: bool = False,
-) -> None:
-    key_specs = [
-        ("logdet_cov", "logdet_cov"),
-        ("condH_log10_max", "condH_log10"),
-        ("condJ_log10_max", "condJ_log10"),
-        ("condK_log10_max", "condK_log10"),
-        ("flow_norm_mean_max", "flow_norm_mean"),
-    ]
-    for key, label in key_specs:
-        val = diagnostics.get(key)
-        if val is None:
-            continue
-        title = f"stability_{label}"
-        path = output_dir / f"{title}.png"
-        _plot_stability_series(
-            path,
-            np.asarray(val),
-            band_percentiles=band_percentiles,
-            show=show,
-            title=title,
-        )
 
 
 def _plot_particle_cloud(
@@ -374,14 +287,6 @@ def _plot_particle_cloud(
     plt.close(fig)
 
 
-def _is_pf_method(method: str) -> bool:
-    method = str(method).lower()
-    return method in ("pf", "bootstrap") or method.startswith("pf")
-
-
-def _is_pfpf_flow_method(method: str) -> bool:
-    method = str(method).lower()
-    return "pfpf" in method and (method.startswith("edh") or method.startswith("ledh"))
 
 
 def _select_pre_resample_particles(out: Dict[str, Any]) -> Optional[np.ndarray]:
@@ -394,72 +299,9 @@ def _select_pre_resample_particles(out: Dict[str, Any]) -> Optional[np.ndarray]:
     return x_pre
 
 
-def _select_pre_resample_weights(out: Dict[str, Any]) -> Optional[np.ndarray]:
-    diagnostics = out.get("diagnostics", {}) if isinstance(out, dict) else {}
-    w_pre = diagnostics.get("w_pre")
-    if w_pre is None:
-        w_pre = out.get("w") if isinstance(out, dict) else None
-    return w_pre
 
 
-def _as_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]
-
-
-def _particle_pairs(
-    pf_particles: List[int],
-    flow_particles: List[int],
-    pair_particles: bool,
-) -> List[Tuple[int, int]]:
-    if not pf_particles and not flow_particles:
-        raise ValueError("num_particles must be set for pf/flow.")
-    if not pf_particles:
-        pf_particles = list(flow_particles)
-    if not flow_particles:
-        flow_particles = list(pf_particles)
-    if pair_particles:
-        if len(pf_particles) == 1 and len(flow_particles) > 1:
-            pf_particles = pf_particles * len(flow_particles)
-        if len(flow_particles) == 1 and len(pf_particles) > 1:
-            flow_particles = flow_particles * len(pf_particles)
-        if len(pf_particles) != len(flow_particles):
-            raise ValueError("pair_particles requires pf/flow lists of equal length.")
-        return list(zip(pf_particles, flow_particles))
-    return list(product(pf_particles, flow_particles))
-
-
-def _deep_set(cfg: Dict[str, Any], key: str, value: Any) -> None:
-    parts = [part for part in key.split(".") if part]
-    if not parts:
-        raise ValueError("override key cannot be empty")
-    node = cfg
-    for part in parts[:-1]:
-        if part not in node or not isinstance(node[part], dict):
-            node[part] = {}
-        node = node[part]
-    node[parts[-1]] = value
-
-
-def _apply_overrides(cfg: Dict[str, Any], overrides: List[str]) -> Dict[str, Any]:
-    for item in overrides:
-        if "=" not in item:
-            raise ValueError(f"override must be key=value, got '{item}'")
-        key, raw_value = item.split("=", 1)
-        value = yaml.safe_load(raw_value)
-        _deep_set(cfg, key.strip(), value)
-    return cfg
-
-
-def _load_config(path: Path, overrides: List[str]) -> Dict[str, Any]:
-    raw = path.read_text(encoding="utf-8")
-    cfg = yaml.safe_load(raw) or {}
-    if not isinstance(cfg, dict):
-        raise ValueError("config root must be a mapping")
-    return _apply_overrides(cfg, overrides)
+# Common config helpers are imported from exp_utils.
 
 
 def _parse_args() -> argparse.Namespace:
@@ -480,94 +322,154 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_model_cov(model_cfg: Dict[str, Any]) -> np.ndarray:
+    cov_eps_cfg = model_cfg.get("cov_eps")
+    if cov_eps_cfg is not None:
+        cov_eps_x = np.array(cov_eps_cfg, dtype=np.float32)
+        if cov_eps_x.shape != (4, 4):
+            raise ValueError("model.cov_eps must be a 4x4 matrix for range-bearing CV model")
+        return cov_eps_x
+    if "q_scale_v" not in model_cfg:
+        raise ValueError("Set model.cov_eps (4x4) or model.q_scale_v for range-bearing CV model")
+    q_scale_v = float(model_cfg.get("q_scale_v", 0.2))
+    return np.diag([0.0, 0.0, q_scale_v**2, q_scale_v**2]).astype(np.float32)
+
+
+def _resolve_filter_cov(
+    model_cfg: Dict[str, Any],
+    model_filter_cfg: Dict[str, Any],
+    cov_eps_x: np.ndarray,
+) -> np.ndarray:
+    cov_eps_filter_cfg = first_non_null(
+        model_filter_cfg.get("cov_eps"),
+        model_filter_cfg.get("cov_eps_x"),
+        model_cfg.get("cov_eps_filter"),
+        model_cfg.get("cov_eps_x_filter"),
+    )
+    if cov_eps_filter_cfg is None:
+        return cov_eps_x
+    cov_eps_x_filter = np.array(cov_eps_filter_cfg, dtype=np.float32)
+    if cov_eps_x_filter.shape != (4, 4):
+        raise ValueError("filters.model.cov_eps must be a 4x4 matrix for range-bearing CV model")
+    return cov_eps_x_filter
+
+
 def main() -> None:
     args = _parse_args()
-    cfg = _load_config(args.config, args.overrides)
+    cfg = load_config(args.config, args.overrides)
 
-    exp_cfg = cfg.get("experiment", {})
-    model_cfg = cfg.get("model", {})
-    filters_cfg = cfg.get("filters", {})
-    pf_cfg = filters_cfg.get("pf", {})
-    flow_cfg = filters_cfg.get("flow", {})
-    kflow_cfg = filters_cfg.get("kflow", {})
-    ukf_cfg = filters_cfg.get("ukf", {})
-    init_cfg = cfg.get("init", {})
+    exp_cfg = cfg_section(cfg, "experiment")
+    model_cfg = cfg_section(cfg, "model")
+    filters_cfg = cfg_section(cfg, "filters")
+    model_filter_cfg = resolve_filter_model_cfg(cfg, filters_cfg)
+    pf_cfg = cfg_subsection(filters_cfg, "pf", "filters")
+    flow_cfg = cfg_subsection(filters_cfg, "flow", "filters")
+    spf_cfg = cfg_subsection(filters_cfg, "stochastic_pf", "filters")
+    kflow_cfg = cfg_subsection(filters_cfg, "kflow", "filters")
+    ukf_cfg = cfg_subsection(filters_cfg, "ukf", "filters")
+    init_cfg = cfg_section(cfg, "init")
 
     out_root = Path(exp_cfg.get("output_root", "results/exp2b_range_bearing"))
     ensure_dir(out_root)
 
     T = int(exp_cfg.get("T", 80))
     batch_size = int(exp_cfg.get("batch_size", 1))
-    seeds = [int(s) for s in _as_list(exp_cfg.get("seeds", [0]))]
+    seeds = [int(s) for s in as_list(exp_cfg.get("seeds", [0]))]
     pair_particles = bool(exp_cfg.get("pair_particles", True))
     save_particles_seed0 = bool(exp_cfg.get("save_particles_seed0", True))
-    plot_state = bool(exp_cfg.get("plot_state", False))
-    plot_seed0_only = bool(exp_cfg.get("plot_seed0_only", True))
-    show_plots = bool(exp_cfg.get("show_plots", False))
-    plot_interactive = bool(exp_cfg.get("plot_interactive", False))
-    plot_time_gap = exp_cfg.get("plot_time_gap")
-    if plot_time_gap is not None:
-        plot_time_gap = int(plot_time_gap)
-        if plot_time_gap <= 0:
-            plot_time_gap = None
-    plot_pf_ess = bool(exp_cfg.get("plot_pf_ess", False))
-    plot_pf_ess_seed0_only = bool(exp_cfg.get("plot_pf_ess_seed0_only", True))
-    plot_pf_ess_show = bool(exp_cfg.get("plot_pf_ess_show", False))
-    plot_pf_degeneracy = bool(exp_cfg.get("plot_pf_degeneracy", False))
-    plot_pf_degeneracy_seed0_only = bool(exp_cfg.get("plot_pf_degeneracy_seed0_only", True))
-    plot_pf_degeneracy_show = bool(exp_cfg.get("plot_pf_degeneracy_show", False))
+    plot_controls = resolve_plot_controls(
+        exp_cfg,
+        [
+            ("plot_state", "plot_seed0_only", None),
+            ("plot_pf_ess", "plot_pf_ess_seed0_only", "plot_pf_ess_show"),
+            ("plot_pf_degeneracy", "plot_pf_degeneracy_seed0_only", "plot_pf_degeneracy_show"),
+            ("plot_stability", "plot_stability_seed0_only", "plot_stability_show"),
+        ],
+    )
+    plot_state = plot_controls["plot_state"]
+    plot_seed0_only = plot_controls["plot_seed0_only"]
+    show_plots = plot_controls["show_plots"]
+    plot_interactive = plot_controls["plot_interactive"]
+    plot_pf_ess = plot_controls["plot_pf_ess"]
+    plot_pf_ess_seed0_only = plot_controls["plot_pf_ess_seed0_only"]
+    plot_pf_ess_show = plot_controls["plot_pf_ess_show"]
+    plot_pf_degeneracy = plot_controls["plot_pf_degeneracy"]
+    plot_pf_degeneracy_seed0_only = plot_controls["plot_pf_degeneracy_seed0_only"]
+    plot_pf_degeneracy_show = plot_controls["plot_pf_degeneracy_show"]
+    plot_stability = plot_controls["plot_stability"]
+    plot_stability_seed0_only = plot_controls["plot_stability_seed0_only"]
+    plot_stability_show = plot_controls["plot_stability_show"]
+    plot_time_gap = parse_positive_int_or_none(exp_cfg.get("plot_time_gap"))
     plot_pf_degeneracy_times = [0, 9, 29]
     plot_pf_degeneracy_times = [t for t in plot_pf_degeneracy_times if 0 <= t < T]
-    plot_stability = bool(exp_cfg.get("plot_stability", False))
-    plot_stability_seed0_only = bool(exp_cfg.get("plot_stability_seed0_only", True))
-    plot_stability_show = bool(exp_cfg.get("plot_stability_show", False))
-    plot_stability_percentiles = exp_cfg.get("plot_stability_percentiles")
-    if plot_stability_percentiles is None:
-        plot_stability_percentiles = (25.0, 75.0)
-    else:
-        vals = list(plot_stability_percentiles) if isinstance(plot_stability_percentiles, (list, tuple)) else []
-        if len(vals) >= 2:
-            plot_stability_percentiles = (float(vals[0]), float(vals[1]))
-        else:
-            plot_stability_percentiles = (25.0, 75.0)
+    plot_stability_percentiles = parse_percentile_band(
+        exp_cfg.get("plot_stability_percentiles"),
+        (25.0, 75.0),
+    )
 
-    distances = [float(d) for d in _as_list(model_cfg.get("distances", [0.5, 2.0, 10.0]))]
-    sigma_thetas = [float(s) for s in _as_list(model_cfg.get("sigma_thetas", [1.0, 5.0, 15.0]))]
-    sigma_rs = [float(s) for s in _as_list(model_cfg.get("sigma_rs", [0.05, 0.2, 1.0]))]
+    summary_keys, exclude_prefixes = get_summary_keys_and_prefixes(exp_cfg, SUMMARY_KEYS)
+
+    distances = [float(d) for d in as_list(model_cfg.get("distances", [0.5, 2.0, 10.0]))]
+    sigma_thetas = [float(s) for s in as_list(model_cfg.get("sigma_thetas", [1.0, 5.0, 15.0]))]
+    sigma_rs = [float(s) for s in as_list(model_cfg.get("sigma_rs", [0.05, 0.2, 1.0]))]
+    sigma_thetas_filter = resolve_optional_float_list(
+        first_non_null(
+            model_filter_cfg.get("sigma_thetas"),
+            model_filter_cfg.get("sigma_theta"),
+            model_cfg.get("sigma_thetas_filter"),
+            model_cfg.get("sigma_theta_filter"),
+        )
+    )
+    sigma_rs_filter = resolve_optional_float_list(
+        first_non_null(
+            model_filter_cfg.get("sigma_rs"),
+            model_filter_cfg.get("sigma_r"),
+            model_cfg.get("sigma_rs_filter"),
+            model_cfg.get("sigma_r_filter"),
+        )
+    )
+    sigma_thetas_filter = expand_sweep_values(
+        sigma_thetas_filter,
+        sigma_thetas,
+        "filters.model.sigma_thetas",
+    )
+    sigma_rs_filter = expand_sweep_values(
+        sigma_rs_filter,
+        sigma_rs,
+        "filters.model.sigma_rs",
+    )
     dt = float(model_cfg.get("dt", 1.0))
     jitter = float(model_cfg.get("jitter", 1e-12))
-    cov_eps_cfg = model_cfg.get("cov_eps")
-    if cov_eps_cfg is not None:
-        cov_eps_x = np.array(cov_eps_cfg, dtype=np.float32)
-        if cov_eps_x.shape != (4, 4):
-            raise ValueError("model.cov_eps must be a 4x4 matrix for range-bearing CV model")
-    else:
-        if "q_scale_v" not in model_cfg:
-            raise ValueError("Set model.cov_eps (4x4) or model.q_scale_v for range-bearing CV model")
-        q_scale_v = float(model_cfg.get("q_scale_v", 0.2))
-        cov_eps_x = np.diag([0.0, 0.0, q_scale_v**2, q_scale_v**2]).astype(np.float32)
+    jacobian_r_min = model_cfg.get("jacobian_r_min")
+    if jacobian_r_min is not None:
+        jacobian_r_min = float(jacobian_r_min)
+    cov_eps_x = _resolve_model_cov(model_cfg)
+    cov_eps_x_filter = _resolve_filter_cov(model_cfg, model_filter_cfg, cov_eps_x)
+    jacobian_r_min_filter = model_filter_cfg.get("jacobian_r_min", jacobian_r_min)
+    if jacobian_r_min_filter is not None:
+        jacobian_r_min_filter = float(jacobian_r_min_filter)
 
+    methods_cfg = filters_cfg.get("methods")
     base_methods = [
         str(m).lower()
-        for m in _as_list(
-            filters_cfg.get(
-                "methods",
-                [
-                    "ekf",
-                    "ukf",
-                    "pf",
-                    "edh",
-                    "edh(pfpf)",
-                    "ledh",
-                    "ledh(pfpf)",
-                    "kflow_scalar",
-                    "kflow_diag",
-                ],
-            )
+        for m in as_list(
+            methods_cfg
+            if methods_cfg is not None
+            else [
+                "ekf",
+                "ukf",
+                "pf",
+                "edh",
+                "edh(pfpf)",
+                "ledh",
+                "ledh(pfpf)",
+                "kflow_scalar",
+                "kflow_diag",
+            ]
         )
     ]
-    pf_particles = [int(n) for n in _as_list(pf_cfg.get("num_particles", [200]))]
-    flow_particles = [int(n) for n in _as_list(flow_cfg.get("num_particles", [200]))]
+    pf_particles = [int(n) for n in as_list(pf_cfg.get("num_particles", [200]))]
+    flow_particles = [int(n) for n in as_list(flow_cfg.get("num_particles", [200]))]
 
     num_lambda_flow = int(flow_cfg.get("num_lambda", 20))
     pf_ess_threshold = float(pf_cfg.get("ess_threshold", 0.5))
@@ -579,16 +481,19 @@ def main() -> None:
     ukf_kappa = ukf_cfg.get("kappa")
     ukf_jitter = ukf_cfg.get("jitter")
 
-    particle_pairs = _particle_pairs(pf_particles, flow_particles, pair_particles)
+    pairs_list = particle_pairs(pf_particles, flow_particles, pair_particles)
 
     for dist in distances:
         x0 = build_initial_state(dist, init_cfg)
         m0 = build_initial_mean(x0, init_cfg)
         P0 = build_initial_cov(init_cfg)
-        init_dist = build_init_dist(m0, P0)
-        for sigma_theta in sigma_thetas:
-            for sigma_r in sigma_rs:
-                for N_pf, N_flow in particle_pairs:
+        P0_filter = build_initial_cov_filter(init_cfg)
+        init_dist = build_init_dist(m0, P0_filter)
+        for sigma_theta_idx, sigma_theta in enumerate(sigma_thetas):
+            for sigma_r_idx, sigma_r in enumerate(sigma_rs):
+                sigma_theta_filter = sigma_thetas_filter[sigma_theta_idx]
+                sigma_r_filter = sigma_rs_filter[sigma_r_idx]
+                for N_pf, N_flow in pairs_list:
                     cfg_tag = tag_from_cfg(
                         {
                             "dist": dist,
@@ -613,7 +518,9 @@ def main() -> None:
                         reweight_pf=pf_reweight,
                         reweight_flow=flow_reweight,
                         methods=base_methods,
+                        flow_cfg=flow_cfg,
                         kflow_cfg=kflow_cfg,
+                        stochastic_pf_cfg=spf_cfg,
                     )
                     metrics_across_seeds: Dict[str, List[Dict[str, Any]]] = {
                         method: [] for method in methods
@@ -627,7 +534,7 @@ def main() -> None:
                             and filter_cfg.get(method, {}).get("num_particles") is not None
                         }
                         init_particles_by_n = {
-                            n: build_init_particles(m0, P0, n, batch_size, seed)
+                            n: build_init_particles(m0, P0_filter, n, batch_size, seed)
                             for n in particle_counts
                         }
                         sim_ssm = build_ssm(
@@ -637,8 +544,19 @@ def main() -> None:
                             cov_eps_x=cov_eps_x,
                             jitter=jitter,
                             seed=seed,
+                            jacobian_r_min=jacobian_r_min,
+                        )
+                        filter_ssm = build_ssm(
+                            sigma_r=sigma_r_filter,
+                            sigma_theta=np.deg2rad(sigma_theta_filter),
+                            dt=dt,
+                            cov_eps_x=cov_eps_x_filter,
+                            jitter=jitter,
+                            seed=seed,
+                            jacobian_r_min=jacobian_r_min_filter,
                         )
                         x_true, y_obs = sim_ssm.simulate(T, shape=(batch_size,), x0=x0)
+                        rng_state = filter_ssm.rng.state.read_value()
 
                         per_seed_dir = out_root / cfg_tag / f"seed{seed}"
                         ensure_dir(per_seed_dir)
@@ -646,18 +564,12 @@ def main() -> None:
 
                         outputs: Dict[str, Dict[str, Any]] = {}
                         for method in methods:
-                            method_ssm = build_ssm(
-                                sigma_r=sigma_r,
-                                sigma_theta=np.deg2rad(sigma_theta),
-                                dt=dt,
-                                cov_eps_x=cov_eps_x,
-                                jitter=jitter,
-                                seed=seed,
-                            )
+                            filter_ssm.rng.state.assign(rng_state)
+                            method_ssm = filter_ssm
                             method_cfg = dict(filter_cfg.get(method, {}))
                             if method in ("kf", "kalman", "ekf", "ukf"):
                                 method_cfg["m0"] = m0
-                                method_cfg["P0"] = P0
+                                method_cfg["P0"] = P0_filter
                             else:
                                 method_cfg["init_dist"] = init_dist
                                 num_particles = method_cfg.get("num_particles")
@@ -696,19 +608,19 @@ def main() -> None:
                             metrics_by_method[method] = metrics
                             metrics_across_seeds[method].append(metrics)
 
-                            if _is_pf_method(method) or _is_pfpf_flow_method(method):
+                            if is_particle_like_method(method):
                                 if plot_pf_ess and (
                                     not plot_pf_ess_seed0_only or seed == seeds[0]
                                 ):
-                                    w_pre = _select_pre_resample_weights(out)
+                                    w_pre = select_pre_resample_weights(out)
                                     if w_pre is not None:
-                                        ess_threshold = (
-                                            pf_ess_threshold
-                                            if _is_pf_method(method)
-                                            else flow_ess_threshold
+                                        ess_threshold = ess_threshold_for_method(
+                                            method,
+                                            pf_ess_threshold,
+                                            flow_ess_threshold,
                                         )
                                         plot_path = method_dir / "pf_ess_over_time.png"
-                                        _plot_ess_over_time(
+                                        plot_ess_over_time(
                                             plot_path,
                                             w_pre,
                                             ess_threshold=ess_threshold,
@@ -718,7 +630,7 @@ def main() -> None:
                                     not plot_pf_degeneracy_seed0_only or seed == seeds[0]
                                 ):
                                     x_pre = _select_pre_resample_particles(out)
-                                    w_pre = _select_pre_resample_weights(out)
+                                    w_pre = select_pre_resample_weights(out)
                                     if x_pre is not None and w_pre is not None:
                                         plot_path = method_dir / "pf_particles_t0_9_29.png"
                                         _plot_particle_cloud(
@@ -739,11 +651,11 @@ def main() -> None:
                             diag["cov"] = out["cov"]
                             diff = x_true - out["mean"]
                             diag["rmse_t"] = tf.norm(diff, axis=-1)
-                            w_pre = _select_pre_resample_weights(out)
+                            w_pre = select_pre_resample_weights(out)
                             if w_pre is None:
                                 w_pre = out.get("w")
                             if w_pre is not None and not out.get("is_gaussian", False):
-                                ess_t = _ess_from_weights(np.asarray(w_pre))
+                                ess_t = ess_from_weights(np.asarray(w_pre))
                                 if ess_t is not None:
                                     diag["ess_t"] = ess_t
                                 parents = out.get("parents")
@@ -760,7 +672,7 @@ def main() -> None:
                             ):
                                 diag_src = out.get("diagnostics", {})
                                 if isinstance(diag_src, dict):
-                                    _plot_stability_over_time(
+                                    plot_stability_over_time(
                                         method_dir,
                                         diag_src,
                                         band_percentiles=plot_stability_percentiles,
@@ -768,9 +680,17 @@ def main() -> None:
                                     )
 
                         print_separator(f"exp2b_range_bearing {cfg_tag} seed{seed} summary")
-                        print_method_summary_table(metrics_by_method, method_order=tuple(methods))
+                        print_method_summary_table(
+                            metrics_by_method,
+                            method_order=tuple(methods),
+                            keys=summary_keys,
+                        )
                         print_separator(f"exp2b_range_bearing {cfg_tag} seed{seed} compare")
-                        print_metrics_compare(metrics_by_method, method_order=tuple(methods))
+                        print_metrics_compare(
+                            metrics_by_method,
+                            method_order=tuple(methods),
+                            exclude_prefixes=exclude_prefixes,
+                        )
 
                         if plot_state and (not plot_seed0_only or seed == seeds[0]):
                             plot_path = per_seed_dir / "state_trajectory.png"
@@ -789,9 +709,17 @@ def main() -> None:
                     if len(seeds) > 1:
                         mean_metrics = aggregate_metrics_by_method(metrics_across_seeds)
                         print_separator(f"exp2b_range_bearing {cfg_tag} avg summary")
-                        print_method_summary_table(mean_metrics, method_order=tuple(methods))
+                        print_method_summary_table(
+                            mean_metrics,
+                            method_order=tuple(methods),
+                            keys=summary_keys,
+                        )
                         print_separator(f"exp2b_range_bearing {cfg_tag} avg compare")
-                        print_metrics_compare(mean_metrics, method_order=tuple(methods))
+                        print_metrics_compare(
+                            mean_metrics,
+                            method_order=tuple(methods),
+                            exclude_prefixes=exclude_prefixes,
+                        )
 
 
 if __name__ == "__main__":

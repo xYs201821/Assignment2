@@ -4,8 +4,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import tensorflow as tf
 
-from experiments.exp_utils import ensure_dir, save_json
+from experiments.common.exp_utils import ensure_dir, save_json
 from src.metrics import evaluate as evaluate_metrics
 
 
@@ -15,6 +16,7 @@ def _is_scalar(value: Any) -> bool:
 
 SUMMARY_KEYS = (
     "rmse_state",
+    "rmse_vol",
     "rmse_obs",
     "rmse_y",
     "nll",
@@ -25,8 +27,10 @@ SUMMARY_KEYS = (
     "ess_final",
     "impoverishment_mean",
     "impoverishment_final",
-    "runtime.total_s",
-    "memory.peak_rss_mb",
+    "runtime.total",
+    "runtime.per_batch",
+    "memory.total",
+    "memory.per_batch",
 )
 SKIP_PRINT_KEYS = {"rank_hist"}
 
@@ -138,6 +142,100 @@ def aggregate_metrics_by_method(
     return {method: aggregate_metrics(vals) for method, vals in metrics_by_method.items()}
 
 
+def particle_mean(x_seq: tf.Tensor, w_seq: tf.Tensor) -> tf.Tensor:
+    return tf.einsum("btn,btnd->btd", w_seq, x_seq)
+
+
+def ess_stats_from_tensor(ess: tf.Tensor | None) -> Dict[str, Any]:
+    if ess is None:
+        return {
+            "ess_mean": float("nan"),
+            "ess_over_time": np.asarray([], dtype=np.float32),
+        }
+
+    ess_np = np.asarray(ess.numpy(), dtype=np.float32)
+    if ess_np.ndim == 1:
+        ess_np = ess_np[np.newaxis, :]
+    if ess_np.size == 0:
+        return {
+            "ess_mean": float("nan"),
+            "ess_over_time": ess_np,
+        }
+
+    return {
+        "ess_mean": float(np.mean(ess_np)),
+        "ess_over_time": ess_np,
+    }
+
+
+def ess_from_log_weights(log_w: tf.Tensor) -> tf.Tensor:
+    w = tf.exp(tf.convert_to_tensor(log_w, dtype=tf.float32))
+    return tf.math.divide_no_nan(1.0, tf.reduce_sum(tf.square(w), axis=-1))
+
+
+def resampled_from_parent_index(parent_index: tf.Tensor) -> tf.Tensor:
+    parent_index = tf.convert_to_tensor(parent_index, dtype=tf.int32)
+    n_particles = tf.shape(parent_index)[-1]
+    identity = tf.reshape(tf.range(n_particles, dtype=tf.int32), [1, 1, n_particles])
+    return tf.reduce_any(tf.not_equal(parent_index, identity), axis=-1)
+
+
+def _grad_snr_and_var(values: np.ndarray) -> tuple[float, float]:
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan"), float("nan")
+    grad_var = float(np.var(arr))
+    grad_snr = float(np.abs(np.mean(arr)) / (np.sqrt(max(grad_var, 0.0)) + 1e-8))
+    return grad_snr, grad_var
+
+
+def grad_metrics_from_history(grad_raw_hist: Any, window: int = 10) -> Dict[str, float]:
+    arr = np.asarray(grad_raw_hist, dtype=np.float32).reshape(-1)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {
+            "grad_snr_init": float("nan"),
+            "grad_snr_final": float("nan"),
+            "grad_var_init": float("nan"),
+            "grad_var_final": float("nan"),
+        }
+
+    win = min(max(int(window), 1), int(arr.size))
+    grad_snr_init, grad_var_init = _grad_snr_and_var(arr[:win])
+    grad_snr_final, grad_var_final = _grad_snr_and_var(arr[-win:])
+    return {
+        "grad_snr_init": grad_snr_init,
+        "grad_snr_final": grad_snr_final,
+        "grad_var_init": grad_var_init,
+        "grad_var_final": grad_var_final,
+    }
+
+
+def safe_nanmean(values: List[float]) -> float:
+    arr = np.asarray(values, dtype=np.float32)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    return float(np.mean(arr))
+
+
+def result_stage_metrics(result: Dict[str, Any], stage: str) -> Dict[str, float]:
+    if stage not in ("init", "final"):
+        raise ValueError("stage must be 'init' or 'final'.")
+    suffix = f"_{stage}"
+    return {
+        "loss": float(result[f"loss{suffix}"]),
+        "nll": float(result[f"nll{suffix}"]),
+        "rmse": float(result[f"rmse{suffix}"]),
+        "rmse_phi": float(result[f"rmse_phi{suffix}"]),
+        "ess_mean": float(result[f"ess_mean{suffix}"]),
+        "grad_snr": float(result[f"grad_snr{suffix}"]),
+        "grad_var": float(result[f"grad_var{suffix}"]),
+        "train_sec": float(result["runtime_train_sec"]),
+    }
+
+
 def print_separator(title: str, char: str = "=") -> None:
     line = char * 12
     print(f"{line} {title} {line}")
@@ -227,6 +325,7 @@ def print_method_summary(
 def print_metrics_compare(
     metrics_by_method: Dict[str, Dict[str, Any]],
     method_order: Optional[Tuple[str, ...]] = None,
+    exclude_prefixes: Optional[Tuple[str, ...]] = None,
     sep: str = " | ",
 ) -> None:
     if method_order is None:
@@ -244,6 +343,12 @@ def print_metrics_compare(
         },
         key=str,
     )
+    if exclude_prefixes:
+        keys = [
+            key
+            for key in keys
+            if not any(str(key).startswith(prefix) for prefix in exclude_prefixes)
+        ]
     header = ["metric", *method_order]
     rows: List[List[str]] = []
     for key in keys:

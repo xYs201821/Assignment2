@@ -6,12 +6,13 @@ import sys
 from typing import List
 
 _EXPERIMENTS = {
-    "exp1": "experiments.exp1_linear_gaussian",
-    "exp2a": "experiments.exp2a_stochastic_vol",
-    "exp2b": "experiments.exp2b_range_bearing",
-    "exp3": "experiments.exp3_multitarget_acoustic",
-    "exp4": "experiments.exp4_lorenz96",
-    "exp4_sim": "experiments.exp4_lorenz96_sim",
+    "exp1": "experiments.exp1.exp1_linear_gaussian",
+    "exp2a": "experiments.exp2a.exp2a_stochastic_vol",
+    "exp2b": "experiments.exp2b.exp2b_range_bearing",
+    "exp3": "experiments.exp3.exp3_lgssm_dpf",
+    "exp3tune": "experiments.exp3.exp3_tune",
+    "exp3pt": "experiments.exp3.exp3_transformer_pretrain",
+    "exp3plot": "experiments.exp3.plot_exp3_dpf_diagnostics",
 }
 
 

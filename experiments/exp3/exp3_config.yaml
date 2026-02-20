@@ -1,0 +1,87 @@
+experiment:
+  output_root: results/exp3_lgssm_dpf
+  seeds: [0, 1, 42, 123, 2026, 4242, 9999, 10000, 1024]
+  T: 40
+  batch_size: 32
+  save_traces: true
+
+model:
+  state_dim: 25
+  obs_dim: 1
+  a_decay: 0.42
+  process_var: 1.0
+  obs_var: 1.0
+  p0_scale: 10.0
+  m0_value: 0.5
+
+proposal:
+  init_delta: 1.5
+  init_gamma: 1.5
+  init_noise_std: 0.05
+
+training:
+  optimizer: adamw
+  steps: 400
+  lr: 2e-2
+  weight_decay: 0.01
+  beta1: 0.9
+  beta2: 0.98
+  amsgrad: true
+  grad_clip_norm: 100.0
+  log_every: 20
+  mc_samples: 4
+
+dpf:
+  methods: [kalman, pf, soft, ot, transformer, diffusion]
+
+  common:
+    num_particles: 25
+    ess_threshold: 0.5
+    resample: auto
+
+  kalman: {}
+  pf:
+    num_particles: 500
+
+  soft:
+    lam: 0.8
+
+  ot:
+    ot_epsilon: 0.05
+    ot_num_iters: 40
+    ot_jitter: 1e-6
+
+  diffusion:
+    diff_a: -0.0001
+    diff_T: 1.0
+    diff_steps: 20
+    diff_ode: true
+    diff_eps: 1e-6
+
+  transformer:
+    d_model: 128
+    hidden: 128
+    num_heads: 8
+    num_encoder_layers: 2
+    num_decoder_layers: 2
+    dropout_rate: 0.1
+    # If null, exp3 runs pretraining automatically.
+    # If -1 or false, exp3 skips pretraining and does not load weights.
+    pretrained_weights: null
+    # Supports placeholders: {experiment_dir}, {experiment_name}, {run_name}, {seed}
+    # Default keeps pretrain outputs inside the same experiment folder.
+    pretrain_output_root: "{experiment_dir}/transformer_pretrain"
+    # Optional overrides for auto pretraining:
+    pretrain_steps: 2000
+    pretrain_batch_size: 128
+    pretrain_lr: 1e-2
+    pretrain_log_every: 100
+    pretrain_loss: gmm
+    pretrain_sim_T: 40
+    pretrain_sim_batch_size: 256
+    freeze_resampler: true
+    train:
+      proposal_lr: 2e-2
+      resampler_lr: 5e-3
+    # Stop gradient through recurrent time state.
+    stop_grad_through_time: true

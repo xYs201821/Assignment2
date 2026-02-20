@@ -1,35 +1,63 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import numpy as np
 import tensorflow as tf
-import yaml
 
-from experiments.exp_helper import (
+from experiments.common.exp_helper import (
+    SUMMARY_KEYS,
     aggregate_metrics_by_method,
     print_method_summary_table,
     print_metrics_compare,
     print_separator,
     record_metrics,
 )
-from experiments.filter_cfg import build_filter_cfg
-from experiments.exp_utils import ensure_dir, save_npz, set_seed, tag_from_cfg
-from experiments.runner import run_filter
+from experiments.common.plot_utils import plot_stability_over_time
+from experiments.common.filter_cfg import build_filter_cfg
+from experiments.common.exp_utils import (
+    as_list,
+    clamp_time_index,
+    cfg_section,
+    cfg_subsection,
+    ess_threshold_for_method,
+    ensure_dir,
+    ess_from_weights,
+    expand_sweep_values,
+    first_non_null,
+    get_summary_keys_and_prefixes,
+    is_particle_like_method,
+    load_config,
+    parse_percentile_band,
+    particle_pairs,
+    resolve_filter_model_cfg,
+    resolve_optional_float_list,
+    save_npz,
+    select_pre_resample_weights,
+    set_seed,
+    tag_from_cfg,
+)
+from experiments.common.runner import run_filter
 from src.ssm import LinearGaussianSSM
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("exp1_config.yaml")
 
 
 def _sensor_grid_positions(dx: int) -> np.ndarray:
-    grid_size = int(np.sqrt(dx))
-    if grid_size * grid_size != dx:
-        raise ValueError(f"dx={dx} must be a perfect square for the spatial grid")
-    coords = np.arange(1, grid_size + 1, dtype=np.float32)
-    xx, yy = np.meshgrid(coords, coords, indexing="xy")
-    return np.stack([xx.ravel(), yy.ravel()], axis=1)
+    cols = int(np.ceil(np.sqrt(dx)))
+    rows = int(np.ceil(dx / cols))
+    x = np.arange(1, cols + 1, dtype=np.float32)
+    y = np.arange(1, rows + 1, dtype=np.float32)
+    xx, yy = np.meshgrid(x, y, indexing="xy")
+    coords = np.stack([xx.ravel(), yy.ravel()], axis=1)
+    return coords[:dx]
 
 
 def build_params(
@@ -273,16 +301,7 @@ def _plot_kflow_marginals(
     plt.close(fig)
 
 
-def _ess_from_weights(w: np.ndarray) -> Optional[np.ndarray]:
-    w_np = np.asarray(w, dtype=np.float64)
-    if w_np.ndim == 2:
-        w_np = w_np[np.newaxis, ...]
-    if w_np.ndim != 3:
-        return None
-    w_sum = np.sum(w_np, axis=-1, keepdims=True)
-    w_norm = np.divide(w_np, w_sum, out=np.zeros_like(w_np), where=w_sum > 0)
-    ess_t = 1.0 / np.sum(np.square(w_norm), axis=-1)
-    return ess_t
+# _ess_from_weights removed - now imported from exp_utils as ess_from_weights
 
 
 def _plot_pf_degeneracy(
@@ -393,7 +412,7 @@ def _plot_ess_over_time(
 ) -> None:
     import matplotlib.pyplot as plt
 
-    ess_t = _ess_from_weights(w)
+    ess_t = ess_from_weights(w)
     if ess_t is None:
         return
     T = ess_t.shape[1]
@@ -429,109 +448,7 @@ def _plot_ess_over_time(
     plt.close(fig)
 
 
-def _plot_stability_series(
-    path: Path,
-    values: np.ndarray,
-    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
-    show: bool = False,
-    title: Optional[str] = None,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    arr = np.asarray(values)
-    if arr.ndim == 1:
-        mean = arr
-        lo = hi = None
-    else:
-        flat = arr.reshape(-1, arr.shape[-1])
-        mean = np.mean(flat, axis=0)
-        if band_percentiles is None:
-            lo = hi = None
-        else:
-            p_lo, p_hi = band_percentiles
-            lo = np.percentile(flat, p_lo, axis=0)
-            hi = np.percentile(flat, p_hi, axis=0)
-
-    t = np.arange(mean.shape[0])
-    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
-    ax.plot(t, mean, color="C0", linewidth=1.6)
-    if lo is not None and hi is not None:
-        ax.fill_between(t, lo, hi, color="C0", alpha=0.25, linewidth=0)
-    ax.set_xlabel("time")
-    ax.grid(True, linestyle=":")
-    if title:
-        ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    if show:
-        plt.show()
-    plt.close(fig)
-
-
-def _plot_stability_over_time(
-    output_dir: Path,
-    diagnostics: Dict[str, Any],
-    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
-    show: bool = False,
-) -> None:
-    key_specs = [
-        ("logdet_cov", "logdet_cov"),
-        ("condH_log10_max", "condH_log10"),
-        ("condJ_log10_max", "condJ_log10"),
-        ("condK_log10_max", "condK_log10"),
-        ("flow_norm_mean_max", "flow_norm_mean"),
-    ]
-    for key, label in key_specs:
-        val = diagnostics.get(key)
-        if val is None:
-            continue
-        title = f"stability_{label}"
-        path = output_dir / f"{title}.png"
-        _plot_stability_series(
-            path,
-            np.asarray(val),
-            band_percentiles=band_percentiles,
-            show=show,
-            title=title,
-        )
-
-
-def _as_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]
-
-
-def _deep_set(cfg: Dict[str, Any], key: str, value: Any) -> None:
-    parts = [part for part in key.split(".") if part]
-    if not parts:
-        raise ValueError("override key cannot be empty")
-    node = cfg
-    for part in parts[:-1]:
-        if part not in node or not isinstance(node[part], dict):
-            node[part] = {}
-        node = node[part]
-    node[parts[-1]] = value
-
-
-def _apply_overrides(cfg: Dict[str, Any], overrides: List[str]) -> Dict[str, Any]:
-    for item in overrides:
-        if "=" not in item:
-            raise ValueError(f"override must be key=value, got '{item}'")
-        key, raw_value = item.split("=", 1)
-        value = yaml.safe_load(raw_value)
-        _deep_set(cfg, key.strip(), value)
-    return cfg
-
-
-def _load_config(path: Path, overrides: List[str]) -> Dict[str, Any]:
-    raw = path.read_text(encoding="utf-8")
-    cfg = yaml.safe_load(raw) or {}
-    if not isinstance(cfg, dict):
-        raise ValueError("config root must be a mapping")
-    return _apply_overrides(cfg, overrides)
+# Common config helpers are imported from exp_utils.
 
 
 def _parse_args() -> argparse.Namespace:
@@ -554,31 +471,49 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
-    cfg = _load_config(args.config, args.overrides)
+    cfg = load_config(args.config, args.overrides)
 
-    exp_cfg = cfg.get("experiment", {})
-    model_cfg = cfg.get("model", {})
-    filters_cfg = cfg.get("filters", {})
-    pf_cfg = filters_cfg.get("pf", {})
-    flow_cfg = filters_cfg.get("flow", {})
-    kflow_cfg = filters_cfg.get("kflow", {})
-    ukf_cfg = filters_cfg.get("ukf", {})
+    exp_cfg = cfg_section(cfg, "experiment")
+    model_cfg = cfg_section(cfg, "model")
+    filters_cfg = cfg_section(cfg, "filters")
+    model_filter_cfg = resolve_filter_model_cfg(cfg, filters_cfg)
+    pf_cfg = cfg_subsection(filters_cfg, "pf", "filters")
+    flow_cfg = cfg_subsection(filters_cfg, "flow", "filters")
+    spf_cfg = cfg_subsection(filters_cfg, "stochastic_pf", "filters")
+    kflow_cfg = cfg_subsection(filters_cfg, "kflow", "filters")
+    ukf_cfg = cfg_subsection(filters_cfg, "ukf", "filters")
 
     out_root = Path(exp_cfg.get("output_root", "results/exp1_linear_gaussian"))
     ensure_dir(out_root)
 
     T = int(exp_cfg.get("T", 60))
     batch_size = int(exp_cfg.get("batch_size", 1))
-    seeds = [int(s) for s in _as_list(exp_cfg.get("seeds", [42]))]
-    dims = [int(d) for d in _as_list(exp_cfg.get("dims", [4]))]
-    dy_values = _as_list(exp_cfg.get("dy"))
+    seeds = [int(s) for s in as_list(exp_cfg.get("seeds", [42]))]
+    dims = [int(d) for d in as_list(exp_cfg.get("dims", [4]))]
+    dy_values = as_list(exp_cfg.get("dy"))
     dy_ratio = float(exp_cfg.get("dy_ratio", 1.0))
 
-    pf_particles = [int(n) for n in _as_list(pf_cfg.get("num_particles", [100]))]
-    flow_particles = [int(n) for n in _as_list(flow_cfg.get("num_particles", [100]))]
+    pf_particles = [int(n) for n in as_list(pf_cfg.get("num_particles", [100]))]
+    flow_particles = [int(n) for n in as_list(flow_cfg.get("num_particles", [100]))]
+
+    methods_cfg = filters_cfg.get("methods")
     base_methods = [
         str(m).lower()
-        for m in _as_list(filters_cfg.get("methods", ["kf", "ekf", "ukf", "pf", "edh", "ledh"]))
+        for m in as_list(
+            methods_cfg
+            if methods_cfg is not None
+            else [
+                "kf",
+                "ekf",
+                "ukf",
+                "pf",
+                "edh",
+                "ledh",
+                "edh(pfpf_opt)",
+                "ledh(pfpf_opt)",
+                "stochastic_pf",
+            ]
+        )
     ]
     num_lambda_flow = int(flow_cfg.get("num_lambda", 20))
     pf_ess_threshold = float(pf_cfg.get("ess_threshold", 0.5))
@@ -609,35 +544,35 @@ def main() -> None:
     plot_stability = bool(exp_cfg.get("plot_stability", False))
     plot_stability_seed0_only = bool(exp_cfg.get("plot_stability_seed0_only", True))
     plot_stability_show = bool(exp_cfg.get("plot_stability_show", False))
-    plot_stability_percentiles = exp_cfg.get("plot_stability_percentiles")
-    if plot_stability_percentiles is None:
-        plot_stability_percentiles = (25.0, 75.0)
-    else:
-        vals = (
-            list(plot_stability_percentiles)
-            if isinstance(plot_stability_percentiles, (list, tuple))
-            else []
-        )
-        if len(vals) >= 2:
-            plot_stability_percentiles = (float(vals[0]), float(vals[1]))
-        else:
-            plot_stability_percentiles = (25.0, 75.0)
-    if plot_kflow_time is None:
-        plot_kflow_time = min(T - 1, 19)
-    plot_kflow_time = int(plot_kflow_time)
-    if T > 0:
-        plot_kflow_time = max(0, min(plot_kflow_time, T - 1))
-    if plot_pf_degeneracy_time is None:
-        plot_pf_degeneracy_time = min(T - 1, 19)
-    plot_pf_degeneracy_time = int(plot_pf_degeneracy_time)
-    if T > 0:
-        plot_pf_degeneracy_time = max(0, min(plot_pf_degeneracy_time, T - 1))
+    plot_stability_percentiles = parse_percentile_band(
+        exp_cfg.get("plot_stability_percentiles"),
+        (25.0, 75.0),
+    )
+    default_time = min(T - 1, 19)
+    plot_kflow_time = clamp_time_index(plot_kflow_time, default=default_time, T=T)
+    plot_pf_degeneracy_time = clamp_time_index(
+        plot_pf_degeneracy_time,
+        default=default_time,
+        T=T,
+    )
+
+    summary_keys, exclude_prefixes = get_summary_keys_and_prefixes(exp_cfg, SUMMARY_KEYS)
 
     alpha = float(model_cfg.get("alpha", 0.9))
     alpha0 = float(model_cfg.get("alpha0", 3.0))
     alpha1 = float(model_cfg.get("alpha1", 0.01))
     beta = float(model_cfg.get("beta", 20.0))
-    sigma_z_values = [float(v) for v in _as_list(model_cfg.get("sigma_z", [0.5]))]
+    sigma_z_values = [float(v) for v in as_list(model_cfg.get("sigma_z", [0.5]))]
+    sigma_z_filter_values = expand_sweep_values(
+        resolve_optional_float_list(
+            first_non_null(
+                model_filter_cfg.get("sigma_z"),
+                model_cfg.get("sigma_z_filter"),
+            )
+        ),
+        sigma_z_values,
+        "filters.model.sigma_z",
+    )
     p0_scale = float(model_cfg.get("p0_scale", 1e-3))
     for dx in dims:
         if dy_values:
@@ -646,7 +581,8 @@ def main() -> None:
             stride = int(round(1.0 / dy_ratio)) if dy_ratio > 0 else 4
             dy_candidates = [max(1, dx // max(1, stride))]
         for dy in dy_candidates:
-            for sigma_z in sigma_z_values:
+            for sigma_z_idx, sigma_z in enumerate(sigma_z_values):
+                sigma_z_filter = sigma_z_filter_values[sigma_z_idx]
                 params = build_params(
                     dx,
                     dy,
@@ -657,6 +593,18 @@ def main() -> None:
                     beta=beta,
                     p0_scale=p0_scale,
                 )
+                filter_params = params
+                if sigma_z_filter != sigma_z:
+                    filter_params = build_params(
+                        dx,
+                        dy,
+                        alpha=alpha,
+                        sigma_z=sigma_z_filter,
+                        alpha0=alpha0,
+                        alpha1=alpha1,
+                        beta=beta,
+                        p0_scale=p0_scale,
+                    )
                 for N_pf in pf_particles:
                     for N_flow in flow_particles:
                         cfg_tag = tag_from_cfg(
@@ -683,7 +631,9 @@ def main() -> None:
                             reweight_pf=pf_reweight,
                             reweight_flow=flow_reweight,
                             methods=base_methods,
+                            flow_cfg=flow_cfg,
                             kflow_cfg=kflow_cfg,
+                            stochastic_pf_cfg=spf_cfg,
                         )
                         metrics_across_seeds: Dict[str, List[Dict[str, Any]]] = {
                             method: [] for method in methods
@@ -691,10 +641,12 @@ def main() -> None:
                         for seed in seeds:
                             set_seed(seed)
                             sim_ssm = build_ssm(params, seed=seed)
+                            filter_ssm = build_ssm(filter_params, seed=seed)
                             x_true, y_obs = sim_ssm.simulate(
                                 T,
                                 shape=(batch_size,),
                             )
+                            rng_state = filter_ssm.rng.state.read_value()
 
                             per_seed_dir = out_root / cfg_tag / f"seed{seed}"
                             ensure_dir(per_seed_dir)
@@ -702,7 +654,8 @@ def main() -> None:
 
                             outputs: Dict[str, Dict[str, Any]] = {}
                             for method in methods:
-                                method_ssm = build_ssm(params, seed=seed)
+                                filter_ssm.rng.state.assign(rng_state)
+                                method_ssm = filter_ssm
                                 method_cfg = dict(filter_cfg.get(method, {}))
                                 if method in ("kf", "ekf", "ukf"):
                                     method_cfg["m0"] = params["m0"]
@@ -770,12 +723,12 @@ def main() -> None:
                                             )
 
                             metrics_by_method: Dict[str, Dict[str, Any]] = {}
-                            kf_out = outputs["kf"]
+                            kf_out = outputs.get("kf")
                             for method in methods:
                                 out = outputs[method]
                                 method_dir = per_seed_dir / method
                                 extra_metrics = None
-                                if method != "kf":
+                                if method != "kf" and kf_out is not None:
                                     mean_rmse, cov_rmse = kf_distance(kf_out, out)
                                     extra_metrics = {
                                         "kf_mean_rmse": mean_rmse,
@@ -793,17 +746,22 @@ def main() -> None:
                                 metrics_by_method[method] = metrics
                                 metrics_across_seeds[method].append(metrics)
 
-                                if method.startswith("pf"):
+                                if is_particle_like_method(method):
                                     if plot_pf_ess and (
                                         not plot_pf_ess_seed0_only or seed == seeds[0]
                                     ):
-                                        w = out.get("w")
-                                        if w is not None:
+                                        w_pre = select_pre_resample_weights(out)
+                                        if w_pre is not None:
+                                            ess_threshold = ess_threshold_for_method(
+                                                method,
+                                                pf_ess_threshold,
+                                                flow_ess_threshold,
+                                            )
                                             plot_path = method_dir / "pf_ess_over_time.png"
                                             _plot_ess_over_time(
                                                 plot_path,
-                                                w,
-                                                ess_threshold=pf_ess_threshold,
+                                                w_pre,
+                                                ess_threshold=ess_threshold,
                                                 show=plot_pf_ess_show,
                                             )
                                     if plot_pf_degeneracy and (
@@ -823,16 +781,17 @@ def main() -> None:
                                             plot_path = method_dir / (
                                                 f"pf_degeneracy_t{plot_pf_degeneracy_time}.png"
                                             )
-                                            _plot_pf_degeneracy(
-                                                plot_path,
-                                                pf_out=out,
-                                                gaussian_out=kf_out,
-                                                x_true=x_true,
-                                                obs_dim=obs_dim,
-                                                unobs_dim=unobs_dim,
-                                                t_index=plot_pf_degeneracy_time,
-                                                show=plot_pf_degeneracy_show,
-                                            )
+                                            if kf_out is not None:
+                                                _plot_pf_degeneracy(
+                                                    plot_path,
+                                                    pf_out=out,
+                                                    gaussian_out=kf_out,
+                                                    x_true=x_true,
+                                                    obs_dim=obs_dim,
+                                                    unobs_dim=unobs_dim,
+                                                    t_index=plot_pf_degeneracy_time,
+                                                    show=plot_pf_degeneracy_show,
+                                                )
 
                                 diag = {
                                     k: v
@@ -845,7 +804,7 @@ def main() -> None:
                                 diag["rmse_t"] = tf.norm(diff, axis=-1)
                                 w = out.get("w")
                                 if w is not None and not out.get("is_gaussian", False):
-                                    ess_t = _ess_from_weights(np.asarray(w))
+                                    ess_t = ess_from_weights(np.asarray(w))
                                     if ess_t is not None:
                                         diag["ess_t"] = ess_t
                                 save_npz(method_dir / "diagnostics.npz", **diag)
@@ -854,7 +813,7 @@ def main() -> None:
                                 ):
                                     diag_src = out.get("diagnostics", {})
                                     if isinstance(diag_src, dict):
-                                        _plot_stability_over_time(
+                                        plot_stability_over_time(
                                             method_dir,
                                             diag_src,
                                             band_percentiles=plot_stability_percentiles,
@@ -862,16 +821,32 @@ def main() -> None:
                                         )
 
                             print_separator(f"exp1_linear_gaussian {cfg_tag} seed{seed} summary")
-                            print_method_summary_table(metrics_by_method, method_order=tuple(methods))
+                            print_method_summary_table(
+                                metrics_by_method,
+                                method_order=tuple(methods),
+                                keys=summary_keys,
+                            )
                             print_separator(f"exp1_linear_gaussian {cfg_tag} seed{seed} compare")
-                            print_metrics_compare(metrics_by_method, method_order=tuple(methods))
+                            print_metrics_compare(
+                                metrics_by_method,
+                                method_order=tuple(methods),
+                                exclude_prefixes=exclude_prefixes,
+                            )
 
                         if len(seeds) > 1:
                             mean_metrics = aggregate_metrics_by_method(metrics_across_seeds)
                             print_separator(f"exp1_linear_gaussian {cfg_tag} avg summary")
-                            print_method_summary_table(mean_metrics, method_order=tuple(methods))
+                            print_method_summary_table(
+                                mean_metrics,
+                                method_order=tuple(methods),
+                                keys=summary_keys,
+                            )
                             print_separator(f"exp1_linear_gaussian {cfg_tag} avg compare")
-                            print_metrics_compare(mean_metrics, method_order=tuple(methods))
+                            print_metrics_compare(
+                                mean_metrics,
+                                method_order=tuple(methods),
+                                exclude_prefixes=exclude_prefixes,
+                            )
 
 
 if __name__ == "__main__":

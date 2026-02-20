@@ -3,15 +3,7 @@ from __future__ import annotations
 from itertools import product
 from typing import Any, Dict, Iterable, List, Tuple
 
-from experiments.exp_utils import tag_from_cfg
-
-
-def _as_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    return [value]
+from experiments.common.exp_utils import as_list, tag_from_cfg
 
 
 def _is_kflow_method(method: str) -> bool:
@@ -36,13 +28,13 @@ def _kflow_param_grid(
     num_particles_flow: int,
     num_lambda_flow: int,
 ) -> Dict[str, List[Any]]:
-    raw_particles = _as_list(kflow_cfg.get("num_particles"))
+    raw_particles = as_list(kflow_cfg.get("num_particles"))
     if not raw_particles:
         kflow_particles: List[Any] = [int(num_particles_flow)]
     else:
         kflow_particles = [None if v is None else int(v) for v in raw_particles]
 
-    raw_lambda = _as_list(kflow_cfg.get("num_lambda"))
+    raw_lambda = as_list(kflow_cfg.get("num_lambda"))
     if not raw_lambda:
         kflow_lambda: List[Any] = [int(num_lambda_flow)]
     else:
@@ -51,16 +43,16 @@ def _kflow_param_grid(
     grid = {
         "num_particles": kflow_particles,
         "num_lambda": kflow_lambda,
-        "ll_grad_mode": _as_list(kflow_cfg.get("ll_grad_mode")),
-        "alpha": _as_list(kflow_cfg.get("alpha")),
-        "alpha_update_every": _as_list(kflow_cfg.get("alpha_update_every")),
-        "ds_init": _as_list(kflow_cfg.get("ds_init")),
-        "optimizer": _as_list(kflow_cfg.get("optimizer")),
-        "optimizer_eps": _as_list(kflow_cfg.get("optimizer_eps")),
-        "optimizer_beta_1": _as_list(kflow_cfg.get("optimizer_beta_1")),
-        "optimizer_beta_2": _as_list(kflow_cfg.get("optimizer_beta_2")),
-        "max_flow_norm": _as_list(kflow_cfg.get("max_flow_norm")),
-        "localization_radius": _as_list(kflow_cfg.get("localization_radius")),
+        "ll_grad_mode": as_list(kflow_cfg.get("ll_grad_mode")),
+        "alpha": as_list(kflow_cfg.get("alpha")),
+        "alpha_update_every": as_list(kflow_cfg.get("alpha_update_every")),
+        "ds_init": as_list(kflow_cfg.get("ds_init")),
+        "optimizer": as_list(kflow_cfg.get("optimizer")),
+        "optimizer_eps": as_list(kflow_cfg.get("optimizer_eps")),
+        "optimizer_beta_1": as_list(kflow_cfg.get("optimizer_beta_1")),
+        "optimizer_beta_2": as_list(kflow_cfg.get("optimizer_beta_2")),
+        "max_flow_norm": as_list(kflow_cfg.get("max_flow_norm")),
+        "localization_radius": as_list(kflow_cfg.get("localization_radius")),
     }
     for key, values in grid.items():
         if key in ("num_particles", "num_lambda"):
