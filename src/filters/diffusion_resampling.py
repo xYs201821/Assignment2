@@ -22,6 +22,7 @@ class DiffusionResamplingDPF(DPFBase):
         diff_ode: bool = True,
         diff_eps: float = 1e-6,
         resample: str | int | bool = "auto",
+        stop_grad_through_time: bool = False,
         debug: bool = False,
         print: bool = False,
         proposal=None,
@@ -31,6 +32,7 @@ class DiffusionResamplingDPF(DPFBase):
             num_particles=num_particles,
             ess_threshold=ess_threshold,
             resample=resample,
+            stop_grad_through_time=stop_grad_through_time,
             debug=debug,
             print=print,
             proposal=proposal,
@@ -104,7 +106,7 @@ class DiffusionResamplingDPF(DPFBase):
 
         t0 = ts[0]
         T = ts[-1]
-        nsteps = tf.shape(ts)[0] - 1
+        nsteps = int(ts.shape[0]) - 1
         log2pi = tf.cast(tf.math.log(tf.constant(2.0 * np.pi, dtype=tf.float32)), x.dtype)
 
         seed = self.ssm._tfp_seed()

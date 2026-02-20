@@ -8,7 +8,7 @@ from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import IO, Any, Dict, List
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -72,8 +72,28 @@ SUMMARY_KEYS = (
 )
 
 
+_log_fh: "IO[str] | None" = None
+
+
+def _init_log_file(path: Path) -> None:
+    global _log_fh
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _log_fh = open(path, "a", buffering=1, encoding="utf-8")
+
+
 def _log(message: str) -> None:
     print(message, flush=True)
+    if _log_fh is not None:
+        try:
+            print(message, file=_log_fh, flush=True)
+        except Exception:
+            pass
+
+
+def _seed_tag(seed: int, method: str | None = None) -> str:
+    """Return a fixed-width seed prefix: [seed= 1024] or [seed= 1024][soft]."""
+    base = f"[seed={seed:>5}]"
+    return base if method is None else f"{base}[{method}]"
 
 
 def _current_gpu_memory_mb() -> tuple[float | None, float | None]:
@@ -89,6 +109,16 @@ def _current_gpu_memory_mb() -> tuple[float | None, float | None]:
         return current_mb, peak_mb
     except Exception:
         return None, None
+
+
+def _reset_gpu_peak() -> None:
+    """Reset GPU peak memory counter so each method reports its own peak."""
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+        if gpus:
+            tf.config.experimental.reset_memory_stats("GPU:0")
+    except Exception:
+        pass
 
 
 def _format_memory_mb(value: float | None) -> str:
@@ -452,12 +482,12 @@ def _maybe_init_transformer_from_pretrain(
     )
     if _is_skip_pretrain_token(path_value):
         _log(
-            f"[seed={seed}][transformer] pretrained_weights={path_value!r}, "
+            f"{_seed_tag(seed, 'transformer')} pretrained_weights={path_value!r}, "
             "skip pretrain and skip loading."
         )
         return None
     if path_value is None:
-        _log(f"[seed={seed}][transformer] pretrained_weights is None, running auto pretrain...")
+        _log(f"{_seed_tag(seed, 'transformer')} pretrained_weights is None, running auto pretrain...")
         weights_path = _auto_pretrain_transformer_weights(
             dpf=dpf,
             method_cfg=method_cfg,
@@ -620,6 +650,7 @@ def _build_dpf(
         ot_epsilon = float(cfg.get("ot_epsilon", cfg.get("epsilon", 0.1)))
         ot_num_iters = int(cfg.get("ot_num_iters", cfg.get("num_iters", 50)))
         ot_jitter = float(cfg.get("ot_jitter", 1e-6))
+        stop_grad_through_time = bool(cfg.get("stop_grad_through_time", False))
         return OTResamplingDPF(
             ssm,
             num_particles=num_particles,
@@ -628,6 +659,7 @@ def _build_dpf(
             ot_num_iters=ot_num_iters,
             ot_jitter=ot_jitter,
             resample=resample,
+            stop_grad_through_time=stop_grad_through_time,
             proposal=proposal,
         )
     if method == "diffusion":
@@ -636,6 +668,7 @@ def _build_dpf(
         diff_steps = int(cfg.get("diff_steps", 8))
         diff_ode = bool(cfg.get("diff_ode", True))
         diff_eps = float(cfg.get("diff_eps", 1e-6))
+        stop_grad_through_time = bool(cfg.get("stop_grad_through_time", False))
         return DiffusionResamplingDPF(
             ssm,
             num_particles=num_particles,
@@ -646,6 +679,7 @@ def _build_dpf(
             diff_ode=diff_ode,
             diff_eps=diff_eps,
             resample=resample,
+            stop_grad_through_time=stop_grad_through_time,
             proposal=proposal,
         )
     if method == "transformer":
@@ -793,8 +827,7 @@ def _run_baseline_method(
         proposal=proposal,
     )
     _log(
-        f"[seed={seed}][baseline] "
-        "fixed-phi baseline with phi=1 (no training)."
+        f"{_seed_tag(seed, 'baseline')} fixed-phi baseline with phi=1 (no training)."
     )
     _reset_filter_rng(fit_ssm, rng_base + 11)
     t_eval_init = time.perf_counter()
@@ -863,6 +896,7 @@ def _train_dpf(
 
     train_t0 = time.perf_counter()
     step_time_hist: deque[float] = deque(maxlen=max(1, int(log_every)))
+    mc_var_window: deque[float] = deque(maxlen=max(1, int(log_every)))
     for step in range(steps):
         step_t0 = time.perf_counter()
         loss_terms = []
@@ -897,6 +931,16 @@ def _train_dpf(
             loss = tf.add_n(loss_terms) / float(mc_samples)
         rmse_step_tensor = tf.add_n(rmse_terms) / float(mc_samples)
         ess_step_tensor = tf.add_n(ess_terms) / float(mc_samples)
+
+        # MC loss variance — monitoring only, stop_gradient so it never enters backprop
+        if mc_samples > 1:
+            mc_losses = tf.stack(
+                [tf.stop_gradient(t) for t in loss_terms], axis=0
+            )
+            mc_var_step = float(tf.math.reduce_variance(mc_losses).numpy())
+        else:
+            mc_var_step = 0.0
+        mc_var_window.append(mc_var_step)
 
         grads = tape.gradient(loss, train_vars)
         valid = [(g, v) for g, v in zip(grads, train_vars) if g is not None]
@@ -939,9 +983,10 @@ def _train_dpf(
             grad_raw_step = float(raw_grad_norm.numpy())
             grad_step = float(grad_norm.numpy())
             avg_step_sec = float(np.mean(step_time_hist))
+            mc_var_avg = float(np.mean(mc_var_window)) if mc_var_window else float("nan")
             gpu_mem_cur_mb, gpu_mem_peak_mb = _current_gpu_memory_mb()
             _log(
-                f"[seed={seed}][{method}] "
+                f"{_seed_tag(seed, method)} "
                 f"step {step + 1}/{steps} "
                 f"loss={loss_step:.5f} "
                 f"rmse={rmse_step:.5f} "
@@ -949,6 +994,7 @@ def _train_dpf(
                 f"ess={ess_step:.2f} "
                 f"g={grad_step:.4f} "
                 f"g_raw={grad_raw_step:.4f} "
+                f"mc_var={mc_var_avg:.4e} "
                 f"mc={mc_samples} "
                 f"gpu_mem={_format_memory_mb(gpu_mem_cur_mb)} "
                 f"gpu_peak={_format_memory_mb(gpu_mem_peak_mb)} "
@@ -1028,7 +1074,7 @@ def _run_trainable_dpf_method(
         dpf.resampler_net.trainable = not freeze_resampler
         if pretrained_weights_used is not None:
             _log(
-                f"[seed={seed}][{method}] "
+                f"{_seed_tag(seed, method)} "
                 f"loaded pretrained resampler weights: {pretrained_weights_used}"
             )
 
@@ -1060,12 +1106,12 @@ def _run_trainable_dpf_method(
     if resampler_vars:
         resampler_optimizer = _build_optimizer(train_cfg_eff, lr_override=resampler_lr)
         _log(
-            f"[seed={seed}][{method}] "
+            f"{_seed_tag(seed, method)} "
             f"proposal_lr={proposal_lr:.3e} resampler_lr={resampler_lr:.3e}"
         )
     else:
         _log(
-            f"[seed={seed}][{method}] "
+            f"{_seed_tag(seed, method)} "
             f"proposal_lr={proposal_lr:.3e}"
         )
 
@@ -1183,6 +1229,7 @@ def _run_single_seed(
     seed_ctx = _build_seed_context(seed, exp_cfg, model_cfg)
     x_true = seed_ctx.x_true
     y_obs = seed_ctx.y_obs
+    _reset_gpu_peak()
     method_out = _run_method_with_registry(
         method=method,
         seed=seed,
@@ -1399,10 +1446,11 @@ def _run_all_methods_for_seed(
         os.close(_saved_fd2)
 
     out_root_path = Path(out_root)
+    _init_log_file(out_root_path / f"seed{seed}.log")
     seed_results: Dict[str, Dict[str, Any]] = {}
-    _log(f"[seed={seed}] started with methods={methods}")
+    _log(f"{_seed_tag(seed)} started with methods={methods}")
     for method in methods:
-        _log(f"[seed={seed}][{method}] starting")
+        _log(f"{_seed_tag(seed, method)} starting")
         result = _run_single_seed(
             seed,
             exp_cfg,
@@ -1423,8 +1471,8 @@ def _run_all_methods_for_seed(
                 method=method,
                 result=result,
             )
-        _log(f"[seed={seed}][{method}] finished")
-    _log(f"[seed={seed}] all methods finished")
+        _log(f"{_seed_tag(seed, method)} finished")
+    _log(f"{_seed_tag(seed)} all methods finished")
     return {"seed": seed, "results": seed_results}
 
 
@@ -1448,6 +1496,7 @@ def run_lgssm_dpf_backprop(
     ).strip() or "exp3"
     out_root = base_out_root / experiment_name
     ensure_dir(out_root)
+    _init_log_file(out_root / "run.log")
     seeds = [int(s) for s in as_list(exp_cfg.get("seeds", [0]))]
     save_traces = bool(exp_cfg.get("save_traces", True))
     methods = _resolve_dpf_methods(dpf_cfg)
