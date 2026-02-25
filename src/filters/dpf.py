@@ -5,22 +5,11 @@ from __future__ import annotations
 import tensorflow as tf
 import tensorflow_probability as tfp
 
+from src.distributions import BootstrapProposal, Proposal
 from src.filters.particle import ParticleFilter
 import src.dtype_config as _dc
 
 tfd = tfp.distributions
-
-
-class _BootstrapProposal:
-    """Default prior proposal q(x_t|x_{t-1}, y_t) = f(x_t|x_{t-1})."""
-
-    def sample(self, ssm, x_prev, y_t, seed=None):
-        del y_t
-        return ssm.sample_transition(x_prev, seed=seed)
-
-    def log_prob(self, ssm, x, x_prev, y_t):
-        del y_t
-        return ssm.transition_dist(x_prev).log_prob(x)
 
 
 class DPFBase(ParticleFilter):
@@ -46,7 +35,7 @@ class DPFBase(ParticleFilter):
         )
         self.resample = self._normalize_reweight(resample)
         self.stop_grad_through_time = bool(stop_grad_through_time)
-        self.proposal = proposal if proposal is not None else _BootstrapProposal()
+        self.proposal = proposal if proposal is not None else BootstrapProposal()
 
     def set_proposal(self, proposal) -> None:
         """Set proposal.
@@ -55,9 +44,16 @@ class DPFBase(ParticleFilter):
           - callable(ssm, x_prev, y_t, seed=None) -> x_pred OR (x_pred, log_q)
           - object with .sample(ssm, x_prev, y_t, seed=None), optional .log_prob(...)
         """
-        self.proposal = proposal if proposal is not None else _BootstrapProposal()
+        self.proposal = proposal if proposal is not None else BootstrapProposal()
 
-    def update_params(self, num_particles=None, ess_threshold=None, resample=None, stop_grad_through_time=None, proposal=None):
+    def update_params(
+        self,
+        num_particles=None,
+        ess_threshold=None,
+        resample=None,
+        proposal=None,
+        stop_grad_through_time=None,
+    ):
         """Update runtime hyperparameters."""
         super().update_params(num_particles=num_particles, ess_threshold=ess_threshold)
         if resample is not None:
@@ -66,6 +62,8 @@ class DPFBase(ParticleFilter):
             self.stop_grad_through_time = bool(stop_grad_through_time)
         if proposal is not None:
             self.set_proposal(proposal)
+        if stop_grad_through_time is not None:
+            self.stop_grad_through_time = bool(stop_grad_through_time)
 
     @staticmethod
     def _normalize_proposal_output(out):
@@ -75,13 +73,22 @@ class DPFBase(ParticleFilter):
             return out[0], out[1]
         return out, None
 
-    def _sample_proposal(self, x_prev, y_t):
+    def _sample_proposal(self, x_prev, y_t, y_prev=None):
         seed = self.ssm._tfp_seed()
         proposal = self.proposal
         if callable(proposal):
             out = proposal(self.ssm, x_prev, y_t, seed=seed)
         elif hasattr(proposal, "sample"):
-            out = proposal.sample(self.ssm, x_prev, y_t, seed=seed)
+            if isinstance(proposal, Proposal):
+                out = proposal.sample(
+                    self.ssm,
+                    x_prev,
+                    y_t,
+                    seed=seed,
+                    y_prev=y_prev,
+                )
+            else:
+                out = proposal.sample(self.ssm, x_prev, y_t, seed=seed)
         else:
             raise TypeError("proposal must be callable or expose .sample(...).")
 
@@ -90,7 +97,16 @@ class DPFBase(ParticleFilter):
 
         if log_q is None and hasattr(proposal, "log_prob"):
             try:
-                log_q = proposal.log_prob(self.ssm, x_pred, x_prev, y_t)
+                if isinstance(proposal, Proposal):
+                    log_q = proposal.log_prob(
+                        self.ssm,
+                        x_pred,
+                        x_prev,
+                        y_t,
+                        y_prev=y_prev,
+                    )
+                else:
+                    log_q = proposal.log_prob(self.ssm, x_pred, x_prev, y_t)
             except (NotImplementedError, AttributeError):
                 # Some SSMs may not expose transition_dist/log_prob; in that case
                 # keep bootstrap semantics (no proposal correction).
@@ -205,10 +221,15 @@ class DPFBase(ParticleFilter):
         scale = self._regularized_cholesky(cov_eff)
         return tf.cast(tfd.MultivariateNormalTriL(loc=y_loc, scale_tril=scale).log_prob(y_obs), _dc.DTYPE)
 
-    def _transition_log_prob(self, x_prev: tf.Tensor, x_pred: tf.Tensor) -> tf.Tensor:
+    def _transition_log_prob(
+        self,
+        x_prev: tf.Tensor,
+        x_pred: tf.Tensor,
+        y_prev: tf.Tensor | None = None,
+    ) -> tf.Tensor:
         # Preferred path: exact transition density.
         try:
-            trans_dist = self.ssm.transition_dist(x_prev)
+            trans_dist = self.ssm.transition_dist(x_prev, y_prev=y_prev)
             if trans_dist is not None:
                 return tf.cast(trans_dist.log_prob(x_pred), _dc.DTYPE)
         except (NotImplementedError, AttributeError):
@@ -255,7 +276,7 @@ class DPFBase(ParticleFilter):
             tf.concat([batch_shape, [self.num_particles]], axis=0),
         )
 
-    def step(self, x_prev, log_w_prev, y_t, resample="auto",
+    def step(self, x_prev, log_w_prev, y_t, resample="auto", y_prev=None,
              training: bool | None = None):
         """One DPF step: propagate, weight, normalize, and optional resample.
 
@@ -263,6 +284,7 @@ class DPFBase(ParticleFilter):
           x_prev: [B, N, dx]
           log_w_prev: [B, N]
           y_t: [B, dy]
+          y_prev: [B, dy] (used by observation-driven transitions, if applicable)
         Returns:
           x_pre: [B, N, dx]
           x_t: [B, N, dx]
@@ -272,7 +294,11 @@ class DPFBase(ParticleFilter):
           log_w_pre: [B, N]
           logz_t: [B]
         """
-        x_pred, log_q = self._sample_proposal(x_prev, y_t)
+        x_pred, log_q = self._sample_proposal(
+            x_prev,
+            y_t,
+            y_prev=y_prev,
+        )
 
         loglik = self._observation_log_prob(x_pred, y_t)
         log_w = log_w_prev + tf.cast(loglik, _dc.DTYPE)
@@ -282,7 +308,11 @@ class DPFBase(ParticleFilter):
                 tf.shape(log_w_prev),
                 message="proposal log_q must have shape [B, N].",
             )
-            log_f = self._transition_log_prob(x_prev, x_pred)
+            log_f = self._transition_log_prob(
+                x_prev,
+                x_pred,
+                y_prev=y_prev,
+            )
             log_w = log_w + tf.cast(log_f - log_q, _dc.DTYPE)
         log_w_norm, w_pre, logz_t = self._log_normalize(log_w)
         ess = self.ess(w_pre)
@@ -393,6 +423,11 @@ class DPFBase(ParticleFilter):
             ) = tas
 
             y_t = y[:, t, :]
+            y_prev = tf.cond(
+                tf.equal(t, 0),
+                lambda: tf.zeros_like(y_t),
+                lambda: y[:, t - 1, :],
+            )
 
             (
                 x_pre,
@@ -407,6 +442,7 @@ class DPFBase(ParticleFilter):
                 log_w,
                 y_t,
                 resample=resample,
+                y_prev=y_prev,
                 training=training,
             )
             if bool(getattr(self, "stop_grad_through_time", False)):
