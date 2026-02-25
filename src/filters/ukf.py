@@ -4,6 +4,7 @@ import tensorflow as tf
 
 from src.filters.base import GaussianFilter
 from src.utility import block_diag, cholesky_solve, quadratic_matmul, tf_cond, weighted_mean
+import src.dtype_config as _dc
 
 
 class UnscentedKalmanFilter(GaussianFilter):
@@ -93,7 +94,7 @@ class UnscentedKalmanFilter(GaussianFilter):
         X_minus = m_exp - P_sqrt
 
         X = tf.concat([m_exp, X_plus, X_minus], axis=1)
-        return X, tf.convert_to_tensor(W_m, dtype=tf.float32), tf.convert_to_tensor(W_c, dtype=tf.float32)
+        return X, tf.convert_to_tensor(W_m, dtype=_dc.DTYPE), tf.convert_to_tensor(W_c, dtype=_dc.DTYPE)
     
     def propagate_sigma_points(self, func, X):
         """Apply nonlinear function to sigma points."""

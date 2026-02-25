@@ -4,6 +4,7 @@ import tensorflow as tf
 
 from src.filters.base import GaussianFilter
 from src.utility import cholesky_solve, quadratic_matmul
+import src.dtype_config as _dc
 
 
 class KalmanFilter(GaussianFilter):
@@ -107,6 +108,6 @@ class KalmanFilter(GaussianFilter):
     @staticmethod
     def _joseph_update(C, P, K, R):
         """Joseph-form covariance update."""
-        I = tf.eye(tf.shape(P)[-1], batch_shape=tf.shape(P)[:-2], dtype=P.dtype)
+        I = tf.eye(tf.shape(P)[-1], batch_shape=tf.shape(P)[:-2], dtype=_dc.DTYPE)
         I_KC = I - tf.linalg.matmul(K, C)
         return quadratic_matmul(I_KC, P, I_KC) + quadratic_matmul(K, R, K)

@@ -3,6 +3,7 @@
 import tensorflow as tf
 
 from src.utility import cholesky_solve, quadratic_matmul
+import src.dtype_config as _dc
 
 FILTER_PRINT_INFO = {
     "BaseFilter": {
@@ -103,8 +104,8 @@ class BaseFilter(tf.Module):
         if memory_sampler is None:
             return None, None
         return (
-            tf.TensorArray(dtype=tf.float32, size=size),
-            tf.TensorArray(dtype=tf.float32, size=size),
+            tf.TensorArray(dtype=_dc.DTYPE, size=size),
+            tf.TensorArray(dtype=_dc.DTYPE, size=size),
         )
 
     @staticmethod
@@ -131,10 +132,10 @@ class BaseFilter(tf.Module):
         sample = memory_sampler()
         rss, gpu = self._parse_memory_sample(sample)
         if rss is not None:
-            mem_rss_ta = mem_rss_ta.write(step, tf.cast(rss, tf.float32))
+            mem_rss_ta = mem_rss_ta.write(step, tf.cast(rss, _dc.DTYPE))
         if mem_gpu_ta is not None:
             gpu_val = 0.0 if gpu is None else gpu
-            mem_gpu_ta = mem_gpu_ta.write(step, tf.cast(gpu_val, tf.float32))
+            mem_gpu_ta = mem_gpu_ta.write(step, tf.cast(gpu_val, _dc.DTYPE))
         return mem_rss_ta, mem_gpu_ta
 
     def _finalize_memory(self, out, mem_rss_ta, mem_gpu_ta):
@@ -152,8 +153,8 @@ class GaussianFilter(BaseFilter):
     def __init__(self, ssm, joseph=True, debug=False, print=False):
         """Initialize Gaussian filter with process/observation noise covariances."""
         super().__init__(ssm, debug=debug, print=print)
-        self.cov_eps_x = tf.convert_to_tensor(ssm.cov_eps_x, dtype=tf.float32)
-        self.cov_eps_y = tf.convert_to_tensor(ssm.cov_eps_y, dtype=tf.float32)
+        self.cov_eps_x = tf.convert_to_tensor(ssm.cov_eps_x, dtype=_dc.DTYPE)
+        self.cov_eps_y = tf.convert_to_tensor(ssm.cov_eps_y, dtype=_dc.DTYPE)
         self.update = self.update_joseph if joseph else self.update_naive
         if type(self) is GaussianFilter:
             self._maybe_print()
@@ -161,12 +162,11 @@ class GaussianFilter(BaseFilter):
     def warmup(self, batch_size=1, T=2, y=None):
         """Trace and compile the filter function to avoid first-call overhead."""
         dy = int(self.ssm.obs_dim)
-        dtype = tf.float32
 
         if y is None:
-            y = tf.zeros([batch_size, T, dy], dtype)
+            y = tf.zeros([batch_size, T, dy], _dc.DTYPE)
         else:
-            y = tf.convert_to_tensor(y, dtype=dtype)
+            y = tf.convert_to_tensor(y, dtype=_dc.DTYPE)
             if len(y.shape) == 2:
                 y = y[tf.newaxis, :]
         _ = self.filter(y)
@@ -240,24 +240,24 @@ class GaussianFilter(BaseFilter):
           m_pred: [B, T, dx]
           P_pred: [B, T, dx, dx]
         """
-        y = tf.convert_to_tensor(y, dtype=tf.float32)
+        y = tf.convert_to_tensor(y, dtype=_dc.DTYPE)
         if len(y.shape) == 2:
             y = y[tf.newaxis, :]
         batch_size = tf.shape(y)[0]
         T = tf.shape(y)[1]
-        m_init = tf.convert_to_tensor(m0 if m0 is not None else self.ssm.m0, dtype=tf.float32)
+        m_init = tf.convert_to_tensor(m0 if m0 is not None else self.ssm.m0, dtype=_dc.DTYPE)
         if len(m_init.shape) == 1:
             m_init = m_init[tf.newaxis, :]
             m_init = tf.tile(m_init, [batch_size, 1])
-        P_init = tf.convert_to_tensor(P0 if P0 is not None else self.ssm.P0, dtype=tf.float32)
+        P_init = tf.convert_to_tensor(P0 if P0 is not None else self.ssm.P0, dtype=_dc.DTYPE)
         if len(P_init.shape) == 2:
             P_init = P_init[tf.newaxis, :, :]
             P_init = tf.tile(P_init, [batch_size, 1, 1])
 
-        m_filt_ta = tf.TensorArray(dtype=tf.float32, size=T, dynamic_size=False)
-        P_filt_ta = tf.TensorArray(dtype=tf.float32, size=T, dynamic_size=False)
-        m_pred_ta = tf.TensorArray(dtype=tf.float32, size=T, dynamic_size=False)
-        P_pred_ta = tf.TensorArray(dtype=tf.float32, size=T, dynamic_size=False)
+        m_filt_ta = tf.TensorArray(dtype=_dc.DTYPE, size=T, dynamic_size=False)
+        P_filt_ta = tf.TensorArray(dtype=_dc.DTYPE, size=T, dynamic_size=False)
+        m_pred_ta = tf.TensorArray(dtype=_dc.DTYPE, size=T, dynamic_size=False)
+        P_pred_ta = tf.TensorArray(dtype=_dc.DTYPE, size=T, dynamic_size=False)
 
         m_invar = tf.TensorShape(None)
         P_invar = tf.TensorShape(None)
@@ -326,6 +326,6 @@ class GaussianFilter(BaseFilter):
         Returns:
           P_new: [..., dx, dx]
         """
-        I = tf.eye(tf.shape(P)[-1], batch_shape=tf.shape(P)[:-2], dtype=P.dtype)
+        I = tf.eye(tf.shape(P)[-1], batch_shape=tf.shape(P)[:-2], dtype=_dc.DTYPE)
         I_KC = I - tf.linalg.matmul(K, C)
         return quadratic_matmul(I_KC, P, I_KC) + quadratic_matmul(K, R, K)

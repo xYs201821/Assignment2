@@ -3,6 +3,7 @@
 import tensorflow as tf
 
 from src.filters.base import BaseFilter
+import src.dtype_config as _dc
 
 
 class ParticleFilter(BaseFilter):
@@ -12,7 +13,7 @@ class ParticleFilter(BaseFilter):
         """Initialize particle count and ESS threshold."""
         super().__init__(ssm, debug=debug, print=print)
         self.num_particles = int(num_particles)
-        self.ess_threshold = tf.convert_to_tensor(ess_threshold, tf.float32)
+        self.ess_threshold = tf.convert_to_tensor(ess_threshold, _dc.DTYPE)
         self._maybe_print()
 
     def sample(self, ssm, x_prev, y_t, seed=None, **kwargs):
@@ -45,7 +46,7 @@ class ParticleFilter(BaseFilter):
         if num_particles is not None:
             self.num_particles = int(num_particles)
         if ess_threshold is not None:
-            self.ess_threshold = tf.convert_to_tensor(ess_threshold, tf.float32)
+            self.ess_threshold = tf.convert_to_tensor(ess_threshold, _dc.DTYPE)
 
     @staticmethod
     def _normalize_init_seed(seed):
@@ -76,7 +77,7 @@ class ParticleFilter(BaseFilter):
         N = self.num_particles
         seed = self._normalize_init_seed(init_seed)
         if init_particles is not None:
-            x = tf.convert_to_tensor(init_particles, dtype=tf.float32)
+            x = tf.convert_to_tensor(init_particles, dtype=_dc.DTYPE)
             if x.shape.rank == 2:
                 x = x[tf.newaxis, ...]
             if x.shape.rank != 3:
@@ -189,7 +190,7 @@ class ParticleFilter(BaseFilter):
         Returns:
           y: [B, T, dy]
         """
-        y = tf.convert_to_tensor(y, tf.float32)
+        y = tf.convert_to_tensor(y, _dc.DTYPE)
         if y.shape.rank == 2:
             y = y[tf.newaxis, ...]
         return y

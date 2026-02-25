@@ -6,6 +6,7 @@ import numpy as np
 import tensorflow as tf
 
 from src.filters.dpf import DPFBase
+import src.dtype_config as _dc
 
 
 class DiffusionResamplingDPF(DPFBase):
@@ -54,8 +55,8 @@ class DiffusionResamplingDPF(DPFBase):
         if self.diff_eps <= 0.0:
             raise ValueError("diff_eps must be positive.")
 
-    def _time_grid(self, dtype: tf.DType) -> tf.Tensor:
-        return tf.linspace(tf.cast(0.0, dtype), tf.cast(self.diff_T, dtype), self.diff_steps + 1)
+    def _time_grid(self) -> tf.Tensor:
+        return tf.linspace(tf.cast(0.0, _dc.DTYPE), tf.cast(self.diff_T, _dc.DTYPE), self.diff_steps + 1)
 
     def update_params(
         self,
@@ -87,11 +88,12 @@ class DiffusionResamplingDPF(DPFBase):
             self.diff_eps = float(diff_eps)
         self._validate_diffusion_cfg()
 
-    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor):
+    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor,
+                      training: bool | None = None):
         """Diffusion differentiable resampling core implementation."""
-        ts = self._time_grid(x.dtype)
-        eps_t = tf.cast(self.diff_eps, x.dtype)
-        a_t = tf.cast(self.diff_a, x.dtype)
+        ts = self._time_grid()
+        eps_t = tf.cast(self.diff_eps, _dc.DTYPE)
+        a_t = tf.cast(self.diff_a, _dc.DTYPE)
         ode = self.diff_ode
         #log_w = tf.stop_gradient(log_w)
         log_w = log_w - tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
@@ -107,17 +109,18 @@ class DiffusionResamplingDPF(DPFBase):
         t0 = ts[0]
         T = ts[-1]
         nsteps = int(ts.shape[0]) - 1
-        log2pi = tf.cast(tf.math.log(tf.constant(2.0 * np.pi, dtype=tf.float32)), x.dtype)
+        min_t_fwd = ts[1] - ts[0]
+        log2pi = tf.cast(tf.math.log(tf.constant(2.0 * np.pi, dtype=_dc.DTYPE)), _dc.DTYPE)
 
         seed = self.ssm._tfp_seed()
         split = tf.random.experimental.stateless_split(seed, num=3)
-        eps0 = tf.random.stateless_normal(tf.shape(x), seed=split[0], dtype=x.dtype)
+        eps0 = tf.random.stateless_normal(tf.shape(x), seed=split[0], dtype=_dc.DTYPE)
         if not ode:
             rnd_shape = tf.concat([tf.reshape(nsteps, [1]), tf.shape(x)], axis=0)
-            rnds = tf.random.stateless_normal(rnd_shape, seed=split[1], dtype=x.dtype)
+            rnds = tf.random.stateless_normal(rnd_shape, seed=split[1], dtype=_dc.DTYPE)
 
-        x_t = mu + tf.sqrt(stat_vars) * eps0
-        final_alps = tf.zeros([tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[1]], dtype=x.dtype)
+        x_t = mu + tf.sqrt(stat_vars) * eps0 # pi_ref
+        final_alps = tf.zeros([tf.shape(x)[0], tf.shape(x)[1], tf.shape(x)[1]], dtype=_dc.DTYPE)
 
         def _ensemble_score(curr_x: tf.Tensor, t_fwd: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
             delta = t_fwd - t0
@@ -148,22 +151,42 @@ class DiffusionResamplingDPF(DPFBase):
         for k in tf.range(nsteps):
             t_prev = ts[k]
             dt = ts[k + 1] - t_prev
-            score, alps = _ensemble_score(x_t, T - t_prev)
+            t_fwd = T - t_prev
+
+            score, alps = _ensemble_score(x_t, t_fwd)
             alps = tf.ensure_shape(alps, final_alps.shape)
             final_alps = alps
 
             if ode:
-                f = a_t * mu + 0.5 * (b2 * score)
-            else:
-                f = a_t * mu + (b2 * score)
-            drift = -a_t * x_t + f
-            x_t = x_t + drift * dt
+                f1 = a_t * mu + 0.5 * (b2 * score)
+                drift1 = -a_t * x_t + f1
+                x_pred = x_t + drift1 * dt
 
-            if not ode:
-                x_t = x_t + tf.sqrt(dt) * tf.sqrt(b2) * rnds[k]
+                t_fwd_next = tf.maximum(T - ts[k + 1], min_t_fwd)
+                score2, alps2 = _ensemble_score(x_pred, t_fwd_next)
+                alps2 = tf.ensure_shape(alps2, final_alps.shape)
+                final_alps = alps2
+                f2 = a_t * mu + 0.5 * (b2 * score2)
+                drift2 = -a_t * x_pred + f2
+
+                x_t = x_t + 0.5 * (drift1 + drift2) * dt # heun method
+            else:
+                f1 = a_t * mu + (b2 * score)
+                drift1 = -a_t * x_t + f1
+                noise = tf.sqrt(dt) * tf.sqrt(b2) * rnds[k]
+                x_pred = x_t + drift1 * dt + noise
+
+                t_fwd_next = tf.maximum(T - ts[k + 1], min_t_fwd)
+                score2, alps2 = _ensemble_score(x_pred, t_fwd_next)
+                alps2 = tf.ensure_shape(alps2, final_alps.shape)
+                final_alps = alps2
+                f2 = a_t * mu + (b2 * score2)
+                drift2 = -a_t * x_pred + f2
+
+                x_t = x_t + 0.5 * (drift1 + drift2) * dt + noise
 
         n_particles = tf.shape(x_t)[-2]
-        log_uniform = -tf.math.log(tf.cast(n_particles, x.dtype))
+        log_uniform = -tf.math.log(tf.cast(n_particles, _dc.DTYPE))
         log_w_new = tf.fill(tf.shape(log_w), log_uniform)
         parent_indices = tf.argmax(final_alps, axis=-1, output_type=tf.int32)
         x_t = tf.ensure_shape(x_t, x.shape)
@@ -186,6 +209,7 @@ class DiffusionResamplingDPF(DPFBase):
         init_dist=None,
         init_seed=None,
         init_particles=None,
+        training: bool | None = None,
     ):
         if any(
             v is not None
@@ -221,6 +245,7 @@ class DiffusionResamplingDPF(DPFBase):
             init_dist=init_dist,
             init_seed=init_seed,
             init_particles=init_particles,
+            training=training,
         )
 
 

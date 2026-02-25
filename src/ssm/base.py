@@ -5,6 +5,7 @@ import tensorflow_probability as tfp
 import numpy as np
 
 from src.utility import weighted_mean
+import src.dtype_config as _dc
 
 tfd = tfp.distributions
 
@@ -92,7 +93,7 @@ class SSM(tf.Module):
         W: [..., num] or [num]
         returns: [..., dim, dim]
         """
-        X = tf.convert_to_tensor(X, dtype=tf.float32)
+        X = tf.convert_to_tensor(X, dtype=_dc.DTYPE)
         if W is None:
             W = tf.ones(tf.shape(X)[:-1], dtype=X.dtype)
 
@@ -203,7 +204,7 @@ class SSM(tf.Module):
         if x0 is None:
             x = self.sample_initial_state(shape)
         else:
-            x0 = tf.convert_to_tensor(x0, dtype=tf.float32)
+            x0 = tf.convert_to_tensor(x0, dtype=_dc.DTYPE)
             shape = tf.convert_to_tensor(shape, dtype=tf.int32)
             x = tf.broadcast_to(
                 tf.reshape(x0, tf.concat([tf.ones_like(shape), [self.state_dim]], axis=0)),
@@ -307,7 +308,9 @@ class LinearGaussianSSM(SSM):
     def __init__(self, A, B, C, D, m0, P0, jitter=1e-6, seed=42, trainable=False):
         """Initialize linear model matrices and noise covariances."""
         super().__init__(seed)
-        self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
+        if jitter is None:
+            jitter = _dc.JITTER
+        self.jitter = tf.convert_to_tensor(jitter, dtype=_dc.DTYPE)
         self.trainable = bool(trainable)
         self.A = self._as_parameter(A, "A")
         self.B = self._as_parameter(B, "B")
@@ -324,9 +327,9 @@ class LinearGaussianSSM(SSM):
 
     def _refresh_covariances(self) -> None:
         """Recompute covariances and Cholesky factors from current parameters."""
-        B = tf.convert_to_tensor(self.B, dtype=tf.float32)
-        D = tf.convert_to_tensor(self.D, dtype=tf.float32)
-        P0 = tf.convert_to_tensor(self.P0, dtype=tf.float32)
+        B = tf.convert_to_tensor(self.B, dtype=_dc.DTYPE)
+        D = tf.convert_to_tensor(self.D, dtype=_dc.DTYPE)
+        P0 = tf.convert_to_tensor(self.P0, dtype=_dc.DTYPE)
 
         Q = tf.linalg.matmul(B, B, adjoint_b=True)
         R = tf.linalg.matmul(D, D, adjoint_b=True)
@@ -342,7 +345,7 @@ class LinearGaussianSSM(SSM):
 
     def _as_parameter(self, value, name):
         """Store model parameters as tensors or trainable variables."""
-        tensor = tf.convert_to_tensor(value, dtype=tf.float32)
+        tensor = tf.convert_to_tensor(value, dtype=_dc.DTYPE)
         if self.trainable:
             return tf.Variable(tensor, trainable=True, name=name)
         return tensor
@@ -351,7 +354,7 @@ class LinearGaussianSSM(SSM):
         """Update a model parameter while preserving trainable variables when possible."""
         if value is None:
             return
-        tensor = tf.convert_to_tensor(value, dtype=tf.float32)
+        tensor = tf.convert_to_tensor(value, dtype=_dc.DTYPE)
         if self.trainable:
             current = getattr(self, name, None)
             if isinstance(current, tf.Variable) and current.shape == tensor.shape:
@@ -373,7 +376,7 @@ class LinearGaussianSSM(SSM):
     ):
         """Update model parameters and refresh derived covariances/factors."""
         if jitter is not None:
-            self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
+            self.jitter = tf.convert_to_tensor(jitter, dtype=_dc.DTYPE)
         self._set_parameter("A", A)
         self._set_parameter("B", B)
         self._set_parameter("C", C)

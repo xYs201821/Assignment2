@@ -6,6 +6,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from src.filters.particle import ParticleFilter
+import src.dtype_config as _dc
 
 tfd = tfp.distributions
 
@@ -31,6 +32,7 @@ class DPFBase(ParticleFilter):
         num_particles: int = 100,
         ess_threshold: float = 0.5,
         resample: str | int | bool = "auto",
+        stop_grad_through_time: bool = False,
         debug: bool = False,
         print: bool = False,
         proposal=None,
@@ -43,6 +45,7 @@ class DPFBase(ParticleFilter):
             print=print,
         )
         self.resample = self._normalize_reweight(resample)
+        self.stop_grad_through_time = bool(stop_grad_through_time)
         self.proposal = proposal if proposal is not None else _BootstrapProposal()
 
     def set_proposal(self, proposal) -> None:
@@ -54,11 +57,13 @@ class DPFBase(ParticleFilter):
         """
         self.proposal = proposal if proposal is not None else _BootstrapProposal()
 
-    def update_params(self, num_particles=None, ess_threshold=None, resample=None, proposal=None):
+    def update_params(self, num_particles=None, ess_threshold=None, resample=None, stop_grad_through_time=None, proposal=None):
         """Update runtime hyperparameters."""
         super().update_params(num_particles=num_particles, ess_threshold=ess_threshold)
         if resample is not None:
             self.resample = self._normalize_reweight(resample)
+        if stop_grad_through_time is not None:
+            self.stop_grad_through_time = bool(stop_grad_through_time)
         if proposal is not None:
             self.set_proposal(proposal)
 
@@ -81,7 +86,7 @@ class DPFBase(ParticleFilter):
             raise TypeError("proposal must be callable or expose .sample(...).")
 
         x_pred, log_q = self._normalize_proposal_output(out)
-        x_pred = tf.convert_to_tensor(x_pred, dtype=tf.float32)
+        x_pred = tf.convert_to_tensor(x_pred, dtype=_dc.DTYPE)
 
         if log_q is None and hasattr(proposal, "log_prob"):
             try:
@@ -91,12 +96,12 @@ class DPFBase(ParticleFilter):
                 # keep bootstrap semantics (no proposal correction).
                 log_q = None
         if log_q is not None:
-            log_q = tf.convert_to_tensor(log_q, dtype=tf.float32)
+            log_q = tf.convert_to_tensor(log_q, dtype=_dc.DTYPE)
         return x_pred, log_q
 
     @staticmethod
-    def _regularized_cholesky(cov: tf.Tensor, jitter: float = 1e-6) -> tf.Tensor:
-        cov = tf.convert_to_tensor(cov, dtype=tf.float32)
+    def _regularized_cholesky(cov: tf.Tensor, jitter: float = _dc.JITTER) -> tf.Tensor:
+        cov = tf.convert_to_tensor(cov, dtype=_dc.DTYPE)
         cov = 0.5 * (cov + tf.linalg.matrix_transpose(cov))
         eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
         return tf.linalg.cholesky(cov + tf.cast(jitter, cov.dtype) * eye)
@@ -105,8 +110,8 @@ class DPFBase(ParticleFilter):
         if not callable(getattr(self.ssm, "h_with_noise", None)):
             raise NotImplementedError("h_with_noise is required for linearized observation fallback.")
 
-        x_pred = tf.convert_to_tensor(x_pred, dtype=tf.float32)
-        cov_r = tf.convert_to_tensor(cov_r, dtype=tf.float32)
+        x_pred = tf.convert_to_tensor(x_pred, dtype=_dc.DTYPE)
+        cov_r = tf.convert_to_tensor(cov_r, dtype=_dc.DTYPE)
         shape = tf.shape(x_pred)
         x_flat = tf.reshape(x_pred, [shape[0] * shape[1], shape[2]])
         r0 = tf.zeros([tf.shape(x_flat)[0], int(self.r_dim)], dtype=x_flat.dtype)
@@ -120,8 +125,8 @@ class DPFBase(ParticleFilter):
                 y_loc_flat = self.ssm.h_with_noise(x_flat, r0)
             H_r_flat = tape.batch_jacobian(y_loc_flat, r0)
 
-        H_r_flat = tf.convert_to_tensor(H_r_flat, dtype=tf.float32)
-        y_loc_flat = tf.convert_to_tensor(y_loc_flat, dtype=tf.float32)
+        H_r_flat = tf.convert_to_tensor(H_r_flat, dtype=_dc.DTYPE)
+        y_loc_flat = tf.convert_to_tensor(y_loc_flat, dtype=_dc.DTYPE)
         cov_eff_flat = tf.linalg.matmul(tf.linalg.matmul(H_r_flat, cov_r), H_r_flat, transpose_b=True)
 
         y_loc = tf.reshape(y_loc_flat, [shape[0], shape[1], tf.shape(y_loc_flat)[-1]])
@@ -135,8 +140,8 @@ class DPFBase(ParticleFilter):
         if not callable(getattr(self.ssm, "f_with_noise", None)):
             raise NotImplementedError("f_with_noise is required for linearized transition fallback.")
 
-        x_prev = tf.convert_to_tensor(x_prev, dtype=tf.float32)
-        cov_q = tf.convert_to_tensor(cov_q, dtype=tf.float32)
+        x_prev = tf.convert_to_tensor(x_prev, dtype=_dc.DTYPE)
+        cov_q = tf.convert_to_tensor(cov_q, dtype=_dc.DTYPE)
         shape = tf.shape(x_prev)
         x_flat = tf.reshape(x_prev, [shape[0] * shape[1], shape[2]])
         q0 = tf.zeros([tf.shape(x_flat)[0], int(self.q_dim)], dtype=x_flat.dtype)
@@ -150,8 +155,8 @@ class DPFBase(ParticleFilter):
                 x_loc_flat = self.ssm.f_with_noise(x_flat, q0)
             F_q_flat = tape.batch_jacobian(x_loc_flat, q0)
 
-        F_q_flat = tf.convert_to_tensor(F_q_flat, dtype=tf.float32)
-        x_loc_flat = tf.convert_to_tensor(x_loc_flat, dtype=tf.float32)
+        F_q_flat = tf.convert_to_tensor(F_q_flat, dtype=_dc.DTYPE)
+        x_loc_flat = tf.convert_to_tensor(x_loc_flat, dtype=_dc.DTYPE)
         cov_eff_flat = tf.linalg.matmul(tf.linalg.matmul(F_q_flat, cov_q), F_q_flat, transpose_b=True)
 
         x_loc = tf.reshape(x_loc_flat, [shape[0], shape[1], tf.shape(x_loc_flat)[-1]])
@@ -181,31 +186,31 @@ class DPFBase(ParticleFilter):
                 "observation_dist is unavailable and fallback requires ssm.cov_eps_y."
             )
 
-        y_obs = tf.convert_to_tensor(y_t, dtype=tf.float32)[..., tf.newaxis, :]
-        y_loc = tf.cast(self.ssm.h(x_pred), tf.float32)
+        y_obs = tf.convert_to_tensor(y_t, dtype=_dc.DTYPE)[..., tf.newaxis, :]
+        y_loc = tf.cast(self.ssm.h(x_pred), _dc.DTYPE)
 
         try:
             y_loc_lin, cov_eff = self._linearized_observation_cov(x_pred, cov_r)
             y_loc = y_loc_lin
         except Exception:  # noqa: BLE001
-            cov_eff = tf.convert_to_tensor(cov_r, dtype=tf.float32)
+            cov_eff = tf.convert_to_tensor(cov_r, dtype=_dc.DTYPE)
 
         innovation_fn = getattr(self.ssm, "innovation", None)
         if callable(innovation_fn):
-            innov = tf.cast(innovation_fn(y_obs, y_loc), tf.float32)
+            innov = tf.cast(innovation_fn(y_obs, y_loc), _dc.DTYPE)
             zero = tf.zeros_like(y_loc)
             scale = self._regularized_cholesky(cov_eff)
-            return tf.cast(tfd.MultivariateNormalTriL(loc=zero, scale_tril=scale).log_prob(innov), tf.float32)
+            return tf.cast(tfd.MultivariateNormalTriL(loc=zero, scale_tril=scale).log_prob(innov), _dc.DTYPE)
 
         scale = self._regularized_cholesky(cov_eff)
-        return tf.cast(tfd.MultivariateNormalTriL(loc=y_loc, scale_tril=scale).log_prob(y_obs), tf.float32)
+        return tf.cast(tfd.MultivariateNormalTriL(loc=y_loc, scale_tril=scale).log_prob(y_obs), _dc.DTYPE)
 
     def _transition_log_prob(self, x_prev: tf.Tensor, x_pred: tf.Tensor) -> tf.Tensor:
         # Preferred path: exact transition density.
         try:
             trans_dist = self.ssm.transition_dist(x_prev)
             if trans_dist is not None:
-                return tf.cast(trans_dist.log_prob(x_pred), tf.float32)
+                return tf.cast(trans_dist.log_prob(x_pred), _dc.DTYPE)
         except (NotImplementedError, AttributeError):
             pass
 
@@ -220,25 +225,26 @@ class DPFBase(ParticleFilter):
                 "transition_dist is unavailable and fallback requires ssm.cov_eps_x."
             )
 
-        x_loc = tf.cast(self.ssm.f(x_prev), tf.float32)
+        x_loc = tf.cast(self.ssm.f(x_prev), _dc.DTYPE)
         try:
             x_loc_lin, cov_eff = self._linearized_transition_cov(x_prev, cov_q)
             x_loc = x_loc_lin
         except Exception:  # noqa: BLE001
-            cov_eff = tf.convert_to_tensor(cov_q, dtype=tf.float32)
+            cov_eff = tf.convert_to_tensor(cov_q, dtype=_dc.DTYPE)
 
         scale = self._regularized_cholesky(cov_eff)
-        return tf.cast(tfd.MultivariateNormalTriL(loc=x_loc, scale_tril=scale).log_prob(x_pred), tf.float32)
+        return tf.cast(tfd.MultivariateNormalTriL(loc=x_loc, scale_tril=scale).log_prob(x_pred), _dc.DTYPE)
 
     def warmup(self, batch_size=1, T=2, resample=None, y=None):
         """Trace filter graph to reduce first-call overhead."""
         if y is None:
-            y = tf.zeros([batch_size, T, self.ssm.obs_dim], dtype=tf.float32)
+            y = tf.zeros([batch_size, T, self.ssm.obs_dim], _dc.DTYPE)
         if resample is None:
             resample = self.resample
         _ = self.filter(y, resample=resample)
 
-    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor):
+    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor,
+                      training: bool | None = None):
         """Resampling implementation hook."""
         raise NotImplementedError
 
@@ -249,7 +255,8 @@ class DPFBase(ParticleFilter):
             tf.concat([batch_shape, [self.num_particles]], axis=0),
         )
 
-    def step(self, x_prev, log_w_prev, y_t, resample="auto"):
+    def step(self, x_prev, log_w_prev, y_t, resample="auto",
+             training: bool | None = None):
         """One DPF step: propagate, weight, normalize, and optional resample.
 
         Shapes:
@@ -268,7 +275,7 @@ class DPFBase(ParticleFilter):
         x_pred, log_q = self._sample_proposal(x_prev, y_t)
 
         loglik = self._observation_log_prob(x_pred, y_t)
-        log_w = log_w_prev + tf.cast(loglik, log_w_prev.dtype)
+        log_w = log_w_prev + tf.cast(loglik, _dc.DTYPE)
         if log_q is not None:
             tf.debugging.assert_equal(
                 tf.shape(log_q),
@@ -276,32 +283,22 @@ class DPFBase(ParticleFilter):
                 message="proposal log_q must have shape [B, N].",
             )
             log_f = self._transition_log_prob(x_prev, x_pred)
-            log_w = log_w + tf.cast(log_f - log_q, log_w_prev.dtype)
+            log_w = log_w + tf.cast(log_f - log_q, _dc.DTYPE)
         log_w_norm, w_pre, logz_t = self._log_normalize(log_w)
         ess = self.ess(w_pre)
 
         resample = self._normalize_reweight(resample)
         if resample in (1, 2):
-            N_float = tf.cast(self.num_particles, tf.float32)
+            N_float = tf.cast(self.num_particles, _dc.DTYPE)
             if resample == 2:
                 mask_do_rs = tf.ones_like(ess, dtype=tf.bool)
             else:
                 mask_do_rs = ess < (self.ess_threshold * N_float)
 
             no_rs_indices = self._identity_parent_indices(x_pred)
-            should_resample = tf.reduce_any(mask_do_rs)
-
-            def _run_resample():
-                return self.resample_step(x_pred, log_w_norm)
-
-            def _skip_resample():
-                return x_pred, log_w_norm, no_rs_indices
-
-            x_rs, log_w_rs, rs_indices = tf.cond(
-                should_resample,
-                _run_resample,
-                _skip_resample,
-            )
+            # non-DMA copied error, have to avoid tf.cond inside tf.while_loop
+            x_rs, log_w_rs, rs_indices = self.resample_step(
+                x_pred, log_w_norm, training=training)
 
             mask_w = mask_do_rs[..., tf.newaxis]
             mask_x = mask_do_rs[..., tf.newaxis, tf.newaxis]
@@ -335,6 +332,7 @@ class DPFBase(ParticleFilter):
         init_dist=None,
         init_seed=None,
         init_particles=None,
+        training: bool | None = None,
     ):
         """Run differentiable particle filter over a sequence.
 
@@ -362,20 +360,22 @@ class DPFBase(ParticleFilter):
             init_particles=init_particles,
         )
         resample_mode = self.resample if resample is None else self._normalize_reweight(resample)
-        return self._filter_loop(y, x_init, log_w_init, resample_mode)
+        return self._filter_loop(y, x_init, log_w_init, resample_mode,
+                                 training=training)
 
     @tf.function(reduce_retracing=True)
-    def _filter_loop(self, y, x_prev, log_w, resample):
+    def _filter_loop(self, y, x_prev, log_w, resample,
+                     training: bool | None = None):
         """Core filter loop (tf.function compiled)."""
         T = tf.shape(y)[1]
 
-        x_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        x_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        log_w_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
-        log_w_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        x_ta = tf.TensorArray(_dc.DTYPE, size=T, dynamic_size=False)
+        x_pre_ta = tf.TensorArray(_dc.DTYPE, size=T, dynamic_size=False)
+        w_ta = tf.TensorArray(_dc.DTYPE, size=T, dynamic_size=False)
+        log_w_ta = tf.TensorArray(_dc.DTYPE, size=T, dynamic_size=False)
+        log_w_pre_ta = tf.TensorArray(_dc.DTYPE, size=T, dynamic_size=False)
         parent_ta = tf.TensorArray(tf.int32, size=T, dynamic_size=False)
-        logz_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        logz_ta = tf.TensorArray(_dc.DTYPE, size=T, dynamic_size=False)
 
         def _cond(t, _state):
             return t < T
@@ -407,6 +407,7 @@ class DPFBase(ParticleFilter):
                 log_w,
                 y_t,
                 resample=resample,
+                training=training,
             )
             if bool(getattr(self, "stop_grad_through_time", False)):
                 x_prev = tf.stop_gradient(x_t)

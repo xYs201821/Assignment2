@@ -10,7 +10,8 @@ from src.filters.dpf import DPFBase
 class StandardResamplingDPF(DPFBase):
     """DPF variant with classic systematic resampling and uniform reset."""
 
-    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor):
+    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor,
+                      training: bool | None = None):
         w = tf.exp(log_w)
         parent_indices = self.systematic_resample(w, self.ssm.rng)
         x_new = self.resample_particles(x, parent_indices)

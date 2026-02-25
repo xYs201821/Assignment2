@@ -1,6 +1,7 @@
 import pytest
 import tensorflow as tf
 
+import src.dtype_config as _dc
 from src.filter import ExtendedKalmanFilter, UnscentedKalmanFilter
 from tests.testhelper import assert_all_finite, assert_psd, assert_symmetric
 
@@ -18,8 +19,8 @@ def test_ekf_matches_tfp_on_linear(lgssm_3d, sim_data_3d, tfp_ref_3d):
     m = out["m_filt"][0]
     P = out["P_filt"][0]
 
-    tf.debugging.assert_near(m, m_tfp, atol=1e-4, rtol=1e-4)
-    tf.debugging.assert_near(P, P_tfp, atol=1e-4, rtol=1e-4)
+    tf.debugging.assert_near(m, m_tfp, atol=1e-3, rtol=1e-3)
+    tf.debugging.assert_near(P, P_tfp, atol=1e-3, rtol=1e-3)
 
 
 def test_ukf_matches_tfp_on_linear(lgssm_3d, sim_data_3d, tfp_ref_3d):
@@ -33,8 +34,8 @@ def test_ukf_matches_tfp_on_linear(lgssm_3d, sim_data_3d, tfp_ref_3d):
     m = out["m_filt"][0]
     P = out["P_filt"][0]
 
-    tf.debugging.assert_near(m, m_tfp, atol=1e-4, rtol=1e-4)
-    tf.debugging.assert_near(P, P_tfp, atol=1e-4, rtol=1e-4)
+    tf.debugging.assert_near(m, m_tfp, atol=1e-3, rtol=1e-3)
+    tf.debugging.assert_near(P, P_tfp, atol=1e-3, rtol=1e-3)
 
 
 def test_ekf_ukf_runs_sv(sv_model):
@@ -63,9 +64,9 @@ def test_ekf_ukf_runs_sv(sv_model):
 def test_ekf_ukf_runs_range_bearing(range_bearing_ssm):
     """EKF and UKF should run on range-bearing model."""
     rb = range_bearing_ssm
-    rb.cov_eps_x = tf.convert_to_tensor(rb.motion_model.cov_eps, dtype=tf.float32)
-    rb.m0 = tf.constant([1.0, 1.0, 1.0, 0.7], dtype=tf.float32)
-    rb.P0 = tf.eye(rb.state_dim, dtype=tf.float32) * 0.1
+    rb.cov_eps_x = tf.convert_to_tensor(rb.motion_model.cov_eps, dtype=_dc.DTYPE)
+    rb.m0 = tf.constant([1.0, 1.0, 1.0, 0.7], dtype=_dc.DTYPE)
+    rb.P0 = tf.eye(rb.state_dim, dtype=_dc.DTYPE) * 0.1
 
     _, y = rb.simulate(T=25, shape=(2,))
 

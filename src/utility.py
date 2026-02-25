@@ -4,6 +4,8 @@ import tensorflow as tf
 import numpy as np
 import tensorflow_probability as tfp
 
+import src.dtype_config as _dc
+
 
 def tf_cond(M, jitter=1e-6):
     """Estimate condition number for symmetric matrices.
@@ -59,8 +61,8 @@ def block_diag(A, B):
     returns: [batch, n+m, n+m]
     """
 
-    A = tf.convert_to_tensor(A, dtype=tf.float32)
-    B = tf.convert_to_tensor(B, dtype=tf.float32)
+    A = tf.cast(tf.convert_to_tensor(A), _dc.DTYPE)
+    B = tf.cast(tf.convert_to_tensor(B), _dc.DTYPE)
     A = tf.cond(
         tf.equal(tf.rank(A), 2),
         lambda: A[tf.newaxis, :, :],
@@ -79,8 +81,8 @@ def block_diag(A, B):
     )
     a = tf.shape(A)[1]
     b = tf.shape(B)[1]
-    Z_ab = tf.zeros([batch, a, b], dtype=tf.float32)
-    Z_ba = tf.zeros([batch, b, a], dtype=tf.float32)
+    Z_ab = tf.zeros([batch, a, b], dtype=_dc.DTYPE)
+    Z_ba = tf.zeros([batch, b, a], dtype=_dc.DTYPE)
     top = tf.concat([A, Z_ab], axis=2)
     bot = tf.concat([Z_ba, B], axis=2)
     return tf.concat([top, bot], axis=1)
@@ -153,12 +155,12 @@ def tfp_lgssm(observations, ssm, mode="filter"):
         num_timesteps=observations.shape[0],
         transition_matrix=ssm.A,
         transition_noise=tfp.distributions.MultivariateNormalTriL(
-            loc=tf.zeros(ssm.state_dim, dtype=tf.float32),
+            loc=tf.zeros(ssm.state_dim, dtype=_dc.DTYPE),
             scale_tril=tf.linalg.cholesky(ssm.cov_eps_x),
         ),
         observation_matrix=ssm.C,
         observation_noise=tfp.distributions.MultivariateNormalTriL(
-            loc=tf.zeros(ssm.obs_dim, dtype=tf.float32),
+            loc=tf.zeros(ssm.obs_dim, dtype=_dc.DTYPE),
             scale_tril=tf.linalg.cholesky(ssm.cov_eps_y),
         ),
         initial_state_prior=tfp.distributions.MultivariateNormalTriL(

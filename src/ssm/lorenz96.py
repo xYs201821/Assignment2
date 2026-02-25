@@ -3,6 +3,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from src.ssm.base import SSM
+import src.dtype_config as _dc
 
 tfd = tfp.distributions
 
@@ -42,25 +43,25 @@ class Lorenz96SSM(SSM):
         if self._state_dim % self.obs_stride != 0:
             raise ValueError("state_dim must be divisible by obs_stride")
 
-        self.dt = tf.convert_to_tensor(dt, dtype=tf.float32)
-        self.F = tf.convert_to_tensor(F, dtype=tf.float32)
+        self.dt = tf.convert_to_tensor(dt, dtype=_dc.DTYPE)
+        self.F = tf.convert_to_tensor(F, dtype=_dc.DTYPE)
         self.obs_op = self._validate_obs_op(obs_op)
 
         indices = np.arange(self.obs_stride - 1, self._state_dim, self.obs_stride, dtype=np.int32)
         self.obs_indices = tf.convert_to_tensor(indices, dtype=tf.int32)
         self._obs_dim = int(indices.size)
 
-        self.cov_eps_x = tf.eye(self._state_dim, dtype=tf.float32) * (float(q_scale) ** 2)
-        self.cov_eps_y = tf.eye(self._obs_dim, dtype=tf.float32) * (float(r_scale) ** 2)
+        self.cov_eps_x = tf.eye(self._state_dim, dtype=_dc.DTYPE) * (float(q_scale) ** 2)
+        self.cov_eps_y = tf.eye(self._obs_dim, dtype=_dc.DTYPE) * (float(r_scale) ** 2)
         self.Lq = tf.linalg.cholesky(self.cov_eps_x)
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 
         if m0 is None:
             m0 = tf.ones([self._state_dim], dtype=tf.float32) * self.F
         if P0 is None:
-            P0 = tf.eye(self._state_dim, dtype=tf.float32)
-        self.m0 = tf.convert_to_tensor(m0, dtype=tf.float32)
-        self.P0 = tf.convert_to_tensor(P0, dtype=tf.float32)
+            P0 = tf.eye(self._state_dim, dtype=_dc.DTYPE)
+        self.m0 = tf.cast(tf.convert_to_tensor(m0), _dc.DTYPE)
+        self.P0 = tf.cast(tf.convert_to_tensor(P0), _dc.DTYPE)
         self.L0 = tf.linalg.cholesky(self.P0)
 
     @staticmethod
@@ -94,11 +95,11 @@ class Lorenz96SSM(SSM):
         return (xp1 - xm2) * xm1 - x + self.F
 
     def f(self, x):
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         return x + self.dt * self._l96_rhs(x)
 
     def h(self, x):
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         x_obs = tf.gather(x, self.obs_indices, axis=-1)
         if self.obs_op == "linear":
             return x_obs

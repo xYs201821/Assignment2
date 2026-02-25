@@ -2,6 +2,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from src.ssm.base import SSM
+import src.dtype_config as _dc
 
 tfd = tfp.distributions
 
@@ -32,10 +33,10 @@ class MultiTargetAcousticSSM(SSM):
     ):
         super().__init__(seed=seed)
         self.C = int(num_targets)
-        self.dt = tf.convert_to_tensor(dt, tf.float32)
-        self.Psi = tf.convert_to_tensor(Psi, tf.float32)
-        self.d0 = tf.convert_to_tensor(d0, tf.float32)
-        self.sigma_w = tf.convert_to_tensor(sigma_w, tf.float32)
+        self.dt = tf.convert_to_tensor(dt, _dc.DTYPE)
+        self.Psi = tf.convert_to_tensor(Psi, _dc.DTYPE)
+        self.d0 = tf.convert_to_tensor(d0, _dc.DTYPE)
+        self.sigma_w = tf.convert_to_tensor(sigma_w, _dc.DTYPE)
 
         if sensor_xy is None:
             xs = tf.linspace(0.0, float(area_size), int(grid_size))
@@ -44,7 +45,7 @@ class MultiTargetAcousticSSM(SSM):
             sensor_xy = tf.stack(
                 [tf.reshape(X, [-1]), tf.reshape(Y, [-1])], axis=-1
             )
-        self.sensor_xy = tf.convert_to_tensor(sensor_xy, tf.float32)
+        self.sensor_xy = tf.convert_to_tensor(sensor_xy, _dc.DTYPE)
         if self.sensor_xy.shape[0] is None:
             raise ValueError("sensor_xy must have a static first dimension")
         self.Ns = int(self.sensor_xy.shape[0])
@@ -73,7 +74,7 @@ class MultiTargetAcousticSSM(SSM):
                 dtype=tf.float32,
             )
         else:
-            Q = tf.convert_to_tensor(cov_eps_x, tf.float32)
+            Q = tf.convert_to_tensor(cov_eps_x, _dc.DTYPE)
         self.Q = Q
 
         self.F = tf.linalg.LinearOperatorKronecker(
@@ -94,13 +95,13 @@ class MultiTargetAcousticSSM(SSM):
         if m0 is None:
             m0 = tf.zeros([dx], tf.float32)
         if P0 is None:
-            P0 = tf.eye(dx, dtype=tf.float32) * 10.0
-        self.m0 = tf.convert_to_tensor(m0, tf.float32)
-        self.P0 = tf.convert_to_tensor(P0, tf.float32)
+            P0 = tf.eye(dx, dtype=_dc.DTYPE) * 10.0
+        self.m0 = tf.convert_to_tensor(m0, _dc.DTYPE)
+        self.P0 = tf.convert_to_tensor(P0, _dc.DTYPE)
 
         self.L0 = tf.linalg.cholesky(self.P0)
         self.Lq = tf.linalg.cholesky(self.cov_eps_x)
-        self.cov_eps_y = tf.eye(self.Ns, dtype=tf.float32) * (self.sigma_w ** 2)
+        self.cov_eps_y = tf.eye(self.Ns, dtype=_dc.DTYPE) * (self.sigma_w ** 2)
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 
     @property
@@ -120,11 +121,11 @@ class MultiTargetAcousticSSM(SSM):
         return self.obs_dim
 
     def f(self, x):
-        x = tf.convert_to_tensor(x, tf.float32)
+        x = tf.convert_to_tensor(x, _dc.DTYPE)
         return tf.linalg.matvec(self.F, x)
 
     def h(self, x):
-        x = tf.convert_to_tensor(x, tf.float32)
+        x = tf.convert_to_tensor(x, _dc.DTYPE)
         shape = tf.shape(x)[:-1]
         x_reshaped = tf.reshape(x, tf.concat([shape, [self.C, 4]], axis=0))
         pos = x_reshaped[..., :, 0:2]

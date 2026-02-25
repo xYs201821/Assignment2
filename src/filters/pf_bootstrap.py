@@ -5,6 +5,7 @@ from __future__ import annotations
 import tensorflow as tf
 
 from src.filters.particle import ParticleFilter
+import src.dtype_config as _dc
 
 
 class BootstrapParticleFilter(ParticleFilter):
@@ -20,7 +21,7 @@ class BootstrapParticleFilter(ParticleFilter):
         if num_particles is not None:
             self.num_particles = int(num_particles)
         if ess_threshold is not None:
-            self.ess_threshold = tf.convert_to_tensor(ess_threshold, tf.float32)
+            self.ess_threshold = tf.convert_to_tensor(ess_threshold, _dc.DTYPE)
         if resample is not None:
             self.resample = self._normalize_reweight(resample)
 
@@ -192,6 +193,7 @@ class BootstrapParticleFilter(ParticleFilter):
             _cond,
             _body,
             (tf.constant(0), (x_prev, log_w, tas)),
+            swap_memory=True,
         )
         (
             x_ta,

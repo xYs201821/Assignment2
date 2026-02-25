@@ -5,6 +5,7 @@ import tensorflow as tf
 from src.filters.particle import ParticleFilter
 from src.filters.mixins import LinearizationMixin
 from src.utility import cholesky_solve
+import src.dtype_config as _dc
 
 
 class FlowBase(ParticleFilter, LinearizationMixin):
@@ -59,7 +60,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         Returns:
             Inverse of cov with shape [..., d, d]
         """
-        cov = tf.convert_to_tensor(cov, dtype=tf.float32)
+        cov = tf.convert_to_tensor(cov, dtype=_dc.DTYPE)
         eye = tf.eye(tf.shape(cov)[-1], batch_shape=tf.shape(cov)[:-2], dtype=cov.dtype)
         jitter_val = 1e-6 if self.jitter is None else float(self.jitter)
         return cholesky_solve(cov, eye, jitter=jitter_val)
