@@ -1,5 +1,6 @@
 import tensorflow as tf
 import numpy as np
+import src.dtype_config as _dc
 
 class MotionModel(tf.Module):
 
@@ -29,9 +30,9 @@ class ConstantVelocityMotionModel(MotionModel):
 
     def __init__(self, dt, cov_eps, seed=42, jitter=1e-12):
         super().__init__(seed)
-        self.dt = tf.convert_to_tensor(dt, dtype=tf.float32)
-        self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
-        cov_eps = tf.convert_to_tensor(cov_eps, dtype=tf.float32)
+        self.dt = tf.convert_to_tensor(dt, dtype=_dc.DTYPE)
+        self.jitter = tf.convert_to_tensor(jitter, dtype=_dc.DTYPE)
+        cov_eps = tf.convert_to_tensor(cov_eps, dtype=_dc.DTYPE)
         if cov_eps.shape.rank != 2 or cov_eps.shape[-1] != cov_eps.shape[-2]:
             raise ValueError("cov_eps must be a square [2*dim,2*dim] matrix for ConstantVelocityMotionModel")
         if cov_eps.shape[-1] is not None and cov_eps.shape[-1] % 2 != 0:
@@ -68,9 +69,9 @@ class ConstantTurnRateMotionModel(MotionModel):
 
     def __init__(self, dt, cov_eps, seed=42, jitter=1e-12):
         super().__init__(seed)
-        self.dt = tf.convert_to_tensor(dt, dtype=tf.float32)
-        self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
-        cov_eps = tf.convert_to_tensor(cov_eps, dtype=tf.float32)
+        self.dt = tf.convert_to_tensor(dt, dtype=_dc.DTYPE)
+        self.jitter = tf.convert_to_tensor(jitter, dtype=_dc.DTYPE)
+        cov_eps = tf.convert_to_tensor(cov_eps, dtype=_dc.DTYPE)
         if cov_eps.shape[0] == 5:
             self.cov_eps = cov_eps
         elif cov_eps.shape[0] == 3:

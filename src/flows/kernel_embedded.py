@@ -7,6 +7,7 @@ from src.flows.flow_base import FlowBase
 from src.optimizer import FixStepSize, FunctionalAdagrad, FunctionalAdam, apply_stop_mask, update_norm
 from src.ssm import SSM
 from src.utility import cholesky_solve, quadratic_matmul
+import src.dtype_config as _dc
 
 
 class KernelParticleFlow(FlowBase):
@@ -179,8 +180,8 @@ class KernelParticleFlow(FlowBase):
     @staticmethod
     def _broadcast_observation(y_t, x):
         """Broadcast observation to match particle batch shape."""
-        y_t = tf.convert_to_tensor(y_t, dtype=tf.float32)
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        y_t = tf.convert_to_tensor(y_t, dtype=_dc.DTYPE)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         obs_dim = tf.shape(y_t)[-1]
         target_shape = tf.concat([tf.shape(x)[:-1], tf.expand_dims(obs_dim, 0)], axis=0)
         return tf.broadcast_to(y_t[..., tf.newaxis, :], target_shape)
@@ -195,11 +196,11 @@ class KernelParticleFlow(FlowBase):
 
     def _sample_mean_and_cov(self, x, w):
         """Weighted sample mean and covariance with optional localization."""
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         if w is None:
             w = tf.ones_like(x[..., 0]) / tf.cast(tf.shape(x)[-2], tf.float32)
         else:
-            w = tf.convert_to_tensor(w, dtype=tf.float32)
+            w = tf.convert_to_tensor(w, dtype=_dc.DTYPE)
         x_bar = tf.einsum("...n,...ni->...i", w, x)
         x_resid = x - x_bar[..., tf.newaxis, :]
         P = tf.einsum("...n,...ni,...nj->...ij", w, x_resid, x_resid)
@@ -249,7 +250,7 @@ class KernelParticleFlow(FlowBase):
         H_x, y_hat = self.jacobian_h_x(x, r0)
 
         v = self.ssm.innovation(y_expand, y_hat)  # [..., n, obs_dim]
-        R = tf.convert_to_tensor(self.ssm.cov_eps_y, dtype=tf.float32)
+        R = tf.convert_to_tensor(self.ssm.cov_eps_y, dtype=_dc.DTYPE)
         if self._use_additive_obs_noise():
             R_eff = tf.broadcast_to(
                 R,
@@ -272,7 +273,7 @@ class KernelParticleFlow(FlowBase):
         Returns:
           grad: [B, N, dx]
         """
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         y_expand = self._broadcast_observation(y, x)
         with tf.GradientTape(watch_accessed_variables=False) as tape:
             tape.watch(x)
@@ -296,14 +297,14 @@ class KernelParticleFlow(FlowBase):
           K: [B, N, N]
           gradK: [B, N, N, dx]
         """
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
-        band_inv = tf.convert_to_tensor(band_inv, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
+        band_inv = tf.convert_to_tensor(band_inv, dtype=_dc.DTYPE)
         xj = x[..., :, tf.newaxis, :]
         xk = x[..., tf.newaxis, :, :]
         diff = xj - xk  # [..., n, n, dx]
         if alpha is None:
             alpha = self._compute_alpha(diff=diff)
-        alpha = tf.convert_to_tensor(alpha, dtype=tf.float32)
+        alpha = tf.convert_to_tensor(alpha, dtype=_dc.DTYPE)
         alpha_inv = tf.math.reciprocal(alpha)
         # alpha_inv shape: [...], band_inv shape: [..., dx, dx]
         alpha_inv = alpha_inv[..., tf.newaxis, tf.newaxis]
@@ -327,15 +328,15 @@ class KernelParticleFlow(FlowBase):
           K: [B, N, N, dx]
           gradK: [B, N, N, dx]
         """
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
-        diagB = tf.convert_to_tensor(diagB, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
+        diagB = tf.convert_to_tensor(diagB, dtype=_dc.DTYPE)
         xj = x[..., :, tf.newaxis, :]
         xk = x[..., tf.newaxis, :, :]
         diff = xj - xk # [..., n, n, dx]
 
         if alpha is None:
             alpha = self._compute_alpha(diff=diff)
-        alpha = tf.convert_to_tensor(alpha, dtype=tf.float32)
+        alpha = tf.convert_to_tensor(alpha, dtype=_dc.DTYPE)
         alpha_scalar = alpha
         # alpha_scalar shape: [...], diagB shape: [..., dx]
         alpha = alpha_scalar[..., tf.newaxis]
@@ -493,12 +494,12 @@ class KernelParticleFlow(FlowBase):
     def _compute_alpha(self, x=None, diff=None):
         """Compute median heuristic bandwidth for kernels."""
         if diff is None:
-            x = tf.convert_to_tensor(x, dtype=tf.float32)
+            x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
             xj = x[..., :, tf.newaxis, :]
             xk = x[..., tf.newaxis, :, :]
             diff = xj - xk  # [..., n, n, dx]
         else:
-            diff = tf.convert_to_tensor(diff, dtype=tf.float32)
+            diff = tf.convert_to_tensor(diff, dtype=_dc.DTYPE)
 
         shape = tf.shape(diff)
         batch_shape = shape[:-3]
@@ -539,19 +540,19 @@ class KernelParticleFlow(FlowBase):
           x: [B, N, dx]
           diagnostics: dict
         """
-        x = tf.identity(tf.convert_to_tensor(x_prior, dtype=tf.float32))
-        y = tf.convert_to_tensor(y, dtype=tf.float32)
+        x = tf.identity(tf.convert_to_tensor(x_prior, dtype=_dc.DTYPE))
+        y = tf.convert_to_tensor(y, dtype=_dc.DTYPE)
         num_particles = tf.shape(x)[-2]
         batch_shape = tf.shape(x)[:-2]
         if w is None:
             w = tf.ones(tf.concat([batch_shape, [num_particles]], axis=0), dtype=tf.float32)
             w = w / tf.cast(num_particles, tf.float32)
         else:
-            w = tf.convert_to_tensor(w, dtype=tf.float32)
+            w = tf.convert_to_tensor(w, dtype=_dc.DTYPE)
             w = tf.math.divide_no_nan(w, tf.reduce_sum(w, axis=-1, keepdims=True))
         if x_mean is None or B is None:
             x_mean, B = self._sample_mean_and_cov(x_prior, w)
-        B = tf.convert_to_tensor(B, dtype=tf.float32)
+        B = tf.convert_to_tensor(B, dtype=_dc.DTYPE)
         diagB = tf.linalg.diag_part(B)
         diagB = tf.maximum(diagB, tf.cast(self.jitter, tf.float32))
         
@@ -560,8 +561,8 @@ class KernelParticleFlow(FlowBase):
         elif self.alpha is None:
             alpha = tf.cast(1.0, tf.float32) / tf.cast(num_particles, tf.float32)
         else:
-            alpha = tf.cast(self.alpha, tf.float32)
-        alpha = tf.convert_to_tensor(alpha, dtype=tf.float32)
+            alpha = tf.cast(self.alpha, _dc.DTYPE)
+        alpha = tf.convert_to_tensor(alpha, dtype=_dc.DTYPE)
         alpha = tf.broadcast_to(alpha, batch_shape)
         
         use_scalar_kernel = self.kernel_type == "scalar"

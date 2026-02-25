@@ -5,6 +5,7 @@ from __future__ import annotations
 import tensorflow as tf
 
 from src.filters.dpf import DPFBase
+import src.dtype_config as _dc
 
 
 def categorical_sample(prob: tf.Tensor, num_samples: int, replacement: bool = True) -> tf.Tensor:
@@ -47,7 +48,7 @@ class SoftResamplingDPF(DPFBase):
         lam = float(lam)
         if not (0.0 < lam <= 1.0):
             raise ValueError("lam must be in (0, 1].")
-        return tf.convert_to_tensor(lam, dtype=tf.float32)
+        return tf.convert_to_tensor(lam, dtype=_dc.DTYPE)
 
     def update_params(
         self,
@@ -92,10 +93,12 @@ class SoftResamplingDPF(DPFBase):
             ),
             axis=0,
         )
-        parent_indices = tf.random.categorical(
+        seed_pair = tf.cast(self.ssm.rng.make_seeds(2)[0], dtype=tf.int32)
+        parent_indices = tf.random.stateless_categorical(
             tf.stop_gradient(log_q),
             num_samples=tf.cast(self.num_particles, tf.int32),
-            dtype=tf.int32,
+            seed=seed_pair,
+            dtype=tf.int32, 
         )
 
         x_new = self.resample_particles(x, parent_indices)
@@ -103,7 +106,8 @@ class SoftResamplingDPF(DPFBase):
         log_w_new, _, _ = self._log_normalize(log_w_new)
         return x_new, log_w_new, parent_indices
 
-    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor):
+    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor,
+                      training: bool | None = None):
         return self.soft_resampling_mixture(x, log_w, lam=self.lam)
 
     def filter(
@@ -117,6 +121,7 @@ class SoftResamplingDPF(DPFBase):
         init_dist=None,
         init_seed=None,
         init_particles=None,
+        training: bool | None = None,
     ):
         if any(v is not None for v in (num_particles, ess_threshold, lam, resample, proposal)):
             self.update_params(
@@ -135,6 +140,7 @@ class SoftResamplingDPF(DPFBase):
             init_dist=init_dist,
             init_seed=init_seed,
             init_particles=init_particles,
+            training=training,
         )
 
 

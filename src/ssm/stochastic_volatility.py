@@ -4,6 +4,7 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from src.ssm.base import SSM
+import src.dtype_config as _dc
 
 tfd = tfp.distributions
 tfb = tfp.bijectors
@@ -15,12 +16,12 @@ class StochasticVolatilitySSM(SSM):
                  obs_mode="y", obs_eps=1e-6, seed=42):
         """Initialize SV parameters and observation mode."""
         super().__init__(seed)
-        self.mu = tf.convert_to_tensor(mu, dtype=tf.float32)
-        self.alpha = tf.convert_to_tensor(alpha, dtype=tf.float32)
-        self.sigma = tf.convert_to_tensor(sigma, dtype=tf.float32)
-        self.beta = tf.convert_to_tensor(beta, dtype=tf.float32)
+        self.mu = tf.convert_to_tensor(mu, dtype=_dc.DTYPE)
+        self.alpha = tf.convert_to_tensor(alpha, dtype=_dc.DTYPE)
+        self.sigma = tf.convert_to_tensor(sigma, dtype=_dc.DTYPE)
+        self.beta = tf.convert_to_tensor(beta, dtype=_dc.DTYPE)
         self.obs_mode = obs_mode
-        self.obs_eps = tf.convert_to_tensor(obs_eps, dtype=tf.float32)
+        self.obs_eps = tf.convert_to_tensor(obs_eps, dtype=_dc.DTYPE)
         if noise_scale_func:
             self.g = lambda x: tf.exp(0.01 * tf.clip_by_value(tf.abs(x), 0.0, 10.0))
         else:

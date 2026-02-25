@@ -1,4 +1,5 @@
 import tensorflow as tf
+import src.dtype_config as _dc
 
 def update_norm(update):
     rank = tf.rank(update)
@@ -32,7 +33,7 @@ class FixStepSize:
 class FunctionalAdagrad:
     def __init__(self, learning_rate=0.01, epsilon=1e-7):
         self.lr = learning_rate
-        self.eps = tf.convert_to_tensor(epsilon, dtype=tf.float32)
+        self.eps = tf.convert_to_tensor(epsilon, dtype=_dc.DTYPE)
 
     def init_state(self, shape):
         return tf.zeros(shape, dtype=tf.float32)

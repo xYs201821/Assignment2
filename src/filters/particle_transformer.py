@@ -5,6 +5,7 @@ from __future__ import annotations
 import tensorflow as tf
 
 from src.filters.dpf import DPFBase
+import src.dtype_config as _dc
 
 
 class ParticleTransformerResampler(tf.keras.layers.Layer):
@@ -253,7 +254,7 @@ class ParticleTransformerResampler(tf.keras.layers.Layer):
           x_new: [B, N, dx]
           attn_last: [B, N, N] (head-averaged final decoder cross-attention)
         """
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         log_w = tf.convert_to_tensor(log_w, dtype=x.dtype)
         log_w = log_w - tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
 
@@ -398,9 +399,10 @@ class ParticleTransformerDPF(DPFBase):
         if rebuild:
             self._build_resampler()
 
-    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor):
+    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor,
+                      training: bool | None = None):
         """Resample particles with neural generator and reset to uniform weights."""
-        x_new, attn = self.resampler_net(x, log_w)
+        x_new, attn = self.resampler_net(x, log_w, training=training)
         log_uniform = -tf.math.log(tf.cast(self.num_particles, x_new.dtype))
         log_w_new = tf.fill(tf.shape(log_w), log_uniform)
         parent_indices = tf.argmax(attn, axis=-1, output_type=tf.int32)
@@ -423,6 +425,7 @@ class ParticleTransformerDPF(DPFBase):
         init_dist=None,
         init_seed=None,
         init_particles=None,
+        training: bool | None = None,
     ):
         """Run differentiable PF with optional runtime hyperparameter overrides."""
         if any(
@@ -463,6 +466,7 @@ class ParticleTransformerDPF(DPFBase):
             init_dist=init_dist,
             init_seed=init_seed,
             init_particles=init_particles,
+            training=training,
         )
 
 

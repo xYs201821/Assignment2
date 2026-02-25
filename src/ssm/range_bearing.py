@@ -5,6 +5,7 @@ import tensorflow_probability as tfp
 
 from src.motion_model import MotionModel
 from src.ssm.base import SSM
+import src.dtype_config as _dc
 
 tfd = tfp.distributions
 
@@ -15,7 +16,7 @@ class _RangeBearingObservationDist:
     def __init__(self, ssm, x):
         """Bind to the SSM and a specific state tensor."""
         self._ssm = ssm
-        self._x = tf.convert_to_tensor(x, dtype=tf.float32)
+        self._x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
 
     def sample(self, seed=None):
         """Sample observation and wrap the bearing component."""
@@ -26,7 +27,7 @@ class _RangeBearingObservationDist:
 
     def log_prob(self, y):
         """Log-probability using wrapped innovation."""
-        y = tf.convert_to_tensor(y, dtype=tf.float32)
+        y = tf.convert_to_tensor(y, dtype=_dc.DTYPE)
         loc = self._ssm.h(self._x)
         v = self._ssm.innovation(y, loc)
         return self._ssm._obs_noise_dist.log_prob(v)
@@ -40,9 +41,9 @@ class RangeBearingSSM(SSM):
         super().__init__(seed)
         assert isinstance(motion_model, MotionModel)
         self.motion_model = motion_model
-        self.jitter = tf.convert_to_tensor(jitter, dtype=tf.float32)
-        self.m0 = tf.zeros([self.motion_model.state_dim], dtype=tf.float32)
-        self.P0 = tf.eye(self.motion_model.state_dim, dtype=tf.float32)
+        self.jitter = tf.convert_to_tensor(jitter, dtype=_dc.DTYPE)
+        self.m0 = tf.zeros([self.motion_model.state_dim], dtype=_dc.DTYPE)
+        self.P0 = tf.eye(self.motion_model.state_dim, dtype=_dc.DTYPE)
         self.cov_eps_x = self.motion_model.cov_eps
         self.cov_eps_y = tf.convert_to_tensor(cov_eps_y, dtype=tf.float32)
         self.angle_indices = (1,)
@@ -54,8 +55,8 @@ class RangeBearingSSM(SSM):
             scale_tril=self.Lr,
         )
         if jacobian_r_min is None:
-            jacobian_r_min = tf.sqrt(tf.maximum(self.jitter, tf.cast(1e-6, tf.float32)))
-        self.jacobian_r_min = tf.convert_to_tensor(jacobian_r_min, dtype=tf.float32)
+            jacobian_r_min = tf.sqrt(tf.maximum(self.jitter, tf.cast(_dc.JITTER, _dc.DTYPE)))
+        self.jacobian_r_min = tf.convert_to_tensor(jacobian_r_min, dtype=_dc.DTYPE)
 
     @staticmethod
     def _wrap_angle(bearing):
@@ -155,7 +156,7 @@ class RangeBearingSSM(SSM):
           J_x(h): [..., dy, dx]
           h(x,r): [..., dy]
         """
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         px = x[..., 0]
         py = x[..., 1]
         r2 = px**2 + py**2
@@ -192,7 +193,7 @@ class RangeBearingSSM(SSM):
 
     def jacobian_h_r(self, x, r):
         """Jacobian of observation w.r.t. additive noise (identity)."""
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         batch_shape = tf.shape(x)[:-1]
         eye = tf.eye(self.obs_dim, batch_shape=batch_shape, dtype=tf.float32)
         return eye, self.h(x)

@@ -7,14 +7,15 @@ import tensorflow as tf
 import tensorflow_probability as tfp
 
 from src.ssm.base import SSM
+import src.dtype_config as _dc
 
 tfd = tfp.distributions
 
 
 def _as_vector(value, size: int, default: float = 0.0) -> tf.Tensor:
     if value is None:
-        return tf.fill([size], tf.cast(default, tf.float32))
-    x = tf.convert_to_tensor(value, dtype=tf.float32)
+        return tf.fill([size], tf.cast(default, _dc.DTYPE))
+    x = tf.convert_to_tensor(value, dtype=_dc.DTYPE)
     if x.shape.rank == 0:
         return tf.fill([size], x)
     x = tf.reshape(x, [-1])
@@ -36,12 +37,12 @@ class _VRNNTransitionDist:
         *,
         deterministic_tol: float = 1e-6,
     ) -> None:
-        self._r_next = tf.convert_to_tensor(r_next, dtype=tf.float32)
+        self._r_next = tf.convert_to_tensor(r_next, dtype=_dc.DTYPE)
         self._z_dist = tfd.MultivariateNormalDiag(
-            loc=tf.convert_to_tensor(z_mu, dtype=tf.float32),
-            scale_diag=tf.convert_to_tensor(z_scale, dtype=tf.float32),
+            loc=tf.convert_to_tensor(z_mu, dtype=_dc.DTYPE),
+            scale_diag=tf.convert_to_tensor(z_scale, dtype=_dc.DTYPE),
         )
-        self._deterministic_tol = tf.convert_to_tensor(float(deterministic_tol), dtype=tf.float32)
+        self._deterministic_tol = tf.convert_to_tensor(float(deterministic_tol), dtype=_dc.DTYPE)
         self._r_dim = int(self._r_next.shape[-1])
 
     def sample(self, seed=None):
@@ -49,7 +50,7 @@ class _VRNNTransitionDist:
         return tf.concat([self._r_next, z], axis=-1)
 
     def log_prob(self, x):
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         r = x[..., : self._r_dim]
         z = x[..., self._r_dim :]
         log_pz = self._z_dist.log_prob(z)
@@ -90,15 +91,15 @@ class VRNNBinarySSM(SSM):
         self._y_embed_dim = int(y_embed_dim)
         self._transition_hidden_dim = int(transition_hidden_dim)
         self._emission_hidden_dim = int(emission_hidden_dim)
-        self.transition_r_std = tf.convert_to_tensor(float(transition_r_std), dtype=tf.float32)
+        self.transition_r_std = tf.convert_to_tensor(float(transition_r_std), dtype=_dc.DTYPE)
         self.deterministic_r = bool(deterministic_r)
         self.deterministic_tol = float(deterministic_tol)
-        self.min_scale = tf.convert_to_tensor(float(min_scale), dtype=tf.float32)
+        self.min_scale = tf.convert_to_tensor(float(min_scale), dtype=_dc.DTYPE)
 
         self.m0 = _as_vector(m0, self._state_dim, default=0.0)
         if P0 is None:
-            P0 = np.eye(self._state_dim, dtype=np.float32)
-        self.P0 = tf.convert_to_tensor(P0, dtype=tf.float32)
+            P0 = np.eye(self._state_dim, dtype=NP__dc.DTYPE)
+        self.P0 = tf.cast(tf.convert_to_tensor(P0), _dc.DTYPE)
         self.L0 = tf.linalg.cholesky(self.P0)
 
         # Compatibility fields used by filters that inspect additive-noise covariances.
@@ -180,7 +181,7 @@ class VRNNBinarySSM(SSM):
             layer.trainable = trainable
 
     def _split_state(self, x: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         r = x[..., : self._recurrent_dim]
         z = x[..., self._recurrent_dim :]
         return r, z
@@ -200,7 +201,7 @@ class VRNNBinarySSM(SSM):
         return r_next, z_mu, z_scale
 
     def _reshape_to_flat(self, x: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         lead_shape = tf.shape(x)[:-1]
         flat = tf.reshape(x, [-1, self.state_dim])
         return flat, lead_shape
@@ -213,7 +214,7 @@ class VRNNBinarySSM(SSM):
         if y_prev is None:
             return tf.zeros(target_shape, dtype=tf.float32)
 
-        y_prev = tf.convert_to_tensor(y_prev, dtype=tf.float32)
+        y_prev = tf.convert_to_tensor(y_prev, dtype=_dc.DTYPE)
         if y_prev.shape.rank == 1:
             y_prev = y_prev[tf.newaxis, :]
 
@@ -245,7 +246,7 @@ class VRNNBinarySSM(SSM):
         return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.L0)
 
     def transition_dist(self, x_prev, **kwargs):
-        x_prev = tf.convert_to_tensor(x_prev, dtype=tf.float32)
+        x_prev = tf.convert_to_tensor(x_prev, dtype=_dc.DTYPE)
         x_flat, lead_shape = self._reshape_to_flat(x_prev)
         y_prev = self._prepare_y_prev(kwargs.get("y_prev", None), lead_shape)
         y_prev_flat = tf.reshape(y_prev, [-1, self.obs_dim])
@@ -279,7 +280,7 @@ class VRNNBinarySSM(SSM):
         )
 
     def f(self, x, **kwargs):
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         x_flat, lead_shape = self._reshape_to_flat(x)
         y_prev = self._prepare_y_prev(kwargs.get("y_prev", None), lead_shape)
         y_prev_flat = tf.reshape(y_prev, [-1, self.obs_dim])
@@ -311,7 +312,7 @@ class VRNNBinarySSM(SSM):
         if x0 is None:
             x = self.sample_initial_state(shape)
         else:
-            x0 = tf.convert_to_tensor(x0, dtype=tf.float32)
+            x0 = tf.convert_to_tensor(x0, dtype=_dc.DTYPE)
             x = tf.broadcast_to(
                 tf.reshape(x0, tf.concat([tf.ones_like(shape), [self.state_dim]], axis=0)),
                 tf.concat([shape, [self.state_dim]], axis=0),
@@ -320,7 +321,7 @@ class VRNNBinarySSM(SSM):
         if y0 is None:
             y_prev = tf.zeros(tf.concat([shape, [self.obs_dim]], axis=0), dtype=tf.float32)
         else:
-            y0 = tf.convert_to_tensor(y0, dtype=tf.float32)
+            y0 = tf.convert_to_tensor(y0, dtype=_dc.DTYPE)
             y_prev = tf.broadcast_to(
                 tf.reshape(y0, tf.concat([tf.ones_like(shape), [self.obs_dim]], axis=0)),
                 tf.concat([shape, [self.obs_dim]], axis=0),

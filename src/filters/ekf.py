@@ -5,6 +5,7 @@ import tensorflow as tf
 from src.filters.base import GaussianFilter
 from src.filters.mixins import LinearizationMixin
 from src.utility import quadratic_matmul
+import src.dtype_config as _dc
 
 
 class ExtendedKalmanFilter(GaussianFilter, LinearizationMixin):
@@ -27,7 +28,7 @@ class ExtendedKalmanFilter(GaussianFilter, LinearizationMixin):
           m_pred: [B, dx]
           P_pred: [B, dx, dx]
         """
-        q0 = tf.zeros(tf.concat([tf.shape(m_prev)[:-1], [self.q_dim]], axis=0), dtype=tf.float32)
+        q0 = tf.zeros(tf.concat([tf.shape(m_prev)[:-1], [self.q_dim]], axis=0), _dc.DTYPE)
         F_x, m_pred = self.jacobian_f_x(m_prev, q0)
         F_q, _ = self.jacobian_f_q(m_prev, q0)
 
@@ -46,7 +47,7 @@ class ExtendedKalmanFilter(GaussianFilter, LinearizationMixin):
           m_filt: [B, dx]
           P_filt: [B, dx, dx]
         """
-        r0 = tf.zeros(tf.concat([tf.shape(m_pred)[:-1], [self.r_dim]], axis=0), dtype=tf.float32)
+        r0 = tf.zeros(tf.concat([tf.shape(m_pred)[:-1], [self.r_dim]], axis=0), _dc.DTYPE)
 
         H_x, y_pred = self.jacobian_h_x(m_pred, r0)
         H_r, _ = self.jacobian_h_r(m_pred, r0)
@@ -72,7 +73,7 @@ class ExtendedKalmanFilter(GaussianFilter, LinearizationMixin):
           m_filt: [B, dx]
           P_filt: [B, dx, dx]
         """
-        r0 = tf.zeros(tf.concat([tf.shape(m_pred)[:-1], [self.r_dim]], axis=0), dtype=tf.float32)
+        r0 = tf.zeros(tf.concat([tf.shape(m_pred)[:-1], [self.r_dim]], axis=0), _dc.DTYPE)
 
         H_x, y_pred = self.jacobian_h_x(m_pred, r0)
         H_r, _ = self.jacobian_h_r(m_pred, r0)

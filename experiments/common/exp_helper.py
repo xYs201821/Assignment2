@@ -209,6 +209,8 @@ def grad_metrics_from_history(grad_raw_hist: Any, window: int = 10) -> Dict[str,
         "grad_snr_final": grad_snr_final,
         "grad_var_init": grad_var_init,
         "grad_var_final": grad_var_final,
+        "grad_raw_init": float(np.mean(arr[:win])),
+        "grad_raw_final": float(np.mean(arr[-win:])),
     }
 
 
@@ -232,6 +234,7 @@ def result_stage_metrics(result: Dict[str, Any], stage: str) -> Dict[str, float]
         "ess_mean": float(result[f"ess_mean{suffix}"]),
         "grad_snr": float(result[f"grad_snr{suffix}"]),
         "grad_var": float(result[f"grad_var{suffix}"]),
+        "grad_raw": float(result[f"grad_raw{suffix}"]),
         "train_sec": float(result["runtime_train_sec"]),
     }
 

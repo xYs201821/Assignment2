@@ -1,10 +1,9 @@
-"""Lorenz-96 nonlinear state-space model."""
-
 import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
 from src.ssm.base import SSM
+import src.dtype_config as _dc
 
 tfd = tfp.distributions
 
@@ -36,7 +35,6 @@ class Lorenz96SSM(SSM):
         P0=None,
         seed=None,
     ):
-        """Initialize Lorenz-96 parameters and noise covariances."""
         super().__init__(seed=seed)
         self._state_dim = int(state_dim)
         self.obs_stride = int(obs_stride)
@@ -45,30 +43,29 @@ class Lorenz96SSM(SSM):
         if self._state_dim % self.obs_stride != 0:
             raise ValueError("state_dim must be divisible by obs_stride")
 
-        self.dt = tf.convert_to_tensor(dt, dtype=tf.float32)
-        self.F = tf.convert_to_tensor(F, dtype=tf.float32)
+        self.dt = tf.convert_to_tensor(dt, dtype=_dc.DTYPE)
+        self.F = tf.convert_to_tensor(F, dtype=_dc.DTYPE)
         self.obs_op = self._validate_obs_op(obs_op)
 
         indices = np.arange(self.obs_stride - 1, self._state_dim, self.obs_stride, dtype=np.int32)
         self.obs_indices = tf.convert_to_tensor(indices, dtype=tf.int32)
         self._obs_dim = int(indices.size)
 
-        self.cov_eps_x = tf.eye(self._state_dim, dtype=tf.float32) * (float(q_scale) ** 2)
-        self.cov_eps_y = tf.eye(self._obs_dim, dtype=tf.float32) * (float(r_scale) ** 2)
+        self.cov_eps_x = tf.eye(self._state_dim, dtype=_dc.DTYPE) * (float(q_scale) ** 2)
+        self.cov_eps_y = tf.eye(self._obs_dim, dtype=_dc.DTYPE) * (float(r_scale) ** 2)
         self.Lq = tf.linalg.cholesky(self.cov_eps_x)
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 
         if m0 is None:
             m0 = tf.ones([self._state_dim], dtype=tf.float32) * self.F
         if P0 is None:
-            P0 = tf.eye(self._state_dim, dtype=tf.float32)
-        self.m0 = tf.convert_to_tensor(m0, dtype=tf.float32)
-        self.P0 = tf.convert_to_tensor(P0, dtype=tf.float32)
+            P0 = tf.eye(self._state_dim, dtype=_dc.DTYPE)
+        self.m0 = tf.cast(tf.convert_to_tensor(m0), _dc.DTYPE)
+        self.P0 = tf.cast(tf.convert_to_tensor(P0), _dc.DTYPE)
         self.L0 = tf.linalg.cholesky(self.P0)
 
     @staticmethod
     def _validate_obs_op(value):
-        """Validate observation operator selection."""
         mode = str(value).lower()
         valid = {"linear", "abs", "exp", "square"}
         if mode not in valid:
@@ -77,51 +74,32 @@ class Lorenz96SSM(SSM):
 
     @property
     def state_dim(self):
-        """State dimension."""
         return self._state_dim
 
     @property
     def obs_dim(self):
-        """Observation dimension."""
         return self._obs_dim
 
     @property
     def q_dim(self):
-        """Process noise dimension."""
         return self._state_dim
 
     @property
     def r_dim(self):
-        """Observation noise dimension."""
         return self._obs_dim
 
     def _l96_rhs(self, x):
-        """Lorenz-96 vector field."""
         xp1 = tf.roll(x, shift=-1, axis=-1)
         xm2 = tf.roll(x, shift=2, axis=-1)
         xm1 = tf.roll(x, shift=1, axis=-1)
         return (xp1 - xm2) * xm1 - x + self.F
 
     def f(self, x):
-        """Euler discretization of Lorenz-96 dynamics.
-
-        Shapes:
-          x: [B, dx]
-        Returns:
-          x_next: [B, dx]
-        """
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         return x + self.dt * self._l96_rhs(x)
 
     def h(self, x):
-        """Apply the configured observation operator.
-
-        Shapes:
-          x: [B, dx]
-        Returns:
-          y: [B, dy]
-        """
-        x = tf.convert_to_tensor(x, dtype=tf.float32)
+        x = tf.convert_to_tensor(x, dtype=_dc.DTYPE)
         x_obs = tf.gather(x, self.obs_indices, axis=-1)
         if self.obs_op == "linear":
             return x_obs
@@ -134,35 +112,14 @@ class Lorenz96SSM(SSM):
         raise ValueError("Invalid obs_op")
 
     def initial_state_dist(self, shape, **kwargs):
-        """Initial Gaussian state distribution.
-
-        Shapes:
-          shape: batch shape
-        Returns:
-          dist over [..., dx]
-        """
         shape = tf.convert_to_tensor(shape, tf.int32)
         loc = tf.broadcast_to(self.m0, tf.concat([shape, [self.state_dim]], axis=0))
         return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.L0)
 
     def transition_dist(self, x_prev, **kwargs):
-        """Transition distribution using Euler step and Gaussian noise.
-
-        Shapes:
-          x_prev: [B, dx]
-        Returns:
-          dist over [B, dx]
-        """
         loc = self.f(x_prev)
         return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.Lq)
 
     def observation_dist(self, x, **kwargs):
-        """Observation distribution for selected indices.
-
-        Shapes:
-          x: [B, dx]
-        Returns:
-          dist over [B, dy]
-        """
         loc = self.h(x)
         return tfd.MultivariateNormalTriL(loc=loc, scale_tril=self.Lr)

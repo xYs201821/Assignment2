@@ -31,6 +31,7 @@ from experiments.common.exp_utils import (
     cfg_section,
     cfg_subsection,
     ensure_dir,
+    ess_from_weights,
     expand_sweep_values,
     ess_threshold_for_method,
     first_non_null,
@@ -416,13 +417,15 @@ def main() -> None:
                                             flow_ess_threshold,
                                         )
                                         plot_path = method_dir / "pf_ess_over_time.png"
-                                        plot_ess_over_time(
-                                            plot_path,
-                                            w_pre,
-                                            ess_threshold=ess_threshold,
-                                            band_percentiles=plot_pf_ess_percentiles,
-                                            show=plot_pf_ess_show,
-                                        )
+                                        ess_arr = ess_from_weights(w_pre)
+                                        if ess_arr is not None:
+                                            plot_ess_over_time(
+                                                plot_path,
+                                                {method: ess_arr},
+                                                ess_threshold=ess_threshold,
+                                                band_percentiles=plot_pf_ess_percentiles,
+                                                show=plot_pf_ess_show,
+                                            )
 
                             diag = {
                                 k: v

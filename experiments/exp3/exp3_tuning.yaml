@@ -15,8 +15,8 @@ tuning:
         lr: [1e-1]
 
     diffusion:
-      diff_steps: [10, 20, 50]
-      diff_a: [-0.0001, -0.1, -1.0]
+      diff_steps: [5, 10, 20]
+      diff_a: [-0.001, -0.1, -1.0]
       train:
         steps: [100]
         lr: [1e-1]
@@ -38,4 +38,4 @@ tuning:
       train:
         steps: [100]
         proposal_lr: [1e-1]
-        resampler_lr: [2e-3]
+        resampler_lr: [5e-2]

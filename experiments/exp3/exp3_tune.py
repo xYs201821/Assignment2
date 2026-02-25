@@ -7,12 +7,12 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import product
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Sequence, Tuple
 
 import numpy as np
-from tqdm.auto import tqdm
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -27,7 +27,7 @@ DEFAULT_TUNING_CONFIG = Path(__file__).with_name("exp3_tuning.yaml")
 
 
 def _log(message: str) -> None:
-    tqdm.write(message)
+    print(message, flush=True)
 
 
 def _split_candidate_params_for_log(
@@ -105,6 +105,16 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="How many top candidates to keep in the per-method summary.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Number of candidates to evaluate in parallel (one subprocess per candidate). "
+            "Default: 1 (serial)."
+        ),
     )
     return parser.parse_args()
 
@@ -326,10 +336,10 @@ def _fmt_float(value: Any, digits: int = 6) -> str:
 
 
 def _print_method_metric_table(method: str, records: Sequence[Dict[str, Any]]) -> None:
-    headers = ["candidate", "train_sec", "rmse", "loss", "phi_rmse", "ess", "grad_raw", "status", "params"]
+    headers = ["candidate", "train_sec", "rmse", "loss", "phi_rmse", "ess", "grad_raw", "grad_var", "grad_snr", "status", "tune_params"]
     rows: List[List[str]] = []
     for rec in sorted(records, key=lambda r: int(r.get("candidate_id", 0))):
-        params_text = json.dumps(rec.get("params", {}), ensure_ascii=False, sort_keys=True)
+        tune_params_text = json.dumps(rec.get("tune_params", rec.get("params", {})), ensure_ascii=False, sort_keys=True)
         rows.append(
             [
                 str(int(rec.get("candidate_id", 0))),
@@ -339,8 +349,10 @@ def _print_method_metric_table(method: str, records: Sequence[Dict[str, Any]]) -
                 _fmt_float(rec.get("rmse_phi_mean", float("nan"))),
                 _fmt_float(rec.get("ess_mean", float("nan"))),
                 _fmt_float(rec.get("grad_raw_mean", float("nan"))),
+                _fmt_float(rec.get("grad_var_mean", float("nan")), digits=3),
+                _fmt_float(rec.get("grad_snr_mean", float("nan")), digits=3),
                 str(rec.get("status", "")),
-                params_text,
+                tune_params_text,
             ]
         )
 
@@ -366,7 +378,10 @@ def _write_method_table_csv(path: Path, records: Sequence[Dict[str, Any]]) -> No
         "phi_rmse",
         "ess",
         "grad_raw",
+        "grad_var",
+        "grad_snr",
         "status",
+        "tune_params",
         "params",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -382,7 +397,10 @@ def _write_method_table_csv(path: Path, records: Sequence[Dict[str, Any]]) -> No
                     "phi_rmse": rec.get("rmse_phi_mean", float("nan")),
                     "ess": rec.get("ess_mean", float("nan")),
                     "grad_raw": rec.get("grad_raw_mean", float("nan")),
+                    "grad_var": rec.get("grad_var_mean", float("nan")),
+                    "grad_snr": rec.get("grad_snr_mean", float("nan")),
                     "status": rec.get("status", ""),
+                    "tune_params": json.dumps(rec.get("tune_params", {}), ensure_ascii=False, sort_keys=True),
                     "params": json.dumps(rec.get("params", {}), ensure_ascii=False, sort_keys=True),
                 }
             )
@@ -434,6 +452,8 @@ def _evaluate_candidate(
     ess_vals: List[float] = []
     train_sec_vals: List[float] = []
     grad_raw_vals: List[float] = []
+    grad_var_vals: List[float] = []
+    grad_snr_vals: List[float] = []
 
     _log(f"[{method}] candidate={candidate_id:04d} seeds={list(map(int, seeds))}")
     tune_params, train_params = _split_candidate_params_for_log(
@@ -441,7 +461,8 @@ def _evaluate_candidate(
         keys=tune_param_keys,
     )
     _log(f"[{method}] tune_params={json.dumps(tune_params, default=_json_default, sort_keys=True)}")
-    _log(f"[{method}] train_params={json.dumps(train_params, default=_json_default, sort_keys=True)}")
+    if train_params:
+        _log(f"[{method}] train_params={json.dumps(train_params, default=_json_default, sort_keys=True)}")
     try:
         for seed in seeds:
             t_seed0 = time.perf_counter()
@@ -477,6 +498,8 @@ def _evaluate_candidate(
                 grad_raw_finite = grad_raw_hist[np.isfinite(grad_raw_hist)]
                 if grad_raw_finite.size > 0:
                     grad_raw = float(grad_raw_finite[-1])
+            grad_var_final = float(result.get("grad_var_final", float("nan")))
+            grad_snr_final = float(result.get("grad_snr_final", float("nan")))
 
             rmse_vals.append(rmse_final)
             rmse_phi_vals.append(rmse_phi_final)
@@ -484,6 +507,8 @@ def _evaluate_candidate(
             ess_vals.append(ess_final)
             train_sec_vals.append(train_sec)
             grad_raw_vals.append(grad_raw)
+            grad_var_vals.append(grad_var_final)
+            grad_snr_vals.append(grad_snr_final)
             per_seed.append(
                 {
                     "seed": int(seed),
@@ -493,6 +518,8 @@ def _evaluate_candidate(
                     "loss_final": loss_final,
                     "ess_mean_final": ess_final,
                     "grad_raw_final": grad_raw,
+                    "grad_var_final": grad_var_final,
+                    "grad_snr_final": grad_snr_final,
                 }
             )
         status = "ok"
@@ -510,6 +537,7 @@ def _evaluate_candidate(
             "method": method,
             "candidate_id": int(candidate_id),
             "params": params,
+            "tune_params": tune_params,
             "seeds": [int(s) for s in seeds],
             "num_runs": int(len(rmse_vals)),
             "rmse_mean": rmse_mean,
@@ -525,6 +553,10 @@ def _evaluate_candidate(
             "train_sec_std": _finite_std(train_sec_vals),
             "grad_raw_mean": _finite_mean(grad_raw_vals),
             "grad_raw_std": _finite_std(grad_raw_vals),
+            "grad_var_mean": _finite_mean(grad_var_vals),
+            "grad_var_std": _finite_std(grad_var_vals),
+            "grad_snr_mean": _finite_mean(grad_snr_vals),
+            "grad_snr_std": _finite_std(grad_snr_vals),
             "elapsed_sec": elapsed,
             "status": "ok",
             "per_seed": per_seed,
@@ -536,6 +568,7 @@ def _evaluate_candidate(
             "method": method,
             "candidate_id": int(candidate_id),
             "params": params,
+            "tune_params": tune_params,
             "seeds": [int(s) for s in seeds],
             "num_runs": int(len(per_seed)),
             "rmse_mean": float("inf"),
@@ -551,6 +584,10 @@ def _evaluate_candidate(
             "train_sec_std": float("nan"),
             "grad_raw_mean": float("nan"),
             "grad_raw_std": float("nan"),
+            "grad_var_mean": float("nan"),
+            "grad_var_std": float("nan"),
+            "grad_snr_mean": float("nan"),
+            "grad_snr_std": float("nan"),
             "elapsed_sec": elapsed,
             "status": "failed",
             "per_seed": per_seed,
@@ -565,6 +602,62 @@ def _evaluate_candidate(
         f"elapsed={record['elapsed_sec']:.1f}s"
     )
     return record
+
+
+def _worker_evaluate_candidate(
+    candidate_id: int,
+    method: str,
+    params: Dict[str, Any],
+    tune_param_keys: Sequence[str],
+    seeds: Sequence[int],
+    exp_cfg: Dict[str, Any],
+    model_cfg: Dict[str, Any],
+    train_cfg: Dict[str, Any],
+    dpf_cfg_base: Dict[str, Any],
+    proposal_cfg: Dict[str, Any],
+    objective: str,
+    output_dir: Path,
+) -> Dict[str, Any]:
+    """Subprocess entry point: suppress GPU noise, init TF, then evaluate."""
+    import sys as _sys
+
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
+
+    _devnull_fd = os.open(os.devnull, os.O_WRONLY)
+    _saved_fd2 = os.dup(2)
+    _saved_stderr = _sys.stderr
+    os.dup2(_devnull_fd, 2)
+    _sys.stderr = open(os.devnull, "w")
+    os.close(_devnull_fd)
+    try:
+        import tensorflow as _tf
+        from absl import logging as _absl_logging
+        _absl_logging.set_verbosity(_absl_logging.ERROR)
+        _absl_logging.set_stderrthreshold("error")
+        for _gpu in _tf.config.list_physical_devices("GPU"):
+            _tf.config.experimental.set_memory_growth(_gpu, True)
+        _tf.constant(0)
+    finally:
+        _sys.stderr.close()
+        _sys.stderr = _saved_stderr
+        os.dup2(_saved_fd2, 2)
+        os.close(_saved_fd2)
+
+    return _evaluate_candidate(
+        candidate_id=candidate_id,
+        method=method,
+        params=params,
+        tune_param_keys=tune_param_keys,
+        seeds=seeds,
+        exp_cfg=exp_cfg,
+        model_cfg=model_cfg,
+        train_cfg=train_cfg,
+        dpf_cfg_base=dpf_cfg_base,
+        proposal_cfg=proposal_cfg,
+        objective=objective,
+        output_dir=output_dir,
+    )
 
 
 def _write_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
@@ -586,9 +679,14 @@ def _write_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
         "train_sec_std",
         "grad_raw_mean",
         "grad_raw_std",
+        "grad_var_mean",
+        "grad_var_std",
+        "grad_snr_mean",
+        "grad_snr_std",
         "elapsed_sec",
         "num_runs",
         "seeds",
+        "tune_params",
         "params",
         "error",
     ]
@@ -598,6 +696,7 @@ def _write_csv(path: Path, records: Sequence[Dict[str, Any]]) -> None:
         for rec in records:
             row = dict(rec)
             row["seeds"] = ",".join(str(s) for s in row.get("seeds", []))
+            row["tune_params"] = json.dumps(row.get("tune_params", {}), ensure_ascii=False, default=_json_default)
             row["params"] = json.dumps(row.get("params", {}), ensure_ascii=False, default=_json_default)
             writer.writerow({k: row.get(k, "") for k in fields})
 
@@ -685,7 +784,14 @@ def main() -> None:
     objective = str(args.objective or tuning_cfg.get("objective", "combined")).strip().lower()
     if objective not in ("rmse", "loss", "rmse_phi", "combined"):
         raise ValueError("objective must be one of: rmse, loss, rmse_phi, combined.")
-    seeds = [int(s) for s in (args.seeds if args.seeds is not None else as_list(exp_cfg.get("seeds", [0])))]
+
+    if args.seeds is not None:
+        seeds = [int(s) for s in args.seeds]
+    else:
+        all_seeds = as_list(exp_cfg.get("seeds", [0]))
+        seeds = [int(all_seeds[0])]
+
+    n_workers = max(1, int(args.num_workers))
     methods = _resolve_methods(args.methods, dpf_cfg=dpf_cfg, tuning_cfg=tuning_cfg)
     if not methods:
         raise RuntimeError("No methods selected for tuning.")
@@ -697,6 +803,7 @@ def main() -> None:
     _log(f"[exp3_tune] methods={methods}")
     _log(f"[exp3_tune] seeds={seeds}")
     _log(f"[exp3_tune] objective={objective}")
+    _log(f"[exp3_tune] num_workers={n_workers}")
 
     t0 = time.time()
     all_records: List[Dict[str, Any]] = []
@@ -718,36 +825,60 @@ def main() -> None:
             f"sweep_keys={sorted(sweep.keys())}"
         )
 
+        candidates_list = list(_iter_candidates(fixed=fixed, sweep=sweep))
         records_method: List[Dict[str, Any]] = []
-        candidate_iter = tqdm(
-            _iter_candidates(fixed=fixed, sweep=sweep),
-            total=num_candidates,
-            desc=f"exp3_tune:{method}",
-            unit="cand",
-            dynamic_ncols=True,
-            leave=True,
+
+        _shared_kwargs = dict(
+            method=method,
+            tune_param_keys=tune_param_keys,
+            seeds=seeds,
+            exp_cfg=exp_cfg,
+            model_cfg=model_cfg,
+            train_cfg=train_cfg,
+            dpf_cfg_base=dpf_cfg,
+            proposal_cfg=proposal_cfg,
+            objective=objective,
+            output_dir=args.output_dir,
         )
-        for idx, params in enumerate(candidate_iter, start=1):
-            rec = _evaluate_candidate(
-                candidate_id=idx,
-                method=method,
-                params=params,
-                tune_param_keys=tune_param_keys,
-                seeds=seeds,
-                exp_cfg=exp_cfg,
-                model_cfg=model_cfg,
-                train_cfg=train_cfg,
-                dpf_cfg_base=dpf_cfg,
-                proposal_cfg=proposal_cfg,
-                objective=objective,
-                output_dir=args.output_dir,
-            )
+
+        partial_csv = args.output_dir / "exp3_tune_partial.csv"
+
+        def _record_done(rec: Dict[str, Any]) -> None:
             records_method.append(rec)
             all_records.append(rec)
-            candidate_iter.set_postfix_str(
-                f"done={idx}/{num_candidates} status={rec.get('status', 'ok')}",
-                refresh=False,
-            )
+            _write_csv(partial_csv, all_records)
+
+        if n_workers <= 1:
+            for idx, params in enumerate(candidates_list, start=1):
+                _log(f"[exp3_tune][{method}] candidate {idx}/{num_candidates} starting")
+                rec = _evaluate_candidate(
+                    candidate_id=idx, params=params, **_shared_kwargs
+                )
+                _record_done(rec)
+                _log(
+                    f"[exp3_tune][{method}] candidate {idx}/{num_candidates} "
+                    f"status={rec.get('status', 'ok')}"
+                )
+        else:
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                futures = {
+                    pool.submit(
+                        _worker_evaluate_candidate,
+                        candidate_id=idx,
+                        params=params,
+                        **_shared_kwargs,
+                    ): idx
+                    for idx, params in enumerate(candidates_list, start=1)
+                }
+                completed = 0
+                for fut in as_completed(futures):
+                    rec = fut.result()
+                    _record_done(rec)
+                    completed += 1
+                    _log(
+                        f"[exp3_tune][{method}] candidate {rec.get('candidate_id')} done "
+                        f"({completed}/{num_candidates}) status={rec.get('status', 'ok')}"
+                    )
 
         _print_method_metric_table(method, records_method)
         method_table_csv = args.output_dir / f"{method}_results_table.csv"
@@ -799,6 +930,7 @@ def main() -> None:
     _log(f"[exp3_tune] results_json={json_path}")
     _log(f"[exp3_tune] results_csv={csv_path}")
     _log(f"[exp3_tune] best_json={best_path}")
+    _log(f"[exp3_tune] partial_csv={args.output_dir / 'exp3_tune_partial.csv'} (incremental, safe to keep)")
 
 
 if __name__ == "__main__":

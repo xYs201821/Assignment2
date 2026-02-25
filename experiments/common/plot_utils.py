@@ -127,6 +127,7 @@ def plot_ess_over_time(
     band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
     show: bool = False,
     title: Optional[str] = None,
+    ess_threshold: Optional[float] = None,
 ) -> None:
     """Plot ESS over time for multiple methods.
     
@@ -180,6 +181,15 @@ def plot_ess_over_time(
                 lo = np.min(ess_np, axis=0)
                 hi = np.max(ess_np, axis=0)
             ax.fill_between(t, lo, hi, alpha=0.2)
+
+    if ess_threshold is not None:
+        ax.axhline(
+            float(ess_threshold),
+            color="gray",
+            linestyle="--",
+            linewidth=1.0,
+            label=f"threshold ({ess_threshold:.2g})",
+        )
 
     ax.set_xlabel("time")
     ax.set_ylabel("ESS")

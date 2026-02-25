@@ -233,7 +233,8 @@ class OTResamplingDPF(DPFBase):
         parent_indices = tf.argmax(plan, axis=-2, output_type=tf.int32)
         return x_new, log_w_new, parent_indices
 
-    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor):
+    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor,
+                      training: bool | None = None):
         return self.ot_resample_barycentric(
             x=x,
             log_w=log_w,
@@ -254,6 +255,7 @@ class OTResamplingDPF(DPFBase):
         init_dist=None,
         init_seed=None,
         init_particles=None,
+        training: bool | None = None,
     ):
         if any(
             v is not None
@@ -285,6 +287,7 @@ class OTResamplingDPF(DPFBase):
             init_dist=init_dist,
             init_seed=init_seed,
             init_particles=init_particles,
+            training=training,
         )
 
 
