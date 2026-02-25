@@ -1,7 +1,8 @@
+absl-py
+matplotlib
+numpy
+psutil
+pytest
+pyyaml
 tensorflow
 tensorflow_probability
-numpy
-matplotlib
-pytest
-psutil
-pyyaml

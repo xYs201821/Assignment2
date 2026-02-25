@@ -1,136 +1,145 @@
-# Filters and SSM Interfaces
+# Assignment2: Particle Filtering and Differentiable Particle Filter Experiments
 
-This README focuses on the SSM and filter interfaces used in exp1-2 and how the experiment code wires them together (generated with the help of ChatGPT).
+This repository contains a TensorFlow-based research codebase for nonlinear state estimation and differentiable particle filtering.
 
-## Experiment map
-- exp1: LinearGaussianSSM + kf, pf, edh(pfpf), ledh(pfpf)
-- exp2a: StochasticVolatilitySSM + ekf, ukf, pf, edh, ledh, edh(pfpf), kflow_diag, kflow_scalar
-- exp2b: RangeBearingSSM + ekf, ukf, pf, edh
+It includes:
+- classical Gaussian filters (`KF`, `EKF`, `UKF`)
+- bootstrap particle filtering
+- particle-flow methods (`EDH`, `LEDH`, kernel flow, stochastic particle flow)
+- differentiable particle filters with multiple resampling schemes (soft, OT, diffusion, transformer)
+- experiment pipelines for multiple state-space models
 
-## SSM base interface (src/ssm/base.py)
-Required properties:
-- state_dim, obs_dim, q_dim, r_dim
-- m0, P0 (initial mean/cov)
-- cov_eps_x, cov_eps_y (process/obs noise cov)
+## Requirements
 
-Required methods:
-- initial_state_dist(shape) -> tfd.Distribution
-- transition_dist(x_prev) -> tfd.Distribution
-- observation_dist(x) -> tfd.Distribution
-- f(x) and h(x) deterministic dynamics/observation
+- Python `3.11`
+- Linux/macOS environment recommended
+- Optional GPU support via TensorFlow (CPU-only runs are supported)
 
-Optional overrides:
-- f_with_noise(x, q) / h_with_noise(x, r) for non-additive noise
-- innovation(y, y_pred) for wrapped angles
-- measurement_mean, measurement_residual for non-Euclidean obs
+Install dependencies:
 
-Common helpers:
-- sample_initial_state, sample_transition, sample_observation
-- simulate(T, shape, x0=None) -> x_traj [batch, T, dx], y_traj [batch, T, dy]
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
 
-Shape conventions:
-- state x: [batch, dx] or [batch, N, dx] for particles
-- observation y: [batch, dy] or [batch, T, dy]
+## Quick Start
 
-## SSMs used in exp1-2
+Run the experiment router help:
 
-### LinearGaussianSSM (exp1)
-- file: src/ssm/base.py
-- init: A, B, C, D, m0, P0, jitter, seed
-- f(x) = A x, h(x) = C x
-- cov_eps_x = B B^T, cov_eps_y = D D^T
-- used in experiments/exp1/exp1_linear_gaussian.py 
+```bash
+python -m experiments --help
+```
 
-### StochasticVolatilitySSM (exp2a)
-- file: src/ssm/stochastic_volatility.py
-- init: alpha, sigma, beta, mu, noise_scale_func, obs_mode, obs_eps, seed
-- nonlinear obs; obs_mode in config is "logy2"
-- overrides f_with_noise and h_with_noise (non-additive noise)
-- used in experiments/exp2a/exp2a_stochastic_vol.py 
+Run a default experiment:
 
-### RangeBearingSSM (exp2b)
-- file: src/ssm/range_bearing.py
-- init: motion_model (ConstantVelocityMotionModel), cov_eps_y, jitter, seed
-- observation returns [range, bearing] with angle wrapping
-- overrides innovation and measurement_mean/residual for bearing
-- used in experiments/exp2b/exp2b_range_bearing.py 
+```bash
+python -m experiments exp3 --seed 0 --methods kalman --steps 1
+```
 
-## Filter interfaces
+Run unit tests:
 
-### Gaussian filters: KF, EKF, UKF
-Classes:
-- src/filters/kalman.py: KalmanFilter
-- src/filters/ekf.py: ExtendedKalmanFilter
-- src/filters/ukf.py: UnscentedKalmanFilter
+```bash
+pytest -m unit
+```
 
-Constructor: KalmanFilter(ssm) / ExtendedKalmanFilter(ssm, joseph=True) /
-UnscentedKalmanFilter(ssm, alpha, beta, kappa, jitter, joseph)
+## Experiment Entry Points
 
-Call pattern:
-- filt.warmup(batch_size)   # used in experiments to trace tf.function
-- out = filt.filter(y, m0=None, P0=None)
+Primary entry command:
 
-Outputs (dict):
-- m_filt: [batch, T, dx]
-- P_filt: [batch, T, dx, dx]
-- m_pred, P_pred: one-step predictions
-- cond_P: condition numbers
+```bash
+python -m experiments <name> [experiment args...]
+```
 
-SSM requirements:
-- KF expects LinearGaussianSSM with A, C and cov_eps_x/cov_eps_y
-- EKF/UKF use f/h and f_with_noise/h_with_noise for Jacobians or sigma points
+Available `<name>` values:
 
-### Particle and flow filters: PF, EDH, LEDH, KernelFlow
-Classes:
-- src/filters/pf_bootstrap.py: BootstrapParticleFilter (method name "pf")
-- src/flows/edh.py: EDHFlow
-- src/flows/ledh.py: LEDHFlow
-- src/flows/kernel_embedded.py: KernelParticleFlow (method names "kflow_diag"/"kflow_scalar")
+| Name | Module | Default config |
+| --- | --- | --- |
+| `exp1` | `experiments.exp1.exp1_linear_gaussian` | `experiments/exp1/exp1_config.yaml` |
+| `exp2a` | `experiments.exp2a.exp2a_stochastic_vol` | `experiments/exp2a/exp2a_config.yaml` |
+| `exp2b` | `experiments.exp2b.exp2b_range_bearing` | `experiments/exp2b/exp2b_config.yaml` |
+| `exp3` | `experiments.exp3.exp3_lgssm_dpf` | `experiments/exp3/exp3_config.yaml` |
+| `exp3tune` | `experiments.exp3.exp3_tune` | `experiments/exp3/exp3_config.yaml` + `experiments/exp3/exp3_tuning.yaml` |
+| `exp3pt` | `experiments.exp3.exp3_transformer_pretrain` | `experiments/exp3/exp3_transformer_pretrain_config.yaml` |
+| `exp3plot` | `experiments.exp3.plot_exp3_dpf_diagnostics` | plot utility (reads saved traces) |
+| `dai22` | `experiments.dai22.exp_dai22` | CLI-only (no YAML required) |
 
-Common call pattern:
-- filt.warmup(batch_size, ...)
-- x_seq, w_seq, diagnostics, parents = filt.filter(
-      y,
-      num_particles=None,
-      ess_threshold=None,
-      reweight="always", # 'never' for kflow, edh/ledh
-      resample="auto", # 'auto': only resample when below threshold; 'always': always resample; 'never' never resample
-      init_dist=None,
-      init_seed=None,
-      init_particles=None,
-  )
+Examples:
 
-Outputs:
-- x_seq: [batch, T, N, dx]
-- w_seq: [batch, T, N]
-- diagnostics: m_pred, P_pred, x_pred, w_pre, plus flow-specific stats
-- parents: resampling parent indices [batch, T, N]
+```bash
+# Run exp2b with defaults
+python -m experiments exp2b
 
-Notes:
-- reweight/resample can be "never", "auto", "always" (or bool/int)
-- init_dist provides .sample(shape, seed) or is a callable returning a distribution (see build_init_dist)
-- init_particles can be used to seed PF/flows (used in exp2b)
-- either provide init_particles or init_dist
+# Force device selection on router
+python -m experiments --device cpu exp3 --steps 100 --num-workers 2
 
-KernelParticleFlow specific args:
-- kernel_type: "diag" or "scalar" 
-- ll_grad_mode: "linearized" or "dist" # whether or not use linearization to approximate likelihood
-- optimizer: "fixed", "adagrad", "adam" # 'none' stands for fixed step size
-- alpha, alpha_update_every, ds_init, max_flow_norm, localization_radius
+# Override YAML values (supported in exp1/exp2a/exp2b via --set).
+# In zsh, quote values containing [] to avoid shell glob expansion.
+python -m experiments exp2a \
+  --set 'experiment.seeds=[0,1,2]' \
+  --set 'filters.flow.num_particles=[100]'
+```
+## Testing
 
-## Experiment wiring (exp1-2)
+Pytest is configured with unit and integration markers.
 
-All experiments build filters via experiments/common/filter_cfg.py and run them via
-experiments/common/runner.py: run_filter(ssm, y_obs, method, **cfg).
+```bash
+# all tests
+pytest
 
-Key config blocks in exp*_config.yaml:
-- filters.methods: list of method names (kf, ekf, ukf, pf, edh, ledh, edh(pfpf), ledh(pfpf), kflow_diag, kflow_scalar)
-- filters.ukf: alpha, beta, kappa, jitter
-- filters.pf: num_particles, ess_threshold, reweight
-- filters.flow: num_particles, num_lambda, ess_threshold, reweight
-- filters.kflow: num_particles, num_lambda, alpha, ds_init, optimizer, ll_grad_mode, max_flow_norm, localization_radius
+# only unit tests
+pytest -m unit
 
-Method name behavior:
-- "edh(pfpf)" / "ledh(pfpf)" force reweight="always" and resample="auto"
-- "kflow_diag" / "kflow_scalar" select kernel_type
-- kflow grid params are expanded into method suffixes via tag_from_cfg
+# only integration tests
+pytest -m integration
+
+# specific test file
+pytest tests/unit/test_ukf_sigma_points.py -q
+```
+
+## Results and Outputs
+
+Outputs are written under `results/` by default (overridable in configs/CLI).
+
+Typical artifacts include:
+- per-seed traces (`*.npz`)
+- diagnostics and metrics
+- experiment summaries (`summary.json`)
+- diagnostic plots (`*.png`)
+
+For `exp3`, the default structure is:
+
+```text
+results/exp3_lgssm_dpf/<experiment_name>/
+```
+
+By default `experiment_name` is `exp3`, so plotting usually targets:
+
+```bash
+python -m experiments exp3plot --input-root results/exp3_lgssm_dpf/exp3
+```
+
+This plotting command requires existing trace files under the input directory
+(run `exp3` first).
+
+## Repository Layout
+
+```text
+src/
+  filters/        # KF/EKF/UKF, PF, DPF variants, resampling layers
+  flows/          # EDH/LEDH, kernel flow, stochastic PF, beta schedules
+  ssm/            # state-space models (linear Gaussian, SV, range-bearing, VRNN)
+experiments/
+  exp1/ exp2a/ exp2b/ exp3/ exp4/ dai22/
+  common/         # shared config, runner, metrics, plotting utilities
+tests/
+  unit/
+  integration/
+```
+
+## Notes
+
+- Run commands from repository root so relative config paths resolve correctly.
+- Large particle counts and long horizons are memory-intensive; reduce `num_particles`, `batch_size`, or training `steps` if needed.
+- Seeds are configurable in each experiment YAML under `experiment.seeds` for reproducibility.
