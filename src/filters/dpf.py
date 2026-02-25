@@ -62,8 +62,6 @@ class DPFBase(ParticleFilter):
             self.stop_grad_through_time = bool(stop_grad_through_time)
         if proposal is not None:
             self.set_proposal(proposal)
-        if stop_grad_through_time is not None:
-            self.stop_grad_through_time = bool(stop_grad_through_time)
 
     @staticmethod
     def _normalize_proposal_output(out):
