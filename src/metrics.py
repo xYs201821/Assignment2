@@ -448,10 +448,17 @@ def evaluate(
     x_particles = outputs.get("x_particles")
     w = outputs.get("w")
     w_pre = outputs.get("w_pre")
+    log_w_pre = outputs.get("log_w_pre")
+    if w_pre is None and log_w_pre is not None:
+        w_pre = tf.exp(_to_tensor(log_w_pre))
     if w_pre is None:
         diagnostics = outputs.get("diagnostics")
         if isinstance(diagnostics, dict):
             w_pre = diagnostics.get("w_pre")
+            if w_pre is None:
+                log_w_pre = diagnostics.get("log_w_pre")
+                if log_w_pre is not None:
+                    w_pre = tf.exp(_to_tensor(log_w_pre))
     parents = outputs.get("parents")
     is_gaussian = bool(outputs.get("is_gaussian", False))
 
@@ -477,17 +484,26 @@ def evaluate(
         metrics["rmse_y"] = float(rmse_from_error(innovation).numpy())
 
     if cfg.get("nll"):
-        if is_gaussian:
+        diagnostics = outputs.get("diagnostics")
+        log_z = outputs.get("log_z")
+        if log_z is None and isinstance(diagnostics, dict):
+            log_z = diagnostics.get("log_z")
+
+        if log_z is not None:
+            # Prefer per-step log normalizer from the filter loop when available.
+            nll_t = -_to_tensor(log_z)
+        elif is_gaussian:
             mean_nll = outputs.get("m_pred", mean)
             cov_nll = outputs.get("P_pred", cov)
             nll_t = nll_from_gaussian(ssm, y_obs_t, mean_nll, cov_nll)
         else:
-            diagnostics = outputs.get("diagnostics")
             x_pred = outputs.get("x_pred")
             w_prev = outputs.get("w_prev")
             if isinstance(diagnostics, dict):
                 if x_pred is None:
                     x_pred = diagnostics.get("x_pred")
+                if x_pred is None:
+                    x_pred = diagnostics.get("x_pre")
                 if w_prev is None:
                     w_prev = diagnostics.get("w_prev")
             if x_pred is not None and w_prev is not None:
