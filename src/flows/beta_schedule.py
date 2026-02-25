@@ -354,101 +354,97 @@ class OptimalBetaSolver:
         )
 
         r_lo = residual(v_lo)
-        bracket_ok = tf.logical_and(
-            tf.reduce_all(r_lo <= 0.0),
-            tf.reduce_all(r_hi >= 0.0),
+        bracket_ok = tf.logical_and(r_lo <= 0.0, r_hi >= 0.0)
+
+        k0 = tf.constant(0, dtype=tf.int32)
+
+        def bisect_cond(k, v_lo, v_hi, r_lo, r_hi):
+            width = v_hi - v_lo
+            active = tf.logical_and(bracket_ok, width > tol)
+            need = tf.reduce_any(active)
+            return tf.logical_and(k < tf.cast(max_bisect, tf.int32), need)
+
+        def bisect_body(k, v_lo, v_hi, r_lo, r_hi):
+            v_mid = 0.5 * (v_lo + v_hi)
+            r_mid = residual(v_mid)
+            use_hi = tf.logical_and(bracket_ok, r_mid >= 0.0)
+            use_lo = tf.logical_and(bracket_ok, tf.logical_not(use_hi))
+            v_hi = tf.where(use_hi, v_mid, v_hi)
+            r_hi = tf.where(use_hi, r_mid, r_hi)
+            v_lo = tf.where(use_lo, v_mid, v_lo)
+            r_lo = tf.where(use_lo, r_mid, r_lo)
+            return k + 1, v_lo, v_hi, r_lo, r_hi
+
+        _, v_lo_f, v_hi_f, _, _ = tf.while_loop(
+            bisect_cond,
+            bisect_body,
+            [k0, v_lo, v_hi, r_lo, r_hi],
+            shape_invariants=[
+                tf.TensorShape([]),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+            ],
         )
 
-        def _solve():
-            k0 = tf.constant(0, dtype=tf.int32)
+        v0_star = 0.5 * (v_lo_f + v_hi_f)
+        v0_star = tf.where(bracket_ok, v0_star, tf.ones_like(v0_star))
 
-            def bisect_cond(k, v_lo, v_hi, r_lo, r_hi):
-                width = v_hi - v_lo
-                need = tf.reduce_any(width > tol)
-                return tf.logical_and(k < tf.cast(max_bisect, tf.int32), need)
+        beta0 = tf.zeros_like(v0_star)
+        v0 = v0_star
+        ta_beta = tf.TensorArray(compute_dtype, size=num_steps + 1)
+        ta_v = tf.TensorArray(compute_dtype, size=num_steps + 1)
+        ta_beta = ta_beta.write(0, beta0)
+        ta_v = ta_v.write(0, v0)
 
-            def bisect_body(k, v_lo, v_hi, r_lo, r_hi):
-                v_mid = 0.5 * (v_lo + v_hi)
-                r_mid = residual(v_mid)
-                use_hi = r_mid >= 0.0
-                v_hi = tf.where(use_hi, v_mid, v_hi)
-                r_hi = tf.where(use_hi, r_mid, r_hi)
-                v_lo = tf.where(use_hi, v_lo, v_mid)
-                r_lo = tf.where(use_hi, r_lo, r_mid)
-                return k + 1, v_lo, v_hi, r_lo, r_hi
+        def traj_cond(i, beta, v, ta_beta, ta_v):
+            return i < num_steps
 
-            _, v_lo_f, v_hi_f, _, _ = tf.while_loop(
-                bisect_cond,
-                bisect_body,
-                [k0, v_lo, v_hi, r_lo, r_hi],
-                shape_invariants=[
-                    tf.TensorShape([]),
-                    tf.TensorShape(None),
-                    tf.TensorShape(None),
-                    tf.TensorShape(None),
-                    tf.TensorShape(None),
-                ],
-            )
+        def traj_body(i, beta, v, ta_beta, ta_v):
+            beta, v = rk4_step(beta, v)
+            if debug_shapes:
+                def _print():
+                    tf.print(
+                        "integrate_trajectory step",
+                        "i:", i,
+                        "beta:", tf.shape(beta),
+                        "v:", tf.shape(v),
+                    )
+                    return 0
 
-            v0_star = 0.5 * (v_lo_f + v_hi_f)
+                _ = tf.cond(tf.equal(i, 0), _print, lambda: 0)
+            ta_beta = ta_beta.write(i + 1, beta)
+            ta_v = ta_v.write(i + 1, v)
+            return i + 1, beta, v, ta_beta, ta_v
 
-            beta0 = tf.zeros_like(v0_star)
-            v0 = v0_star
-            ta_beta = tf.TensorArray(compute_dtype, size=num_steps + 1)
-            ta_v = tf.TensorArray(compute_dtype, size=num_steps + 1)
-            ta_beta = ta_beta.write(0, beta0)
-            ta_v = ta_v.write(0, v0)
+        i0 = tf.constant(0, dtype=tf.int32)
+        _, _, _, ta_beta, ta_v = tf.while_loop(
+            traj_cond,
+            traj_body,
+            [i0, beta0, v0, ta_beta, ta_v],
+            shape_invariants=[
+                tf.TensorShape([]),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+                None,
+                None,
+            ],
+        )
 
-            def traj_cond(i, beta, v, ta_beta, ta_v):
-                return i < num_steps
+        beta_grid = ta_beta.stack()
+        v_grid = ta_v.stack()
 
-            def traj_body(i, beta, v, ta_beta, ta_v):
-                beta, v = rk4_step(beta, v)
-                if debug_shapes:
-                    def _print():
-                        tf.print(
-                            "integrate_trajectory step",
-                            "i:", i,
-                            "beta:", tf.shape(beta),
-                            "v:", tf.shape(v),
-                        )
-                        return 0
+        beta_grid = tf.linalg.matrix_transpose(beta_grid)
+        v_grid = tf.linalg.matrix_transpose(v_grid)
+        beta = tf.cast(beta_grid[:, :-1], tf.float32)
+        beta_dot = tf.cast(v_grid[:, :-1], tf.float32)
 
-                    _ = tf.cond(tf.equal(i, 0), _print, lambda: 0)
-                ta_beta = ta_beta.write(i + 1, beta)
-                ta_v = ta_v.write(i + 1, v)
-                return i + 1, beta, v, ta_beta, ta_v
+        beta_lin = tf.linspace(0.0, 1.0, num_steps + 1)[:-1]
+        batch = tf.shape(P0_inv)[0]
+        beta_fallback = tf.tile(beta_lin[tf.newaxis, :], [batch, 1])
+        beta = tf.where(bracket_ok[:, tf.newaxis], beta, beta_fallback)
+        beta_dot = tf.where(bracket_ok[:, tf.newaxis], beta_dot, tf.ones_like(beta_dot))
+        v0_star_out = tf.where(bracket_ok, tf.cast(v0_star, tf.float32), tf.ones_like(tf.cast(v0_star, tf.float32)))
 
-            i0 = tf.constant(0, dtype=tf.int32)
-            _, _, _, ta_beta, ta_v = tf.while_loop(
-                traj_cond,
-                traj_body,
-                [i0, beta0, v0, ta_beta, ta_v],
-                shape_invariants=[
-                    tf.TensorShape([]),
-                    tf.TensorShape(None),
-                    tf.TensorShape(None),
-                    None,
-                    None,
-                ],
-            )
-
-            beta_grid = ta_beta.stack()
-            v_grid = ta_v.stack()
-
-            beta_grid = tf.linalg.matrix_transpose(beta_grid)
-            v_grid = tf.linalg.matrix_transpose(v_grid)
-            beta = tf.cast(beta_grid[:, :-1], tf.float32)
-            beta_dot = tf.cast(v_grid[:, :-1], tf.float32)
-            v0_star_out = tf.cast(v0_star, tf.float32)
-            return beta, beta_dot, v0_star_out
-
-        def _fallback():
-            beta_lin = tf.linspace(0.0, 1.0, num_steps + 1)[:-1]
-            batch = tf.shape(P0_inv)[0]
-            beta = tf.tile(beta_lin[tf.newaxis, :], [batch, 1])
-            beta_dot = tf.ones_like(beta)
-            v0_star = tf.ones([batch], dtype=tf.float32)
-            return tf.cast(beta, tf.float32), tf.cast(beta_dot, tf.float32), v0_star
-
-        return tf.cond(bracket_ok, _solve, _fallback)
+        return beta, beta_dot, v0_star_out

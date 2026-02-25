@@ -3,7 +3,7 @@
 import tensorflow as tf
 
 from src.flows.flow_base import FlowBase
-from src.flows.beta_schedule import BetaScheduleConfig, build_beta_schedule
+from src.flows.beta_schedule import BetaScheduleConfig, build_beta_schedule, _cond_number_f
 from src.flows.diagnostics import _cond_from_matrix, _cond_from_rect
 from src.utility import cholesky_solve, quadratic_matmul
 
@@ -56,6 +56,13 @@ class EDHFlow(FlowBase):
 
     def _flow_diag_keys(self):
         return (
+            "condInfo_log10",
+            "condA_log10_max",
+            "condJ_log10_max",
+            "logdetJ",
+            "beta_sched",
+            "beta_dot_sched",
+            "condF_sched",
             "condCov_log10",
             "logdet_cov",
         )
@@ -117,16 +124,17 @@ class EDHFlow(FlowBase):
         r_dim = tf.cast(self.ssm.r_dim, tf.int32)
         I = tf.eye(state_dim, batch_shape=batch_shape, dtype=mu.dtype)
 
+        r0_sched = tf.zeros(tf.concat([batch_shape, [r_dim]], axis=0), dtype=mu.dtype)
+        H0, _ = self.jacobian_h_x(m0, r0_sched)
+        H_r0, _ = self.jacobian_h_r(m0, r0_sched)
+        R_eff0 = quadratic_matmul(H_r0, R, H_r0)
+        R_inv0 = self._inverse_from_cov(R_eff0)
+        RinvJ = tf.einsum("bij,bjk->bik", R_inv0, H0)
+        Info = tf.einsum("bji,bjk->bik", H0, RinvJ)
+        P0_inv = self._inverse_from_cov(P)
+
         guard_on = bool(self.beta_schedule.guard) and self.beta_schedule.mode == "optimal"
         if self.beta_schedule.mode == "optimal":
-            r0_sched = tf.zeros(tf.concat([batch_shape, [r_dim]], axis=0), dtype=mu.dtype)
-            H0, _ = self.jacobian_h_x(m0, r0_sched)
-            H_r0, _ = self.jacobian_h_r(m0, r0_sched)
-            R_eff0 = quadratic_matmul(H_r0, R, H_r0)
-            R_inv0 = self._inverse_from_cov(R_eff0)
-            RinvJ = tf.einsum("bij,bjk->bik", R_inv0, H0)
-            Info = tf.einsum("bji,bjk->bik", H0, RinvJ)
-            P0_inv = self._inverse_from_cov(P)
             beta, beta_dot, dl = build_beta_schedule(
                 "optimal",
                 num_lambda=self.num_lambda,
@@ -162,7 +170,35 @@ class EDHFlow(FlowBase):
         jitter_val = 1e-6 if self.jitter is None else float(self.jitter)
         eps = jitter_val if jitter_val > 0.0 else 1e-6
         eps_t = tf.cast(eps, mu.dtype)
+        log10_base = tf.math.log(10.0)
+        cond_f_sched = _cond_number_f(
+            P0_inv,
+            Info,
+            None,
+            beta,
+            beta_dot,
+            dtype=mu.dtype,
+            jitter=self.jitter,
+            eps=eps,
+        )
+        cond_f_sched = tf.where(
+            tf.math.is_finite(cond_f_sched),
+            cond_f_sched,
+            tf.ones_like(cond_f_sched),
+        )
+        cond_info = _cond_from_matrix(Info, eps_t)
+        cond_info = tf.where(
+            tf.math.is_finite(cond_info),
+            cond_info,
+            tf.ones_like(cond_info),
+        )
+        cond_info_log10 = tf.cast(
+            tf.math.log(cond_info + eps_t) / log10_base,
+            tf.float32,
+        )
         logdet = tf.zeros(tf.shape(mu)[:-2], dtype=tf.float32)
+        condA_log10_max = tf.zeros(tf.shape(mu)[:-2], dtype=tf.float32)
+        condJ_log10_max = tf.zeros(tf.shape(mu)[:-2], dtype=tf.float32)
         r0 = tf.zeros(tf.concat([batch_shape, [r_dim]], axis=0), dtype=mu.dtype)
 
         for j in range(self.num_lambda):
@@ -238,6 +274,22 @@ class EDHFlow(FlowBase):
             bad = tf.logical_or(bad, tf.logical_not(tf.math.is_finite(lad)))
             lad = tf.where(bad, tf.zeros_like(lad), lad)
             logdet = logdet + lad
+            condA = _cond_from_rect(A, eps_t)
+            condA = tf.where(
+                tf.logical_or(tf.logical_not(tf.math.is_finite(condA)), bad),
+                tf.ones_like(condA),
+                condA,
+            )
+            condA_log10 = tf.math.log(condA + eps_t) / log10_base
+            condA_log10_max = tf.maximum(condA_log10_max, tf.cast(condA_log10, tf.float32))
+            condJ = _cond_from_rect(J, eps_t)
+            condJ = tf.where(
+                tf.logical_or(tf.logical_not(tf.math.is_finite(condJ)), bad),
+                tf.ones_like(condJ),
+                condJ,
+            )
+            condJ_log10 = tf.math.log(condJ + eps_t) / log10_base
+            condJ_log10_max = tf.maximum(condJ_log10_max, tf.cast(condJ_log10, tf.float32))
             # Particle transport with Euler discretization.
             Ax = tf.einsum("bij,bnj->bni", A, mu)
             mu_next = mu + step_scale[..., tf.newaxis, tf.newaxis] * (
@@ -247,7 +299,6 @@ class EDHFlow(FlowBase):
             mu = tf.where(bad[..., tf.newaxis, tf.newaxis], mu, mu_next)
 
         # Compute diagnostics outside the loop
-        log10_base = tf.math.log(10.0)
         w_uniform = tf.ones(tf.shape(mu)[:-1], dtype=mu.dtype) / tf.cast(tf.shape(mu)[-2], mu.dtype)
         cov = self.ssm.state_cov(mu, w_uniform)
         # Ensure symmetric and add jitter for numerical stability
@@ -262,6 +313,13 @@ class EDHFlow(FlowBase):
         logdet_cov = tf.reduce_sum(tf.math.log(s), axis=-1)
 
         diagnostics = {
+            "condInfo_log10": cond_info_log10,
+            "condA_log10_max": condA_log10_max,
+            "condJ_log10_max": condJ_log10_max,
+            "logdetJ": logdet,
+            "beta_sched": tf.cast(beta, tf.float32),
+            "beta_dot_sched": tf.cast(beta_dot, tf.float32),
+            "condF_sched": tf.cast(cond_f_sched, tf.float32),
             "condCov_log10": cond_cov_log10,
             "logdet_cov": logdet_cov,
         }

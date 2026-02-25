@@ -3,7 +3,7 @@
 import tensorflow as tf
 
 from src.flows.flow_base import FlowBase
-from src.flows.beta_schedule import BetaScheduleConfig, build_beta_schedule
+from src.flows.beta_schedule import BetaScheduleConfig, build_beta_schedule, _cond_number_f
 from src.flows.diagnostics import _cond_from_matrix, _cond_from_rect
 from src.utility import cholesky_solve, quadratic_matmul
 
@@ -56,6 +56,13 @@ class LEDHFlow(FlowBase):
 
     def _flow_diag_keys(self):
         return (
+            "condInfo_log10",
+            "condA_log10_max",
+            "condJ_log10_max",
+            "logdetJ",
+            "beta_sched",
+            "beta_dot_sched",
+            "condF_sched",
             "condCov_log10",
             "logdet_cov",
         )
@@ -123,21 +130,23 @@ class LEDHFlow(FlowBase):
             tf.concat([batch_shape, [N, state_dim, state_dim]], axis=0),
         )
         R = self.ssm.cov_eps_y
+
+        if w is None:
+            mu_mean = tf.reduce_mean(mu, axis=-2)
+        else:
+            w = tf.math.divide_no_nan(w, tf.reduce_sum(w, axis=-1, keepdims=True))
+            mu_mean = self.ssm.state_mean(mu, w)
+        r0_sched = tf.zeros(tf.concat([batch_shape, [r_dim]], axis=0), dtype=mu.dtype)
+        H0, _ = self.jacobian_h_x(mu_mean, r0_sched)
+        H_r0, _ = self.jacobian_h_r(mu_mean, r0_sched)
+        R_eff0 = quadratic_matmul(H_r0, R, H_r0)
+        R_inv0 = self._inverse_from_cov(R_eff0)
+        RinvJ = tf.einsum("bij,bjk->bik", R_inv0, H0)
+        Info = tf.einsum("bji,bjk->bik", H0, RinvJ)
+        P0_inv = self._inverse_from_cov(P)
+
         guard_on = bool(self.beta_schedule.guard) and self.beta_schedule.mode == "optimal"
         if self.beta_schedule.mode == "optimal":
-            if w is None:
-                mu_mean = tf.reduce_mean(mu, axis=-2)
-            else:
-                w = tf.math.divide_no_nan(w, tf.reduce_sum(w, axis=-1, keepdims=True))
-                mu_mean = self.ssm.state_mean(mu, w)
-            r0_sched = tf.zeros(tf.concat([batch_shape, [r_dim]], axis=0), dtype=mu.dtype)
-            H0, _ = self.jacobian_h_x(mu_mean, r0_sched)
-            H_r0, _ = self.jacobian_h_r(mu_mean, r0_sched)
-            R_eff0 = quadratic_matmul(H_r0, R, H_r0)
-            R_inv0 = self._inverse_from_cov(R_eff0)
-            RinvJ = tf.einsum("bij,bjk->bik", R_inv0, H0)
-            Info = tf.einsum("bji,bjk->bik", H0, RinvJ)
-            P0_inv = self._inverse_from_cov(P)
             beta, beta_dot, dl = build_beta_schedule(
                 "optimal",
                 num_lambda=self.num_lambda,
@@ -151,6 +160,8 @@ class LEDHFlow(FlowBase):
                 max_bracket=self.beta_schedule.max_bracket,
                 tol=self.beta_schedule.tol,
             )
+            beta_sched = tf.cast(beta, mu.dtype)
+            beta_dot_sched = tf.cast(beta_dot, mu.dtype)
             beta = beta[:, tf.newaxis, :]
             beta_dot = beta_dot[:, tf.newaxis, :]
             beta = tf.broadcast_to(beta, tf.concat([batch_shape, [N, self.num_lambda]], axis=0))
@@ -169,6 +180,8 @@ class LEDHFlow(FlowBase):
                 num_lambda=self.num_lambda,
                 dtype=mu.dtype,
             )
+            beta_sched = tf.cast(beta, mu.dtype)
+            beta_dot_sched = tf.cast(beta_dot, mu.dtype)
             beta = beta[:, tf.newaxis, :]
             beta_dot = beta_dot[:, tf.newaxis, :]
             beta = tf.broadcast_to(beta, tf.concat([batch_shape, [N, self.num_lambda]], axis=0))
@@ -196,7 +209,35 @@ class LEDHFlow(FlowBase):
         jitter_val = 0.0 if self.jitter is None else float(self.jitter)
         eps = jitter_val if jitter_val > 0.0 else 1e-12
         eps_t = tf.cast(eps, mu.dtype)
+        log10_base = tf.math.log(10.0)
+        cond_f_sched = _cond_number_f(
+            P0_inv,
+            Info,
+            None,
+            beta_sched,
+            beta_dot_sched,
+            dtype=mu.dtype,
+            jitter=self.jitter,
+            eps=eps,
+        )
+        cond_f_sched = tf.where(
+            tf.math.is_finite(cond_f_sched),
+            cond_f_sched,
+            tf.ones_like(cond_f_sched),
+        )
+        cond_info = _cond_from_matrix(Info, eps_t)
+        cond_info = tf.where(
+            tf.math.is_finite(cond_info),
+            cond_info,
+            tf.ones_like(cond_info),
+        )
+        cond_info_log10 = tf.cast(
+            tf.math.log(cond_info + eps_t) / log10_base,
+            tf.float32,
+        )
         logdet = tf.zeros(tf.shape(mu)[:-1], dtype=tf.float32)
+        condA_log10_max = tf.zeros(tf.shape(mu)[:-2], dtype=tf.float32)
+        condJ_log10_max = tf.zeros(tf.shape(mu)[:-2], dtype=tf.float32)
         r0 = tf.zeros(tf.concat([batch_shape, [N, r_dim]], axis=0), dtype=mu.dtype)
 
         for j in range(self.num_lambda):
@@ -272,13 +313,30 @@ class LEDHFlow(FlowBase):
             bad = tf.logical_or(bad, tf.logical_not(tf.math.is_finite(lad)))
             lad = tf.where(bad, tf.zeros_like(lad), lad)
             logdet = logdet + lad
+            condA_particles = _cond_from_rect(A, eps_t)
+            condA_particles = tf.where(
+                tf.logical_or(tf.logical_not(tf.math.is_finite(condA_particles)), bad),
+                tf.ones_like(condA_particles),
+                condA_particles,
+            )
+            condA_mean = tf.reduce_mean(condA_particles, axis=-1)
+            condA_log10 = tf.math.log(condA_mean + eps_t) / log10_base
+            condA_log10_max = tf.maximum(condA_log10_max, tf.cast(condA_log10, tf.float32))
+            condJ_particles = _cond_from_rect(J, eps_t)
+            condJ_particles = tf.where(
+                tf.logical_or(tf.logical_not(tf.math.is_finite(condJ_particles)), bad),
+                tf.ones_like(condJ_particles),
+                condJ_particles,
+            )
+            condJ_mean = tf.reduce_mean(condJ_particles, axis=-1)
+            condJ_log10 = tf.math.log(condJ_mean + eps_t) / log10_base
+            condJ_log10_max = tf.maximum(condJ_log10_max, tf.cast(condJ_log10, tf.float32))
 
             # Particle transport with Euler discretization.
             Ax = tf.einsum("bnij,bnj->bni", A, mu)
             mu_next = mu + step_scale[..., tf.newaxis] * (Ax + b)
             mu = tf.where(bad[..., tf.newaxis], mu, mu_next)
 
-        log10_base = tf.math.log(10.0)
         w_uniform = tf.ones(tf.shape(mu)[:-1], dtype=mu.dtype) / tf.cast(tf.shape(mu)[-2], mu.dtype)
         cov = self.ssm.state_cov(mu, w_uniform)
         # Ensure symmetric and add jitter for numerical stability
@@ -293,6 +351,13 @@ class LEDHFlow(FlowBase):
         logdet_cov = tf.reduce_sum(tf.math.log(s), axis=-1)
 
         diagnostics = {
+            "condInfo_log10": cond_info_log10,
+            "condA_log10_max": condA_log10_max,
+            "condJ_log10_max": condJ_log10_max,
+            "logdetJ": tf.reduce_mean(logdet, axis=-1),
+            "beta_sched": tf.cast(beta_sched, tf.float32),
+            "beta_dot_sched": tf.cast(beta_dot_sched, tf.float32),
+            "condF_sched": tf.cast(cond_f_sched, tf.float32),
             "condCov_log10": cond_cov_log10,
             "logdet_cov": logdet_cov,
         }

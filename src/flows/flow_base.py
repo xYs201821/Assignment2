@@ -83,6 +83,11 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         return ()
 
     @staticmethod
+    def _empty_flow_diag() -> dict:
+        """Return an empty flow diagnostics dictionary."""
+        return {}
+
+    @staticmethod
     def _broadcast_log_det(log_det, log_q0):
         """Broadcast log_det to match log_q0 rank when needed."""
         log_det = tf.convert_to_tensor(log_det, dtype=log_q0.dtype)
@@ -176,7 +181,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             y = self._normalize_y(y)
         _ = self.filter(y, reweight=reweight, resample=resample)
 
-    def step(
+    def _step_with_flow_diag(
         self,
         x_prev,
         log_w_prev,
@@ -199,6 +204,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
           parent_indices: [B, N]
           log_w_pre: [B, N]
           logz_t: [B]
+          flow_diag: dict[str, Tensor]
         """
         reweight, resample = self._normalize_step_modes(reweight, resample)
         if reweight != 0 and not self._flow_supports_reweight():
@@ -219,7 +225,9 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         w_prev = tf.math.divide_no_nan(w_prev, tf.reduce_sum(w_prev, axis=-1, keepdims=True))
 
         m, P = self._prior_from_sample(mu_tilde, w_prev)
-        x_t, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
+        x_t, log_det, flow_diag = self._flow_transport(mu_tilde, y_t, m, P, w=w_prev)
+        if flow_diag is None:
+            flow_diag = self._empty_flow_diag()
 
         # Importance reweighting with flow Jacobian correction (if supported).
         log_w = self._flow_reweight(
@@ -274,6 +282,37 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             parent_indices,
             log_w_pre,
             logz_t,
+            flow_diag,
+        )
+
+    def step(
+        self,
+        x_prev,
+        log_w_prev,
+        y_t,
+        reweight="auto",
+        resample="never",
+        **kwargs,
+    ):
+        """Public one-step API preserving legacy 7-tuple return signature."""
+        x_pre, x_t, log_w_final, w_final, parent_indices, log_w_pre, logz_t, _ = (
+            self._step_with_flow_diag(
+                x_prev,
+                log_w_prev,
+                y_t,
+                reweight=reweight,
+                resample=resample,
+                **kwargs,
+            )
+        )
+        return (
+            x_pre,
+            x_t,
+            log_w_final,
+            w_final,
+            parent_indices,
+            log_w_pre,
+            logz_t,
         )
 
     def filter(
@@ -314,6 +353,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
     def _filter_loop_impl(self, y, x_prev, log_w, reweight, resample):
         """Core filter loop (tf.function compiled)."""
         T = tf.shape(y)[1]
+        flow_diag_keys = tuple(self._flow_diag_keys())
 
         x_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
         x_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
@@ -322,6 +362,10 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         log_w_pre_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
         parent_ta = tf.TensorArray(tf.int32, size=T, dynamic_size=False)
         logz_ta = tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+        flow_diag_tas = tuple(
+            tf.TensorArray(tf.float32, size=T, dynamic_size=False)
+            for _ in flow_diag_keys
+        )
 
         def _cond(t, _state):
             return t < T
@@ -336,6 +380,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
                 log_w_pre_ta,
                 parent_ta,
                 logz_ta,
+                flow_diag_tas,
             ) = tas
 
             y_t = y[:, t, :]
@@ -347,7 +392,8 @@ class FlowBase(ParticleFilter, LinearizationMixin):
                 parent_indices,
                 log_w_pre,
                 logz_t,
-            ) = self.step(
+                flow_diag,
+            ) = self._step_with_flow_diag(
                 x_prev,
                 log_w,
                 y_t,
@@ -363,6 +409,14 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             log_w_pre_ta = log_w_pre_ta.write(t, log_w_pre)
             parent_ta = parent_ta.write(t, parent_indices)
             logz_ta = logz_ta.write(t, logz_t)
+            flow_diag_tas_list = list(flow_diag_tas)
+            for idx, key in enumerate(flow_diag_keys):
+                if key in flow_diag:
+                    flow_diag_tas_list[idx] = flow_diag_tas_list[idx].write(
+                        t,
+                        tf.cast(flow_diag[key], tf.float32),
+                    )
+            flow_diag_tas = tuple(flow_diag_tas_list)
 
             tas = (
                 x_ta,
@@ -372,6 +426,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
                 log_w_pre_ta,
                 parent_ta,
                 logz_ta,
+                flow_diag_tas,
             )
             return t + 1, (x_prev, log_w, tas)
 
@@ -383,11 +438,12 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             log_w_pre_ta,
             parent_ta,
             logz_ta,
+            flow_diag_tas,
         )
         loop_state_invariants = (
             tf.TensorShape(None),
             tf.TensorShape(None),
-            (None, None, None, None, None, None, None),
+            (None, None, None, None, None, None, None, tuple(None for _ in flow_diag_keys)),
         )
         _, (_, _, tas) = tf.while_loop(
             _cond,
@@ -403,6 +459,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             log_w_pre_ta,
             parent_ta,
             logz_ta,
+            flow_diag_tas,
         ) = tas
 
         x_seq = self._stack_and_permute(x_ta, tail_dims=2)
@@ -421,4 +478,6 @@ class FlowBase(ParticleFilter, LinearizationMixin):
             "log_w_pre": log_w_pre_seq,
             "parent_index": parent_seq,
         }
+        for key, ta in zip(flow_diag_keys, flow_diag_tas):
+            diagnostics[key] = self._stack_and_permute(ta, tail_dims=0)
         return x_seq, w_seq, diagnostics, parent_seq

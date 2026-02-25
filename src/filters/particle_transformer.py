@@ -288,6 +288,7 @@ class ParticleTransformerResampler(tf.keras.layers.Layer):
 
         attn_last = tf.reduce_mean(attn_last, axis=1)
         out_scaled = self.final_proj(query)
+        out_scaled = tf.math.tanh(out_scaled)
         x_new = self._undo_scale(out_scaled, x_min=x_min, x_range=x_range)
         return x_new, attn_last
 
