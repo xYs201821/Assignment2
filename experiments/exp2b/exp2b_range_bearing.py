@@ -620,12 +620,14 @@ def main() -> None:
                                             flow_ess_threshold,
                                         )
                                         plot_path = method_dir / "pf_ess_over_time.png"
-                                        plot_ess_over_time(
-                                            plot_path,
-                                            w_pre,
-                                            ess_threshold=ess_threshold,
-                                            show=plot_pf_ess_show,
-                                        )
+                                        ess_arr = ess_from_weights(w_pre)
+                                        if ess_arr is not None:
+                                            plot_ess_over_time(
+                                                plot_path,
+                                                {method: ess_arr},
+                                                ess_threshold=ess_threshold,
+                                                show=plot_pf_ess_show,
+                                            )
                                 if plot_pf_degeneracy and (
                                     not plot_pf_degeneracy_seed0_only or seed == seeds[0]
                                 ):

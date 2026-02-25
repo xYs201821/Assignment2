@@ -40,6 +40,7 @@ from experiments.common.exp_helper import (
     grad_metrics_from_history as _grad_metrics_from_history,
     particle_mean as _particle_mean,
     print_method_summary_table,
+    print_metrics_compare,
     print_separator,
     resampled_from_parent_index as _resampled_from_parent_index,
     result_stage_metrics as _result_stage_metrics,
@@ -68,8 +69,12 @@ SUMMARY_KEYS = (
     "ess_mean",
     "grad_snr",
     "grad_var",
+    "grad_raw",
+    "gpu_peak_mb",
     "train_sec",
 )
+# Metrics reported for the held-out test split (no grad/phi columns).
+TEST_SUMMARY_KEYS = ("loss", "nll", "rmse", "ess_mean")
 
 
 _log_fh: "IO[str] | None" = None
@@ -199,8 +204,10 @@ class _SeedContext:
     """Per-seed immutable context shared by method runners."""
     rng: np.random.Generator
     fit_ssm: LinearGaussianSSM
-    x_true: Any
-    y_obs: Any
+    x_true: Any   # train split
+    y_obs: Any    # train split
+    x_test: Any   # test split
+    y_test: Any   # test split
     state_dim: int
     obs_dim: int
     rng_base: int
@@ -211,7 +218,12 @@ def _build_seed_context(
     exp_cfg: Dict[str, Any],
     model_cfg: Dict[str, Any],
 ) -> _SeedContext:
-    """Build one seed's simulation data + fit model once and reuse downstream."""
+    """Build one seed's simulation data + fit model once and reuse downstream.
+
+    The simulated batch is split 50/50 into train and test halves.  If
+    ``batch_size`` is odd the last sequence is dropped so both halves have
+    equal size.  A minimum of 2 sequences (1 train + 1 test) is required.
+    """
     set_seed(seed)
     rng = np.random.default_rng(seed)
 
@@ -220,18 +232,37 @@ def _build_seed_context(
     state_dim = int(model_cfg.get("state_dim", 8))
     obs_dim = int(model_cfg.get("obs_dim", max(1, state_dim // 2)))
 
+    if batch_size < 2:
+        raise ValueError(
+            f"experiment.batch_size must be >= 2 for train-test split, got {batch_size}. "
+            "Set experiment.batch_size to an even integer >= 2 in the config."
+        )
+    B_half = batch_size // 2  # each split gets this many sequences
+    if batch_size % 2 != 0:
+        _log(
+            f"[seed={seed}] WARNING: batch_size={batch_size} is odd; "
+            f"using {B_half * 2} sequences ({B_half} train + {B_half} test)."
+        )
+
     sim_ssm, fit_ssm = build_exp3_linear_ssm_pair(
         model_cfg=model_cfg,
         seed=int(seed),
         fit_trainable=False,
     )
-    x_true, y_obs = sim_ssm.simulate(T=T, shape=[batch_size])
+    x_all, y_all = sim_ssm.simulate(T=T, shape=[B_half * 2])
+
+    x_train = x_all[:B_half]
+    y_train = y_all[:B_half]
+    x_test  = x_all[B_half:]
+    y_test  = y_all[B_half:]
 
     return _SeedContext(
         rng=rng,
         fit_ssm=fit_ssm,
-        x_true=x_true,
-        y_obs=y_obs,
+        x_true=x_train,
+        y_obs=y_train,
+        x_test=x_test,
+        y_test=y_test,
         state_dim=state_dim,
         obs_dim=obs_dim,
         rng_base=int(seed) * 1_000_000,
@@ -249,7 +280,7 @@ def _evaluate_filter(
     mean_seq = _particle_mean(x_seq, w_seq)
     logz_t = tf.convert_to_tensor(diagnostics["log_z"], dtype=tf.float32)
     logz_total = tf.reduce_sum(logz_t, axis=1)
-    loss = -tf.reduce_mean(logz_total)
+    loss = -tf.reduce_mean(logz_t)
     nll = -tf.reduce_mean(logz_t)
     rmse = tf.sqrt(tf.reduce_mean(tf.square(mean_seq - x_true)))
     log_w_pre = tf.convert_to_tensor(diagnostics["log_w_pre"], dtype=tf.float32)
@@ -300,7 +331,7 @@ def _evaluate_kalman(
     L = tf.linalg.cholesky(S)
     logz_t = tfd.MultivariateNormalTriL(loc=y_pred, scale_tril=L).log_prob(y_obs_t)
     logz_total = tf.reduce_sum(logz_t, axis=1)  # [B]
-    loss = -tf.reduce_mean(logz_total)
+    loss = -tf.reduce_mean(logz_t)
     nll = -tf.reduce_mean(logz_t)
 
     diagnostics = {
@@ -764,17 +795,22 @@ def _resolve_method_train_cfg(
 
 def _run_kalman_method(seed_ctx: _SeedContext) -> Dict[str, Any]:
     fit_ssm = seed_ctx.fit_ssm
-    x_true = seed_ctx.x_true
-    y_obs = seed_ctx.y_obs
+    x_true = seed_ctx.x_true  # train split
+    y_obs = seed_ctx.y_obs    # train split
 
     t_eval_init = time.perf_counter()
     init_eval = _evaluate_kalman(fit_ssm, y_obs, x_true)
     runtime_eval_init_sec = float(time.perf_counter() - t_eval_init)
     runtime_eval_final_sec = runtime_eval_init_sec
 
+    t_eval_test = time.perf_counter()
+    test_eval = _evaluate_kalman(fit_ssm, seed_ctx.y_test, seed_ctx.x_test)
+    runtime_eval_test_sec = float(time.perf_counter() - t_eval_test)
+
     return {
         "init_eval": init_eval,
         "final_eval": init_eval,
+        "test_eval": test_eval,
         "rmse_phi_init": float("nan"),
         "rmse_phi_final": float("nan"),
         "phi_init": np.asarray([], dtype=np.float32),
@@ -789,10 +825,15 @@ def _run_kalman_method(seed_ctx: _SeedContext) -> Dict[str, Any]:
         "grad_snr_final": float("nan"),
         "grad_var_init": float("nan"),
         "grad_var_final": float("nan"),
+        "grad_raw_init": float("nan"),
+        "grad_raw_final": float("nan"),
+        "gpu_peak_train_mb": float("nan"),
+        "runtime_pretrain_sec": 0.0,
         "runtime_train_sec": 0.0,
         "runtime_train_per_step_sec": 0.0,
         "runtime_eval_init_sec": runtime_eval_init_sec,
         "runtime_eval_final_sec": runtime_eval_final_sec,
+        "runtime_eval_test_sec": runtime_eval_test_sec,
     }
 
 
@@ -834,12 +875,17 @@ def _run_baseline_method(
     init_eval = _evaluate_filter(dpf, y_obs, x_true, resample=resample)
     runtime_eval_init_sec = float(time.perf_counter() - t_eval_init)
 
+    t_eval_test = time.perf_counter()
+    test_eval = _evaluate_filter(dpf, seed_ctx.y_test, seed_ctx.x_test, resample=resample)
+    runtime_eval_test_sec = float(time.perf_counter() - t_eval_test)
+
     rmse_phi_init = float(proposal.rmse_phi_to_one().numpy())
     phi_init = np.asarray(proposal.phi_vector().numpy(), dtype=np.float32)
 
     return {
         "init_eval": init_eval,
         "final_eval": init_eval,
+        "test_eval": test_eval,
         "rmse_phi_init": rmse_phi_init,
         "rmse_phi_final": rmse_phi_init,
         "phi_init": phi_init,
@@ -854,10 +900,15 @@ def _run_baseline_method(
         "grad_snr_final": float("nan"),
         "grad_var_init": float("nan"),
         "grad_var_final": float("nan"),
+        "grad_raw_init": float("nan"),
+        "grad_raw_final": float("nan"),
+        "gpu_peak_train_mb": float("nan"),
+        "runtime_pretrain_sec": 0.0,
         "runtime_train_sec": 0.0,
         "runtime_train_per_step_sec": 0.0,
         "runtime_eval_init_sec": runtime_eval_init_sec,
         "runtime_eval_final_sec": runtime_eval_init_sec,
+        "runtime_eval_test_sec": runtime_eval_test_sec,
     }
 
 
@@ -909,12 +960,13 @@ def _train_dpf(
                     fit_ssm,
                     rng_base + 1_000 + step * mc_stride + mc_idx,
                 )
-                x_seq, w_seq, diagnostics, _ = dpf.filter(y_obs, resample=resample)
-                logz_total = tf.reduce_sum(
+                x_seq, w_seq, diagnostics, _ = dpf.filter(
+                    y_obs, resample=resample, training=True)
+                logz_per_step = tf.reduce_mean(
                     tf.convert_to_tensor(diagnostics["log_z"], dtype=tf.float32),
                     axis=-1,
                 )
-                loss_terms.append(-tf.reduce_mean(logz_total))
+                loss_terms.append(-tf.reduce_mean(logz_per_step))
                 # Metrics are for logging only; keep them out of autodiff recording.
                 with tape.stop_recording():
                     mean_seq = _particle_mean(x_seq, w_seq)
@@ -1002,6 +1054,7 @@ def _train_dpf(
             )
     runtime_train_sec = float(time.perf_counter() - train_t0)
     runtime_train_per_step_sec = float(runtime_train_sec / max(steps, 1))
+    _, gpu_peak_train_mb = _current_gpu_memory_mb()
     loss_hist = np.asarray(loss_hist_ta.stack().numpy(), dtype=np.float32)
     rmse_hist = np.asarray(rmse_hist_ta.stack().numpy(), dtype=np.float32)
     grad_hist = np.asarray(grad_hist_ta.stack().numpy(), dtype=np.float32)
@@ -1019,8 +1072,11 @@ def _train_dpf(
         "grad_snr_final": float(grad_stats["grad_snr_final"]),
         "grad_var_init": float(grad_stats["grad_var_init"]),
         "grad_var_final": float(grad_stats["grad_var_final"]),
+        "grad_raw_init": float(grad_stats["grad_raw_init"]),
+        "grad_raw_final": float(grad_stats["grad_raw_final"]),
         "runtime_train_sec": runtime_train_sec,
         "runtime_train_per_step_sec": runtime_train_per_step_sec,
+        "gpu_peak_train_mb": float(gpu_peak_train_mb) if gpu_peak_train_mb is not None else float("nan"),
     }
 
 
@@ -1059,7 +1115,9 @@ def _run_trainable_dpf_method(
     )
     dpf = _build_dpf(fit_ssm, dpf_cfg, method=method, proposal=proposal)
     pretrained_weights_used = None
+    runtime_pretrain_sec = 0.0
     if method == "transformer":
+        t_pretrain_start = time.perf_counter()
         pretrained_weights_used = _maybe_init_transformer_from_pretrain(
             dpf=dpf,
             method_cfg=method_cfg,
@@ -1070,12 +1128,14 @@ def _run_trainable_dpf_method(
             experiment_name=experiment_name,
             experiment_dir=experiment_dir,
         )
+        runtime_pretrain_sec = float(time.perf_counter() - t_pretrain_start)
         freeze_resampler = bool(method_cfg.get("freeze_resampler", True))
         dpf.resampler_net.trainable = not freeze_resampler
         if pretrained_weights_used is not None:
             _log(
                 f"{_seed_tag(seed, method)} "
-                f"loaded pretrained resampler weights: {pretrained_weights_used}"
+                f"loaded pretrained resampler weights: {pretrained_weights_used} "
+                f"(pretrain took {runtime_pretrain_sec:.1f}s)"
             )
 
     proposal_vars, resampler_vars, train_vars = _select_train_var_groups(
@@ -1149,9 +1209,15 @@ def _run_trainable_dpf_method(
     rmse_phi_final = float(proposal.rmse_phi_to_one().numpy())
     phi_final = np.asarray(proposal.phi_vector().numpy(), dtype=np.float32)
 
+    # Test-split evaluation (no gradient computation, held-out data).
+    t_eval_test = time.perf_counter()
+    test_eval = _evaluate_filter(dpf, seed_ctx.y_test, seed_ctx.x_test, resample=resample)
+    runtime_eval_test_sec = float(time.perf_counter() - t_eval_test)
+
     return {
         "init_eval": init_eval,
         "final_eval": final_eval,
+        "test_eval": test_eval,
         "rmse_phi_init": rmse_phi_init,
         "rmse_phi_final": rmse_phi_final,
         "phi_init": phi_init,
@@ -1166,10 +1232,15 @@ def _run_trainable_dpf_method(
         "grad_snr_final": float(train_out["grad_snr_final"]),
         "grad_var_init": float(train_out["grad_var_init"]),
         "grad_var_final": float(train_out["grad_var_final"]),
+        "grad_raw_init": float(train_out["grad_raw_init"]),
+        "grad_raw_final": float(train_out["grad_raw_final"]),
+        "gpu_peak_train_mb": float(train_out["gpu_peak_train_mb"]),
+        "runtime_pretrain_sec": runtime_pretrain_sec,
         "runtime_train_sec": float(train_out["runtime_train_sec"]),
         "runtime_train_per_step_sec": float(train_out["runtime_train_per_step_sec"]),
         "runtime_eval_init_sec": runtime_eval_init_sec,
         "runtime_eval_final_sec": runtime_eval_final_sec,
+        "runtime_eval_test_sec": runtime_eval_test_sec,
     }
 
 
@@ -1215,6 +1286,25 @@ def _run_method_with_registry(
     raise ValueError(f"Unsupported dpf method '{method}'.")
 
 
+def _result_test_metrics(result: Dict[str, Any]) -> Dict[str, float]:
+    """Extract held-out test-split metrics from a seed result for table display.
+
+    Gradient / phi columns are identical between splits (they come from the
+    training run) so they are copied from the existing ``_final`` keys.
+    """
+    return {
+        "loss": float(result["loss_test"]),
+        "nll": float(result["nll_test"]),
+        "rmse": float(result["rmse_test"]),
+        "rmse_phi": float(result["rmse_phi_final"]),
+        "ess_mean": float(result["ess_mean_test"]),
+        "grad_snr": float(result["grad_snr_final"]),
+        "grad_var": float(result["grad_var_final"]),
+        "grad_raw": float(result["grad_raw_final"]),
+        "train_sec": float(result["runtime_train_sec"]),
+    }
+
+
 def _run_single_seed(
     seed: int,
     exp_cfg: Dict[str, Any],
@@ -1227,8 +1317,8 @@ def _run_single_seed(
     experiment_dir: str | Path | None = None,
 ) -> Dict[str, Any]:
     seed_ctx = _build_seed_context(seed, exp_cfg, model_cfg)
-    x_true = seed_ctx.x_true
-    y_obs = seed_ctx.y_obs
+    x_true = seed_ctx.x_true  # train split
+    y_obs = seed_ctx.y_obs    # train split
     _reset_gpu_peak()
     method_out = _run_method_with_registry(
         method=method,
@@ -1245,6 +1335,7 @@ def _run_single_seed(
 
     init_eval = method_out["init_eval"]
     final_eval = method_out["final_eval"]
+    test_eval = method_out["test_eval"]
     rmse_phi_init = float(method_out["rmse_phi_init"])
     rmse_phi_final = float(method_out["rmse_phi_final"])
     phi_init = np.asarray(method_out["phi_init"], dtype=np.float32)
@@ -1259,14 +1350,20 @@ def _run_single_seed(
     grad_snr_final = float(method_out["grad_snr_final"])
     grad_var_init = float(method_out["grad_var_init"])
     grad_var_final = float(method_out["grad_var_final"])
+    grad_raw_init = float(method_out["grad_raw_init"])
+    grad_raw_final = float(method_out["grad_raw_final"])
+    gpu_peak_train_mb = float(method_out["gpu_peak_train_mb"])
+    runtime_pretrain_sec = float(method_out["runtime_pretrain_sec"])
     runtime_train_sec = float(method_out["runtime_train_sec"])
     runtime_train_per_step_sec = float(method_out["runtime_train_per_step_sec"])
     runtime_eval_init_sec = float(method_out["runtime_eval_init_sec"])
     runtime_eval_final_sec = float(method_out["runtime_eval_final_sec"])
+    runtime_eval_test_sec = float(method_out.get("runtime_eval_test_sec", float("nan")))
 
     result = {
         "seed": seed,
         "method": method,
+        # --- train split metrics ---
         "loss_init": init_eval["loss"],
         "loss_final": final_eval["loss"],
         "nll_init": init_eval["nll"],
@@ -1279,14 +1376,26 @@ def _run_single_seed(
         "ess_mean_final": float(final_eval["ess_mean"]),
         "resample_rate_init": float(init_eval["resample_rate"]),
         "resample_rate_final": float(final_eval["resample_rate"]),
+        # --- test split metrics ---
+        "loss_test": float(test_eval["loss"]),
+        "nll_test": float(test_eval["nll"]),
+        "rmse_test": float(test_eval["rmse"]),
+        "ess_mean_test": float(test_eval["ess_mean"]),
+        "resample_rate_test": float(test_eval["resample_rate"]),
+        # --- gradient / training stats (shared, not split-specific) ---
         "grad_snr_init": grad_snr_init,
         "grad_snr_final": grad_snr_final,
         "grad_var_init": grad_var_init,
         "grad_var_final": grad_var_final,
+        "grad_raw_init": grad_raw_init,
+        "grad_raw_final": grad_raw_final,
+        "gpu_peak_train_mb": gpu_peak_train_mb,
+        "runtime_pretrain_sec": runtime_pretrain_sec,
         "runtime_train_sec": runtime_train_sec,
         "runtime_train_per_step_sec": runtime_train_per_step_sec,
         "runtime_eval_init_sec": runtime_eval_init_sec,
         "runtime_eval_final_sec": runtime_eval_final_sec,
+        "runtime_eval_test_sec": runtime_eval_test_sec,
         "loss_history": loss_hist,
         "rmse_history": rmse_hist,
         "grad_raw_norm_history": grad_raw_hist,
@@ -1297,7 +1406,10 @@ def _run_single_seed(
         "resampled_t": np.asarray(final_eval["resampled_t"], dtype=np.bool_),
         "x_true": np.asarray(x_true),
         "y_obs": np.asarray(y_obs),
+        "x_test": np.asarray(seed_ctx.x_test),
+        "y_test": np.asarray(seed_ctx.y_test),
         "mean_final": np.asarray(final_eval["mean"]),
+        "mean_test": np.asarray(test_eval["mean"]),
         "phi_init": phi_init,
         "phi_final": phi_final,
         "pretrained_weights_used": pretrained_weights_used,
@@ -1327,7 +1439,10 @@ def _persist_trace(
         resampled_t=result["resampled_t"].astype(np.int8),
         x_true=result["x_true"],
         y_obs=result["y_obs"],
+        x_test=result["x_test"],
+        y_test=result["y_test"],
         mean_final=result["mean_final"],
+        mean_test=result["mean_test"],
         phi_init=result["phi_init"],
         phi_final=result["phi_final"],
     )
@@ -1340,16 +1455,19 @@ def _log_method_result(
     method: str,
     result: Dict[str, Any],
 ) -> None:
+    pretrain_sec = float(result.get("runtime_pretrain_sec", 0.0))
+    pretrain_part = f" | pretrain_sec {pretrain_sec:.3f}" if pretrain_sec > 0.0 else ""
     _log(
         f"[{tag}] seed={seed} method={method} "
-        f"loss {result['loss_init']:.6f}->{result['loss_final']:.6f} | "
-        f"nll {result['nll_init']:.6f}->{result['nll_final']:.6f} | "
-        f"rmse {result['rmse_init']:.6f}->{result['rmse_final']:.6f} | "
+        f"loss {result['loss_init']:.6f}->{result['loss_final']:.6f} (test {result['loss_test']:.6f}) | "
+        f"nll {result['nll_init']:.6f}->{result['nll_final']:.6f} (test {result['nll_test']:.6f}) | "
+        f"rmse {result['rmse_init']:.6f}->{result['rmse_final']:.6f} (test {result['rmse_test']:.6f}) | "
         f"phi_rmse {result['rmse_phi_init']:.6f}->{result['rmse_phi_final']:.6f} | "
-        f"ess_mean {result['ess_mean_init']:.2f}->{result['ess_mean_final']:.2f} | "
+        f"ess_mean {result['ess_mean_init']:.2f}->{result['ess_mean_final']:.2f} (test {result['ess_mean_test']:.2f}) | "
         f"grad_snr {result['grad_snr_init']:.3f}->{result['grad_snr_final']:.3f} | "
         f"grad_var {result['grad_var_init']:.3e}->{result['grad_var_final']:.3e} | "
         f"train_sec {result['runtime_train_sec']:.3f}"
+        f"{pretrain_part}"
     )
 
 
@@ -1360,6 +1478,7 @@ def _build_method_summary(
 ) -> Dict[str, Dict[str, float]]:
     return {
         method: {
+            # train-split aggregates
             "loss_init_mean": float(np.mean([r["loss_init"] for r in per_seed[method]])),
             "loss_final_mean": float(np.mean([r["loss_final"] for r in per_seed[method]])),
             "nll_init_mean": float(np.mean([r["nll_init"] for r in per_seed[method]])),
@@ -1376,10 +1495,25 @@ def _build_method_summary(
             "resample_rate_final_mean": _safe_nanmean(
                 [r["resample_rate_final"] for r in per_seed[method]]
             ),
+            # test-split aggregates
+            "loss_test_mean": _safe_nanmean([r["loss_test"] for r in per_seed[method]]),
+            "nll_test_mean": _safe_nanmean([r["nll_test"] for r in per_seed[method]]),
+            "rmse_test_mean": _safe_nanmean([r["rmse_test"] for r in per_seed[method]]),
+            "ess_mean_test_mean": _safe_nanmean([r["ess_mean_test"] for r in per_seed[method]]),
+            "resample_rate_test_mean": _safe_nanmean(
+                [r["resample_rate_test"] for r in per_seed[method]]
+            ),
+            # gradient / training stats
             "grad_snr_init_mean": _safe_nanmean([r["grad_snr_init"] for r in per_seed[method]]),
             "grad_snr_final_mean": _safe_nanmean([r["grad_snr_final"] for r in per_seed[method]]),
             "grad_var_init_mean": _safe_nanmean([r["grad_var_init"] for r in per_seed[method]]),
             "grad_var_final_mean": _safe_nanmean([r["grad_var_final"] for r in per_seed[method]]),
+            "grad_raw_init_mean": _safe_nanmean([r["grad_raw_init"] for r in per_seed[method]]),
+            "grad_raw_final_mean": _safe_nanmean([r["grad_raw_final"] for r in per_seed[method]]),
+            "gpu_peak_train_mb_mean": _safe_nanmean([r["gpu_peak_train_mb"] for r in per_seed[method]]),
+            "runtime_pretrain_sec_mean": _safe_nanmean(
+                [r["runtime_pretrain_sec"] for r in per_seed[method]]
+            ),
             "runtime_train_sec_mean": _safe_nanmean(
                 [r["runtime_train_sec"] for r in per_seed[method]]
             ),
@@ -1391,6 +1525,9 @@ def _build_method_summary(
             ),
             "runtime_eval_final_sec_mean": _safe_nanmean(
                 [r["runtime_eval_final_sec"] for r in per_seed[method]]
+            ),
+            "runtime_eval_test_sec_mean": _safe_nanmean(
+                [r.get("runtime_eval_test_sec", float("nan")) for r in per_seed[method]]
             ),
         }
         for method in methods
@@ -1514,10 +1651,46 @@ def run_lgssm_dpf_backprop(
         method: [] for method in methods
     }
 
+    def _collect_seed_results(seed: int, seed_result_map: Dict[str, Dict[str, Any]]) -> None:
+        """Accumulate results for one seed into per_seed / metrics_across_seeds."""
+        per_seed_train: Dict[str, Dict[str, Any]] = {}
+        per_seed_test: Dict[str, Dict[str, Any]] = {}
+        for method in methods:
+            result = seed_result_map[method]
+            per_seed[method].append(result)
+            final_metrics = _result_stage_metrics(result, "final")
+            per_seed_train[method] = final_metrics
+            per_seed_test[method] = _result_test_metrics(result)
+            metrics_across_seeds[method].append(final_metrics)
+            _log_method_result(tag=tag, seed=seed, method=method, result=result)
+
+        print_separator(f"{tag} seed{seed} TRAIN summary")
+        print_method_summary_table(
+            per_seed_train,
+            method_order=tuple(methods),
+            keys=SUMMARY_KEYS,
+        )
+        print_separator(f"{tag} seed{seed} TRAIN compare")
+        print_metrics_compare(
+            per_seed_train,
+            method_order=tuple(methods),
+        )
+        print_separator(f"{tag} seed{seed} TEST summary")
+        print_method_summary_table(
+            per_seed_test,
+            method_order=tuple(methods),
+            keys=TEST_SUMMARY_KEYS,
+        )
+        print_separator(f"{tag} seed{seed} TEST compare")
+        print_metrics_compare(
+            per_seed_test,
+            method_order=tuple(methods),
+        )
+
     if n_workers <= 1:
-        # Serial path — identical to the original behaviour.
+        # Serial path.
         for seed in seeds:
-            per_seed_metrics: Dict[str, Dict[str, Any]] = {}
+            seed_result_map: Dict[str, Dict[str, Any]] = {}
             for method in methods:
                 result = _run_single_seed(
                     seed,
@@ -1530,13 +1703,7 @@ def run_lgssm_dpf_backprop(
                     experiment_name=experiment_name,
                     experiment_dir=out_root,
                 )
-                per_seed[method].append(result)
-                final_metrics = _result_stage_metrics(result, "final")
-                per_seed_metrics[method] = final_metrics
-                metrics_across_seeds[method].append(final_metrics)
-
-                _log_method_result(tag=tag, seed=seed, method=method, result=result)
-
+                seed_result_map[method] = result
                 if save_traces:
                     _persist_trace(
                         out_root=out_root,
@@ -1545,18 +1712,15 @@ def run_lgssm_dpf_backprop(
                         method=method,
                         result=result,
                     )
-
-            print_separator(f"{tag} seed{seed} summary")
-            print_method_summary_table(
-                per_seed_metrics,
-                method_order=tuple(methods),
-                keys=SUMMARY_KEYS,
-            )
+            _collect_seed_results(seed, seed_result_map)
     else:
         # Parallel path: one subprocess per seed, each seed runs all methods
         # sequentially inside its own process.
         # Each process has its own TF global state, so tf.random.set_seed()
         # calls cannot race across seeds.
+        # Force all child processes to use memory-growth mode so n_workers
+        # simultaneous CUDA contexts don't collectively exceed GPU memory.
+        os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
         _log(f"[{tag}] launching {len(seeds)} seeds across {n_workers} workers ...")
         worker_kwargs = dict(
             methods=methods,
@@ -1587,57 +1751,101 @@ def run_lgssm_dpf_backprop(
 
         # Reassemble in original seed order for reproducible summaries.
         for seed in seeds:
-            per_seed_metrics = {}
-            for method in methods:
-                result = seed_outputs[seed][method]
-                per_seed[method].append(result)
-                final_metrics = _result_stage_metrics(result, "final")
-                per_seed_metrics[method] = final_metrics
-                metrics_across_seeds[method].append(final_metrics)
-                _log_method_result(tag=tag, seed=seed, method=method, result=result)
-
-            print_separator(f"{tag} seed{seed} summary")
-            print_method_summary_table(
-                per_seed_metrics,
-                method_order=tuple(methods),
-                keys=SUMMARY_KEYS,
-            )
+            _collect_seed_results(seed, seed_outputs[seed])
 
     method_summary_new = _build_method_summary(
         per_seed=per_seed,
         methods=methods,
     )
     summary_path = out_root / "summary.json"
+    # Merge with existing summary so that results from previous runs (different
+    # methods) are preserved; only the methods in the current run are updated.
+    import json as _json
+    existing_methods: Dict[str, Any] = {}
+    if summary_path.exists():
+        try:
+            existing = _json.loads(summary_path.read_text(encoding="utf-8"))
+            existing_methods = existing.get("methods", {})
+        except Exception as exc:
+            _log(
+                f"[{tag}] WARNING: failed to read existing summary.json, "
+                f"previous methods may be lost: {exc}"
+            )
+    if existing_methods:
+        _log(f"[{tag}] merging with existing methods: {sorted(existing_methods.keys())}")
+    merged_methods = {**existing_methods, **method_summary_new}
     summary = {
         "experiment_name": experiment_name,
         "num_seeds": int(len(seeds)),
-        "methods": method_summary_new,
+        "methods": merged_methods,
     }
-
     save_json(summary_path, summary)
-    _log(f"[{tag}] summary saved: {summary_path}")
+    _log(f"[{tag}] summary saved: {summary_path} (methods: {sorted(merged_methods.keys())})")
     for method in methods:
-        method_summary = summary["methods"][method]
+        method_summary = method_summary_new[method]
+        pretrain_sec = method_summary.get("runtime_pretrain_sec_mean", 0.0)
+        pretrain_part = f", mean pretrain_sec {pretrain_sec:.3f}" if pretrain_sec > 0.0 else ""
         _log(
-            f"[{tag}] {method} mean loss "
-            f"{method_summary['loss_init_mean']:.6f}->{method_summary['loss_final_mean']:.6f}, "
-            f"mean nll {method_summary['nll_init_mean']:.6f}->{method_summary['nll_final_mean']:.6f}, "
-            f"mean rmse {method_summary['rmse_init_mean']:.6f}->{method_summary['rmse_final_mean']:.6f}, "
+            f"[{tag}] {method} "
+            f"TRAIN: mean nll {method_summary['nll_init_mean']:.6f}->{method_summary['nll_final_mean']:.6f}, "
+            f"mean rmse {method_summary['rmse_init_mean']:.6f}->{method_summary['rmse_final_mean']:.6f} | "
+            f"TEST: mean nll {method_summary['nll_test_mean']:.6f}, "
+            f"mean rmse {method_summary['rmse_test_mean']:.6f} | "
             f"mean phi_rmse {method_summary['rmse_phi_init_mean']:.6f}->{method_summary['rmse_phi_final_mean']:.6f}, "
             f"mean ess {method_summary['ess_mean_init_mean']:.2f}->{method_summary['ess_mean_final_mean']:.2f}, "
             f"mean grad_snr {method_summary['grad_snr_init_mean']:.3f}->{method_summary['grad_snr_final_mean']:.3f}, "
             f"mean grad_var {method_summary['grad_var_init_mean']:.3e}->{method_summary['grad_var_final_mean']:.3e}, "
             f"mean train_sec {method_summary['runtime_train_sec_mean']:.3f}"
+            f"{pretrain_part}"
         )
 
-    mean_metrics = aggregate_metrics_by_method(metrics_across_seeds)
-    avg_metrics = dict(mean_metrics)
-    avg_method_order = tuple(methods)
-    print_separator(f"{tag} avg summary")
+    # Build per-method dicts for the final avg tables.
+    merged_all_methods = merged_methods
+    _TRAIN_KEY_MAP = {
+        "loss": "loss_final_mean",
+        "nll": "nll_final_mean",
+        "rmse": "rmse_final_mean",
+        "rmse_phi": "rmse_phi_final_mean",
+        "ess_mean": "ess_mean_final_mean",
+        "grad_snr": "grad_snr_final_mean",
+        "grad_var": "grad_var_final_mean",
+        "grad_raw": "grad_raw_final_mean",
+        "gpu_peak_mb": "gpu_peak_train_mb_mean",
+        "train_sec": "runtime_train_sec_mean",
+    }
+    _TEST_KEY_MAP = {
+        "loss": "loss_test_mean",
+        "nll": "nll_test_mean",
+        "rmse": "rmse_test_mean",
+        "ess_mean": "ess_mean_test_mean",
+    }
+    train_method_metrics: Dict[str, Dict[str, float]] = {}
+    test_method_metrics: Dict[str, Dict[str, float]] = {}
+    for m, ms in merged_all_methods.items():
+        train_method_metrics[m] = {sk: ms.get(lk, float("nan")) for sk, lk in _TRAIN_KEY_MAP.items()}
+        test_method_metrics[m] = {sk: ms.get(lk, float("nan")) for sk, lk in _TEST_KEY_MAP.items()}
+
+    print_separator(f"{tag} avg TRAIN summary")
     print_method_summary_table(
-        avg_metrics,
-        method_order=avg_method_order,
+        train_method_metrics,
+        method_order=tuple(merged_all_methods.keys()),
         keys=SUMMARY_KEYS,
+    )
+    print_separator(f"{tag} avg TRAIN compare")
+    print_metrics_compare(
+        train_method_metrics,
+        method_order=tuple(merged_all_methods.keys()),
+    )
+    print_separator(f"{tag} avg TEST summary")
+    print_method_summary_table(
+        test_method_metrics,
+        method_order=tuple(merged_all_methods.keys()),
+        keys=TEST_SUMMARY_KEYS,
+    )
+    print_separator(f"{tag} avg TEST compare")
+    print_metrics_compare(
+        test_method_metrics,
+        method_order=tuple(merged_all_methods.keys()),
     )
 
 

@@ -25,7 +25,8 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("exp3_transformer_pretrain_config
 class StandardResamplingDPF(DPFBase):
     """DPF with standard systematic resampling."""
 
-    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor):
+    def resample_step(self, x: tf.Tensor, log_w: tf.Tensor,
+                      training: bool | None = None):
         log_w = tf.convert_to_tensor(log_w, dtype=tf.float32)
         w = tf.exp(log_w)
         w = tf.math.divide_no_nan(w, tf.reduce_sum(w, axis=-1, keepdims=True))

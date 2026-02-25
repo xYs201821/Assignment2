@@ -244,8 +244,19 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _nan_to_null(obj: Any) -> Any:
+    """Recursively replace float NaN/Inf with None so JSON output is valid."""
+    if isinstance(obj, float):
+        return None if (obj != obj or obj == float("inf") or obj == float("-inf")) else obj
+    if isinstance(obj, dict):
+        return {k: _nan_to_null(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_nan_to_null(v) for v in obj]
+    return obj
+
+
 def save_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(_nan_to_null(payload), indent=2), encoding="utf-8")
 
 
 def save_npz(path: Path, **arrays: Any) -> None:

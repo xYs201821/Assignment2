@@ -1,6 +1,6 @@
 experiment:
   output_root: results/exp3_lgssm_dpf
-  seeds: [0, 1, 42, 123, 2026, 4242, 9999, 10000, 1024]
+  seeds: [0, 42, 123, 2026, 1024] 
   T: 40
   batch_size: 32
   save_traces: true
@@ -21,45 +21,44 @@ proposal:
 
 training:
   optimizer: adamw
-  steps: 400
-  lr: 2e-2
+  steps: 200
+  lr: 5e-2
   weight_decay: 0.01
   beta1: 0.9
   beta2: 0.98
   amsgrad: true
-  grad_clip_norm: 100.0
+  grad_clip_norm: 10.0
   log_every: 20
   mc_samples: 4
-
 dpf:
-  methods: [kalman, pf, soft, ot, transformer, diffusion]
+  methods: [kalman, baseline, pf, soft, ot, transformer, diffusion]
 
   common:
     num_particles: 25
     ess_threshold: 0.5
-    resample: auto
+    resample: always
 
   kalman: {}
   pf:
     num_particles: 500
 
   soft:
-    lam: 0.8
+    lam: 0.95
 
   ot:
-    ot_epsilon: 0.05
-    ot_num_iters: 40
+    ot_epsilon: 0.1
+    ot_num_iters: 20
     ot_jitter: 1e-6
 
   diffusion:
-    diff_a: -0.0001
+    diff_a: -0.001
     diff_T: 1.0
-    diff_steps: 20
+    diff_steps: 10
     diff_ode: true
     diff_eps: 1e-6
 
   transformer:
-    d_model: 128
+    d_model: 64
     hidden: 128
     num_heads: 8
     num_encoder_layers: 2
@@ -74,14 +73,14 @@ dpf:
     # Optional overrides for auto pretraining:
     pretrain_steps: 2000
     pretrain_batch_size: 128
-    pretrain_lr: 1e-2
+    pretrain_lr: 5e-2
     pretrain_log_every: 100
-    pretrain_loss: gmm
+    pretrain_loss: energy
     pretrain_sim_T: 40
     pretrain_sim_batch_size: 256
     freeze_resampler: true
     train:
-      proposal_lr: 2e-2
-      resampler_lr: 5e-3
+      proposal_lr: 5e-2
+      resampler_lr: 2e-2
     # Stop gradient through recurrent time state.
     stop_grad_through_time: true
