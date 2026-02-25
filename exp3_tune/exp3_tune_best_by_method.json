@@ -1,0 +1,58 @@
+{
+  "ot": {
+    "method": "ot",
+    "candidate_id": 16,
+    "params": {
+      "num_particles": 25,
+      "ess_threshold": 0.5,
+      "resample": "always",
+      "ot_jitter": "1e-6",
+      "train.steps": 100,
+      "train.lr": "1e-1",
+      "ot_epsilon": 10.0,
+      "ot_num_iters": 40
+    },
+    "tune_params": {
+      "ot_epsilon": 10.0,
+      "ot_num_iters": 40
+    },
+    "seeds": [
+      0
+    ],
+    "num_runs": 1,
+    "rmse_mean": 1.6804929971694946,
+    "rmse_std": 0.0,
+    "rmse_phi_mean": 0.11896707862615585,
+    "rmse_phi_std": 0.0,
+    "combined_mean": 1.7994600757956505,
+    "loss_mean": 1.8341490030288696,
+    "loss_std": 0.0,
+    "ess_mean": 18.47011375427246,
+    "ess_std": 0.0,
+    "train_sec_mean": 1498.519433837384,
+    "train_sec_std": 0.0,
+    "grad_raw_mean": 0.039830148220062256,
+    "grad_raw_std": 0.0,
+    "grad_var_mean": 2.210450475104153e-05,
+    "grad_var_std": 0.0,
+    "grad_snr_mean": 6.172710150963114,
+    "grad_snr_std": 0.0,
+    "elapsed_sec": 1502.9491522312164,
+    "status": "ok",
+    "per_seed": [
+      {
+        "seed": 0,
+        "train_sec": 1498.519433837384,
+        "rmse_final": 1.6804929971694946,
+        "rmse_phi_final": 0.11896707862615585,
+        "loss_final": 1.8341490030288696,
+        "ess_mean_final": 18.47011375427246,
+        "grad_raw_final": 0.039830148220062256,
+        "grad_var_final": 2.210450475104153e-05,
+        "grad_snr_final": 6.172710150963114
+      }
+    ],
+    "objective_value": 1.8341490030288696,
+    "error": null
+  }
+}
