@@ -46,13 +46,35 @@ from experiments.common.exp_utils import (
     tag_from_cfg,
 )
 from experiments.common.filter_cfg import build_filter_cfg
-from experiments.common.plot_utils import plot_stability_over_time, plot_ess_over_time
+from experiments.common.plot_utils import plot_stability_over_time
 from experiments.common.runner import run_filter
 from src.metrics import rmse
 from src.motion_model import ConstantVelocityMotionModel
 from src.ssm import RangeBearingSSM
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("exp2b_config.yaml")
+
+_STABILITY_KEY_LABELS = {
+    "condInfo_log10": "cond_Info_log10",
+    "condA_log10_max": "cond_A_log10",
+    "condJ_log10_max": "cond_J_log10",
+    "logdetJ": "logdet_J",
+    "logdet_cov": "logdet_cov",
+    "condH_log10_max": "condH_log10",
+    "condK_log10_max": "condK_log10",
+    "flow_norm_mean_max": "flow_norm_mean",
+}
+
+_DEFAULT_STABILITY_KEYS = (
+    "condInfo_log10",
+    "condA_log10_max",
+    "condJ_log10_max",
+    "logdetJ",
+    "logdet_cov",
+    "condH_log10_max",
+    "condK_log10_max",
+    "flow_norm_mean_max",
+)
 
 
 def build_ssm(
@@ -175,6 +197,512 @@ def _plot_state_trajectory(
     if show:
         plt.show()
     plt.close(fig)
+
+
+def _plot_ess_over_time(
+    path: Path,
+    w: np.ndarray,
+    ess_threshold: Optional[float] = None,
+    show: bool = False,
+    title: Optional[str] = None,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    ess_t = ess_from_weights(w)
+    if ess_t is None:
+        return
+    ess_np = np.asarray(ess_t)
+    if ess_np.ndim == 1:
+        ess_np = ess_np[np.newaxis, :]
+    T = ess_np.shape[1]
+    t = np.arange(T)
+    ess_mean = np.mean(ess_np, axis=0)
+    ess_min = np.min(ess_np, axis=0)
+    ess_max = np.max(ess_np, axis=0)
+
+    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
+    ax.plot(t, ess_mean, color="C0", linewidth=1.6, label="ESS mean")
+    if ess_np.shape[0] > 1:
+        ax.fill_between(t, ess_min, ess_max, color="C0", alpha=0.2, label="ESS range")
+    if ess_threshold is not None:
+        N = np.asarray(w).shape[-1]
+        ax.axhline(
+            ess_threshold * float(N),
+            color="C3",
+            linestyle="--",
+            linewidth=1.0,
+            label="ESS threshold",
+        )
+    ax.set_xlabel("time")
+    ax.set_ylabel("ESS")
+    ax.grid(True, linestyle=":")
+    ax.legend(fontsize=8, loc="best")
+
+    if title:
+        fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
+def _flow_compare_group(method: str) -> Optional[Tuple[str, str]]:
+    name = str(method).lower()
+    if name.startswith("edh"):
+        family = "edh"
+    elif name.startswith("ledh"):
+        family = "ledh"
+    else:
+        return None
+
+    variant = ""
+    if "(" in name and name.endswith(")"):
+        variant = name[name.find("(") + 1 : -1].strip()
+    if variant == "opt":
+        subgroup = ""
+    elif variant.endswith("_opt"):
+        subgroup = variant[:-4]
+    else:
+        subgroup = variant
+    return family, subgroup
+
+
+def _flow_variant(method: str) -> str:
+    name = str(method).lower()
+    if "(" in name and name.endswith(")"):
+        return name[name.find("(") + 1 : -1].strip()
+    return ""
+
+
+def _is_opt_flow_variant(method: str) -> bool:
+    variant = _flow_variant(method)
+    return variant == "opt" or variant.endswith("_opt")
+
+
+def _stability_series_with_band(
+    values: np.ndarray,
+    band_percentiles: Optional[Tuple[float, float]],
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    arr = np.asarray(values)
+    if arr.ndim == 1:
+        return arr, None, None
+    flat = arr.reshape(-1, arr.shape[-1])
+    center = np.median(flat, axis=0)
+    if band_percentiles is None:
+        return center, None, None
+    p_lo, p_hi = band_percentiles
+    lo = np.percentile(flat, p_lo, axis=0)
+    hi = np.percentile(flat, p_hi, axis=0)
+    return center, lo, hi
+
+
+def _schedule_series_with_band(
+    values: np.ndarray,
+    band_percentiles: Optional[Tuple[float, float]],
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    arr = np.asarray(values)
+    if arr.ndim == 0:
+        center = np.asarray([float(arr)], dtype=np.float64)
+        return center, None, None
+    if arr.ndim == 1:
+        flat = arr[np.newaxis, :]
+    elif arr.ndim == 2:
+        # Prefer [B, L]; fallback to transpose when first axis appears to be lambda.
+        flat = arr if arr.shape[0] <= arr.shape[1] else arr.T
+    else:
+        # Flow diagnostics stack schedule vectors as [B, L, T].
+        if arr.ndim == 3 and arr.shape[1] >= arr.shape[2]:
+            arr_l = np.transpose(arr, (0, 2, 1))  # [B, T, L]
+        else:
+            # Fallback: choose the largest non-batch axis as lambda axis.
+            lam_axis = 1 + int(np.argmax(arr.shape[1:])) if arr.ndim > 1 else 0
+            arr_l = np.moveaxis(arr, lam_axis, -1)
+        flat = arr_l.reshape(-1, arr_l.shape[-1])
+    center = np.median(flat, axis=0)
+    if band_percentiles is None:
+        return center, None, None
+    p_lo, p_hi = band_percentiles
+    lo = np.percentile(flat, p_lo, axis=0)
+    hi = np.percentile(flat, p_hi, axis=0)
+    return center, lo, hi
+
+
+def _schedule_time_len(values: np.ndarray) -> int:
+    arr = np.asarray(values)
+    if arr.ndim >= 3:
+        return int(arr.shape[-1])
+    return 1
+
+
+def _schedule_series_at_time_with_band(
+    values: np.ndarray,
+    time_index: int,
+    band_percentiles: Optional[Tuple[float, float]],
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+    """Extract lambda-series at a specific time index and aggregate over batch."""
+    arr = np.asarray(values)
+    if arr.ndim >= 3:
+        t = max(0, min(int(time_index), int(arr.shape[-1]) - 1))
+        arr_t = arr[..., t]
+    else:
+        arr_t = arr
+    arr_t = np.asarray(arr_t)
+    if arr_t.ndim == 1:
+        flat = arr_t[np.newaxis, :]
+    elif arr_t.ndim == 2:
+        flat = arr_t
+    else:
+        flat = arr_t.reshape(-1, arr_t.shape[-1])
+    center = np.median(flat, axis=0)
+    if band_percentiles is None:
+        return center, None, None
+    p_lo, p_hi = band_percentiles
+    lo = np.percentile(flat, p_lo, axis=0)
+    hi = np.percentile(flat, p_hi, axis=0)
+    return center, lo, hi
+
+
+def _plot_beta_schedule_compare_groups(
+    output_dir: Path,
+    outputs: Dict[str, Dict[str, Any]],
+    method_order: List[str],
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+) -> None:
+    """Render Dai22-style beta-schedule comparison panels for flow method pairs."""
+    import matplotlib.pyplot as plt
+
+    grouped: Dict[Tuple[str, str], List[str]] = {}
+    for method in method_order:
+        group = _flow_compare_group(method)
+        if group is None:
+            continue
+        grouped.setdefault(group, []).append(method)
+
+    for (family, subgroup), methods in grouped.items():
+        if len(methods) < 2:
+            continue
+        base_methods = [m for m in methods if not _is_opt_flow_variant(m)]
+        opt_methods = [m for m in methods if _is_opt_flow_variant(m)]
+        if not base_methods or not opt_methods:
+            continue
+        method_base = base_methods[0]
+        method_opt = opt_methods[0]
+
+        diag_base = outputs.get(method_base, {}).get("diagnostics", {})
+        diag_opt = outputs.get(method_opt, {}).get("diagnostics", {})
+        if not isinstance(diag_base, dict) or not isinstance(diag_opt, dict):
+            continue
+
+        beta_base_v = diag_base.get("beta_sched")
+        beta_opt_v = diag_opt.get("beta_sched")
+        beta_dot_base_v = diag_base.get("beta_dot_sched")
+        beta_dot_opt_v = diag_opt.get("beta_dot_sched")
+        if any(v is None for v in (beta_base_v, beta_opt_v, beta_dot_base_v, beta_dot_opt_v)):
+            continue
+
+        T_sched = min(
+            _schedule_time_len(np.asarray(beta_base_v)),
+            _schedule_time_len(np.asarray(beta_opt_v)),
+            _schedule_time_len(np.asarray(beta_dot_base_v)),
+            _schedule_time_len(np.asarray(beta_dot_opt_v)),
+        )
+        if T_sched <= 0:
+            continue
+        time_indices: List[int] = []
+        for t in (1, 40, 70):
+            t = int(t)
+            if 0 <= t < T_sched and t not in time_indices:
+                time_indices.append(t)
+
+        group_tag = family if subgroup == "" else f"{family}_{subgroup}"
+        for t_sel in time_indices:
+            beta_base, beta_base_lo, beta_base_hi = _schedule_series_at_time_with_band(
+                np.asarray(beta_base_v),
+                t_sel,
+                band_percentiles,
+            )
+            beta_opt, beta_opt_lo, beta_opt_hi = _schedule_series_at_time_with_band(
+                np.asarray(beta_opt_v),
+                t_sel,
+                band_percentiles,
+            )
+            beta_dot_base, beta_dot_base_lo, beta_dot_base_hi = _schedule_series_at_time_with_band(
+                np.asarray(beta_dot_base_v),
+                t_sel,
+                band_percentiles,
+            )
+            beta_dot_opt, beta_dot_opt_lo, beta_dot_opt_hi = _schedule_series_at_time_with_band(
+                np.asarray(beta_dot_opt_v),
+                t_sel,
+                band_percentiles,
+            )
+            lengths = [
+                beta_base.shape[0],
+                beta_opt.shape[0],
+                beta_dot_base.shape[0],
+                beta_dot_opt.shape[0],
+            ]
+            L = int(min(lengths))
+            if L <= 0:
+                continue
+            beta_base = beta_base[:L]
+            beta_opt = beta_opt[:L]
+            beta_dot_base = beta_dot_base[:L]
+            beta_dot_opt = beta_dot_opt[:L]
+            if beta_base_lo is not None and beta_base_hi is not None:
+                beta_base_lo = beta_base_lo[:L]
+                beta_base_hi = beta_base_hi[:L]
+            if beta_opt_lo is not None and beta_opt_hi is not None:
+                beta_opt_lo = beta_opt_lo[:L]
+                beta_opt_hi = beta_opt_hi[:L]
+            if beta_dot_base_lo is not None and beta_dot_base_hi is not None:
+                beta_dot_base_lo = beta_dot_base_lo[:L]
+                beta_dot_base_hi = beta_dot_base_hi[:L]
+            if beta_dot_opt_lo is not None and beta_dot_opt_hi is not None:
+                beta_dot_opt_lo = beta_dot_opt_lo[:L]
+                beta_dot_opt_hi = beta_dot_opt_hi[:L]
+
+            lam = np.linspace(0.0, 1.0, L, endpoint=False, dtype=np.float64)
+
+            fig, axes = plt.subplots(2, 2, figsize=(9, 7))
+
+            ax = axes[0, 0]
+            ax.plot(lam, beta_base, label=f"{method_base}", color="C0", linestyle="--")
+            ax.plot(lam, beta_opt, label=f"{method_opt}", color="C1")
+            if beta_base_lo is not None and beta_base_hi is not None:
+                ax.fill_between(lam, beta_base_lo, beta_base_hi, color="C0", alpha=0.15, linewidth=0)
+            if beta_opt_lo is not None and beta_opt_hi is not None:
+                ax.fill_between(lam, beta_opt_lo, beta_opt_hi, color="C1", alpha=0.15, linewidth=0)
+            ax.set_xlabel("lambda")
+            ax.set_ylabel("beta(lambda)")
+            ax.grid(True, linestyle=":")
+            ax.legend(fontsize=8, loc="best")
+
+            ax = axes[0, 1]
+            ax.plot(lam, beta_opt - beta_base, color="C1")
+            ax.set_xlabel("lambda")
+            ax.set_ylabel("e(lambda)=beta_opt-beta_base")
+            ax.grid(True, linestyle=":")
+
+            ax = axes[1, 0]
+            ax.plot(lam, beta_dot_base, label=f"{method_base}", color="C0", linestyle="--")
+            ax.plot(lam, beta_dot_opt, label=f"{method_opt}", color="C1")
+            if beta_dot_base_lo is not None and beta_dot_base_hi is not None:
+                ax.fill_between(
+                    lam,
+                    beta_dot_base_lo,
+                    beta_dot_base_hi,
+                    color="C0",
+                    alpha=0.15,
+                    linewidth=0,
+                )
+            if beta_dot_opt_lo is not None and beta_dot_opt_hi is not None:
+                ax.fill_between(
+                    lam,
+                    beta_dot_opt_lo,
+                    beta_dot_opt_hi,
+                    color="C1",
+                    alpha=0.15,
+                    linewidth=0,
+                )
+            ax.set_xlabel("lambda")
+            ax.set_ylabel("beta_dot(lambda)")
+            ax.grid(True, linestyle=":")
+            ax.legend(fontsize=8, loc="best")
+
+            ax = axes[1, 1]
+            stiff_base_v = diag_base.get("condF_sched")
+            stiff_opt_v = diag_opt.get("condF_sched")
+            if stiff_base_v is not None and stiff_opt_v is not None:
+                stiff_base, _, _ = _schedule_series_at_time_with_band(
+                    np.asarray(stiff_base_v),
+                    t_sel,
+                    band_percentiles,
+                )
+                stiff_opt, _, _ = _schedule_series_at_time_with_band(
+                    np.asarray(stiff_opt_v),
+                    t_sel,
+                    band_percentiles,
+                )
+                Ls = int(min(L, stiff_base.shape[0], stiff_opt.shape[0]))
+                lam_s = lam[:Ls]
+                ax.plot(lam_s, stiff_base[:Ls], label=f"{method_base}", color="C0", linestyle="--")
+                ax.plot(lam_s, stiff_opt[:Ls], label=f"{method_opt}", color="C1")
+                ax.set_yscale("log")
+                ax.legend(fontsize=8, loc="best")
+            else:
+                ax.text(
+                    0.5,
+                    0.5,
+                    "condF_sched unavailable",
+                    ha="center",
+                    va="center",
+                    transform=ax.transAxes,
+                )
+            ax.set_xlabel("lambda")
+            ax.set_ylabel("R_stiff (condF)")
+            ax.grid(True, linestyle=":")
+
+            fig.suptitle(f"beta_schedule_compare_{group_tag} (t={t_sel})")
+            fig.tight_layout()
+            fig.savefig(output_dir / f"beta_schedule_compare_{group_tag}_t{t_sel}.png", dpi=150)
+            np.savez_compressed(
+                output_dir / f"beta_schedule_compare_{group_tag}_t{t_sel}.npz",
+                t_index=np.array([t_sel], dtype=np.int32),
+                lambda_grid=lam,
+                beta_base=beta_base,
+                beta_opt=beta_opt,
+                beta_dot_base=beta_dot_base,
+                beta_dot_opt=beta_dot_opt,
+            )
+            if show:
+                plt.show()
+            plt.close(fig)
+
+
+def _plot_stability_compare_groups(
+    output_dir: Path,
+    outputs: Dict[str, Dict[str, Any]],
+    method_order: List[str],
+    keys: Optional[List[str]] = None,
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    key_order = [str(k) for k in (keys if keys else _DEFAULT_STABILITY_KEYS)]
+    grouped: Dict[Tuple[str, str], List[str]] = {}
+    for method in method_order:
+        group = _flow_compare_group(method)
+        if group is None:
+            continue
+        grouped.setdefault(group, []).append(method)
+
+    for (family, subgroup), methods in grouped.items():
+        if len(methods) < 2:
+            continue
+        group_tag = family if subgroup == "" else f"{family}_{subgroup}"
+        for key in key_order:
+            series_items: List[Tuple[str, np.ndarray]] = []
+            for method in methods:
+                diag = outputs.get(method, {}).get("diagnostics", {})
+                if not isinstance(diag, dict):
+                    continue
+                val = diag.get(key)
+                if val is None:
+                    continue
+                series_items.append((method, np.asarray(val)))
+            if len(series_items) < 2:
+                continue
+
+            fig, ax = plt.subplots(1, 1, figsize=(8, 4))
+            for method, series in series_items:
+                mean, lo, hi = _stability_series_with_band(series, band_percentiles)
+                t = np.arange(mean.shape[0])
+                ax.plot(t, mean, linewidth=1.6, label=method)
+                if lo is not None and hi is not None:
+                    ax.fill_between(t, lo, hi, alpha=0.15, linewidth=0)
+
+            label = _STABILITY_KEY_LABELS.get(key, key)
+            ax.set_xlabel("time")
+            ax.grid(True, linestyle=":")
+            ax.set_title(f"stability_compare_{group_tag}_{label}")
+            ax.legend(fontsize=8, loc="best")
+            fig.tight_layout()
+            fig.savefig(output_dir / f"stability_compare_{group_tag}_{label}.png", dpi=150)
+            if show:
+                plt.show()
+            plt.close(fig)
+
+
+def _plot_stability_compare_groups_panel(
+    output_dir: Path,
+    outputs: Dict[str, Dict[str, Any]],
+    method_order: List[str],
+    keys: Optional[List[str]] = None,
+    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
+    show: bool = False,
+) -> None:
+    """Render Dai22-style 2x2 stability panels for method pairs."""
+    import matplotlib.pyplot as plt
+
+    default_panel_keys = [
+        "condInfo_log10",
+        "condA_log10_max",
+        "condJ_log10_max",
+        "logdetJ",
+    ]
+    key_order_all = [str(k) for k in (keys if keys else _DEFAULT_STABILITY_KEYS)]
+    panel_keys = [k for k in default_panel_keys if k in key_order_all]
+    if len(panel_keys) < 2:
+        return
+
+    grouped: Dict[Tuple[str, str], List[str]] = {}
+    for method in method_order:
+        group = _flow_compare_group(method)
+        if group is None:
+            continue
+        grouped.setdefault(group, []).append(method)
+
+    for (family, subgroup), methods in grouped.items():
+        if len(methods) < 2:
+            continue
+        group_tag = family if subgroup == "" else f"{family}_{subgroup}"
+
+        # Keep only keys that are available for at least two methods in this group.
+        keys_used: List[str] = []
+        for key in panel_keys:
+            count = 0
+            for method in methods:
+                diag = outputs.get(method, {}).get("diagnostics", {})
+                if isinstance(diag, dict) and diag.get(key) is not None:
+                    count += 1
+            if count >= 2:
+                keys_used.append(key)
+        if len(keys_used) < 2:
+            continue
+
+        n = min(4, len(keys_used))
+        nrows, ncols = 2, 2
+        fig, axes = plt.subplots(nrows, ncols, figsize=(9, 7))
+        axes_flat = axes.reshape(-1)
+
+        for i in range(4):
+            ax = axes_flat[i]
+            if i >= n:
+                ax.axis("off")
+                continue
+            key = keys_used[i]
+            drew_any = False
+            for method in methods:
+                diag = outputs.get(method, {}).get("diagnostics", {})
+                if not isinstance(diag, dict):
+                    continue
+                val = diag.get(key)
+                if val is None:
+                    continue
+                mean, lo, hi = _stability_series_with_band(np.asarray(val), band_percentiles)
+                t = np.arange(mean.shape[0])
+                ax.plot(t, mean, linewidth=1.6, label=method)
+                if lo is not None and hi is not None:
+                    ax.fill_between(t, lo, hi, alpha=0.15, linewidth=0)
+                drew_any = True
+            if not drew_any:
+                ax.axis("off")
+                continue
+            ax.set_xlabel("time")
+            ax.set_ylabel(_STABILITY_KEY_LABELS.get(key, key))
+            ax.grid(True, linestyle=":")
+            ax.legend(fontsize=8, loc="best")
+
+        fig.suptitle(f"stability_compare_{group_tag}_panel")
+        fig.tight_layout()
+        fig.savefig(output_dir / f"stability_compare_{group_tag}_panel.png", dpi=150)
+        if show:
+            plt.show()
+        plt.close(fig)
 
 
 # ess_from_weights moved to exp_utils.ess_from_weights
@@ -406,6 +934,8 @@ def main() -> None:
         exp_cfg.get("plot_stability_percentiles"),
         (25.0, 75.0),
     )
+    plot_stability_keys_cfg = [str(k) for k in as_list(exp_cfg.get("plot_stability_keys"))]
+    plot_stability_keys = plot_stability_keys_cfg or None
 
     summary_keys, exclude_prefixes = get_summary_keys_and_prefixes(exp_cfg, SUMMARY_KEYS)
 
@@ -620,7 +1150,7 @@ def main() -> None:
                                             flow_ess_threshold,
                                         )
                                         plot_path = method_dir / "pf_ess_over_time.png"
-                                        plot_ess_over_time(
+                                        _plot_ess_over_time(
                                             plot_path,
                                             w_pre,
                                             ess_threshold=ess_threshold,
@@ -677,7 +1207,35 @@ def main() -> None:
                                         diag_src,
                                         band_percentiles=plot_stability_percentiles,
                                         show=plot_stability_show,
+                                        keys=plot_stability_keys,
                                     )
+
+                        if plot_stability and (
+                            not plot_stability_seed0_only or seed == seeds[0]
+                        ):
+                            _plot_stability_compare_groups(
+                                per_seed_dir,
+                                outputs,
+                                methods,
+                                keys=plot_stability_keys,
+                                band_percentiles=plot_stability_percentiles,
+                                show=plot_stability_show,
+                            )
+                            _plot_stability_compare_groups_panel(
+                                per_seed_dir,
+                                outputs,
+                                methods,
+                                keys=plot_stability_keys,
+                                band_percentiles=plot_stability_percentiles,
+                                show=plot_stability_show,
+                            )
+                            _plot_beta_schedule_compare_groups(
+                                per_seed_dir,
+                                outputs,
+                                methods,
+                                band_percentiles=plot_stability_percentiles,
+                                show=plot_stability_show,
+                            )
 
                         print_separator(f"exp2b_range_bearing {cfg_tag} seed{seed} summary")
                         print_method_summary_table(

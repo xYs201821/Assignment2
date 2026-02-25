@@ -1,13 +1,15 @@
 experiment:
   output_root: results/exp2b_range_bearing
-  T: 30
-  batch_size: 100
-  seeds: [42]
+  T: 80
+  batch_size: 16
+  seeds: [123]
   pair_particles: true
   save_particles_seed0: true
-  plot_show: false
+  plot_show: true
+  # Focus stability plots on EDH/LEDH transport matrix diagnostics.
+  plot_stability_keys: [condInfo_log10, condA_log10_max, condJ_log10_max, logdetJ]
 model:
-  dt: 0.1
+  dt: 1.0
   cov_eps:
     - [0.01, 0.0, 0.0, 0.0]
     - [0.0, 0.01, 0.0, 0.0]
@@ -16,11 +18,11 @@ model:
   jitter: 1e-6
   distances: [1.0]
   sigma_thetas: [1.0]
-  sigma_rs: [0.2]
+  sigma_rs: [0.1]
 filters:
   # `filters.*` is the canonical filter config namespace for exp2b.
   methods:
-    [edh, ledh, edh(pfpf), ledh(pfpf), edh(pfpf_opt), ledh(pfpf_opt), edh(opt), ledh(opt)]
+    [ edh(pfpf), ledh(pfpf), edh(pfpf_opt), ledh(pfpf_opt)]
   model:
     # Optional mismatch model for filtering.
     # If omitted, filter uses `model.*` values.
@@ -34,7 +36,7 @@ filters:
       - [0.0, 0.0, 0.0, 0.1]
     jacobian_r_min: 0.01
     sigma_thetas: [5.0]
-    sigma_rs: [.6]
+    sigma_rs: [0.25]
   ukf:
     alpha: 5e-1
     beta: 2.0
@@ -46,10 +48,10 @@ filters:
     reweight: auto
   flow:
     # Base config for EDH/LEDH family. `edh(opt)` / `ledh(opt)` read `beta_schedule_opt`.
-    num_particles: [200]
-    num_lambda: 500
+    num_particles: [100]
+    num_lambda: 100
     ess_threshold: 0.5
-    reweight: never
+    reweight: always
     jitter: 1e-4
     beta_schedule_opt:
       mode: optimal
@@ -86,7 +88,7 @@ filters:
       guard: true
     jitter: 1e-4
 init:
-  x0: [1., -.9, .1, -.1]
+  x0: [1., -1., .1, -.1]
   m0_offset: [-.5, .5, 0.0, 0.0]
-  P0_diag: [1.0, 1.0, .5, .5]
-  P0_diag_filter: [1.0, 1.0, .5, .5]
+  P0_diag: [1.0, 1.0, .1, .1]
+  P0_diag_filter: [100.0, 100.0, .1, .1]

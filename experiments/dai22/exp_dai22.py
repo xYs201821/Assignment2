@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -105,7 +107,7 @@ class BearingOnlySSM(SSM):
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Dai(22) bearing-only SPF (single step).")
-    parser.add_argument("--num_particles", type=int, default=50)
+    parser.add_argument("--num_particles", type=int, default=100)
     parser.add_argument("--num_lambda", type=int, default=1000)
     parser.add_argument("--beta_mode", choices=["linear", "optimal", "both"], default="both")
     parser.add_argument("--mu", type=float, default=0.2)
@@ -148,6 +150,17 @@ def _stiffness_ratio(
 
 def main() -> None:
     args = parse_args()
+    t0 = time.perf_counter()
+
+    def log(msg: str) -> None:
+        dt = time.perf_counter() - t0
+        print(f"[dai22 +{dt:7.2f}s] {msg}", flush=True)
+
+    log(
+        "start "
+        f"(particles={args.num_particles}, lambda={args.num_lambda}, mc_runs={args.mc_runs}, "
+        f"beta_mode={args.beta_mode}, show={args.show})"
+    )
 
     sensors = np.array([[-3.5, 0.0], [3.5, 0.0]], dtype=np.float32)
     z = np.array([0.4754, 1.1868], dtype=np.float32)
@@ -166,6 +179,7 @@ def main() -> None:
         diffusion=Q,
         reweight="never",
     )
+    log("initialized stochastic flow")
 
     batch_size = max(1, int(args.mc_runs))
     rng = np.random.default_rng(args.seed)
@@ -186,11 +200,14 @@ def main() -> None:
     _, Info = flow._likelihood_terms(x0_tf, y_tf)
     P0_inv = flow._inverse_from_cov(P0_tf)
     solver = OptimalBetaSolver(args.num_lambda)
-    beta_opt, beta_dot_opt, _ = solver.solve(
+    solve_opt_beta = tf.function(solver.solve, reduce_retracing=True)
+    log("solving optimal beta schedule")
+    beta_opt, beta_dot_opt, _ = solve_opt_beta(
         P0_inv,
         Info,
         mu=args.mu,
     )
+    log("optimal beta schedule solved")
     beta_base = np.linspace(0.0, 1.0, args.num_lambda + 1, dtype=np.float32)[:-1]
     beta_dot_base = np.ones_like(beta_base)
     ssm.rng = tf.random.Generator.from_seed(int(args.seed))
@@ -203,14 +220,17 @@ def main() -> None:
         beta_schedule=BetaScheduleConfig(mode="linear"),
     )
     flow_base_transport = tf.function(flow_base._flow_transport, reduce_retracing=True)
+    log("warming up baseline transport graph")
     _ = flow_base_transport(x0_tf[:1], y_tf[:1], m0_tf[:1], P0_tf[:1])
     ssm.rng = tf.random.Generator.from_seed(int(args.seed))
+    log("running baseline transport")
     x_post_base, _, _ = flow_base_transport(
         x0_tf,
         y_tf,
         m0_tf,
         P0_tf,
     )
+    log("baseline transport finished")
 
     ssm.rng = tf.random.Generator.from_seed(int(args.seed))
     flow_opt = StochasticParticleFlow(
@@ -222,14 +242,17 @@ def main() -> None:
         beta_schedule=BetaScheduleConfig(mode="optimal", mu=args.mu, guard=True),
     )
     flow_opt_transport = tf.function(flow_opt._flow_transport, reduce_retracing=True)
+    log("warming up optimal transport graph")
     _ = flow_opt_transport(x0_tf[:1], y_tf[:1], m0_tf[:1], P0_tf[:1])
     ssm.rng = tf.random.Generator.from_seed(int(args.seed))
+    log("running optimal transport")
     x_post_opt, _, _ = flow_opt_transport(
         x0_tf,
         y_tf,
         m0_tf,
         P0_tf,
     )
+    log("optimal transport finished")
 
     x_post_base_np = x_post_base.numpy()
     x_post_opt_np = x_post_opt.numpy()
@@ -294,6 +317,7 @@ def main() -> None:
     if args.show:
         import matplotlib.pyplot as plt
 
+        log("rendering plots")
         fig, axes = plt.subplots(2, 2, figsize=(9, 7))
         axes[0, 0].plot(lam, beta_base, label="baseline beta=lambda", color="C0", linestyle="--")
         axes[0, 0].plot(lam, beta_opt_plot, label="optimal beta*", color="C1")
@@ -324,6 +348,7 @@ def main() -> None:
         if args.out is not None:
             fig.savefig(out_dir / "exp5_dai22_figure2.png", dpi=150)
         if args.show:
+            log("showing plot window (will block until closed)")
             plt.show()
         plt.close(fig)
 
@@ -373,6 +398,7 @@ def main() -> None:
                 writer.writerow(["run_id", "mse_baseline", "mse_opt", "trP_baseline", "trP_opt"])
                 writer.writerows(rows)
                 writer.writerow(["mean", mse_b_mean, mse_o_mean, trp_b_mean, trp_o_mean])
+    log("done")
 
 
 if __name__ == "__main__":

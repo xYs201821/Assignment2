@@ -3,9 +3,40 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+_STABILITY_KEY_LABELS = {
+    "condJ_log10_max": "cond_J_log10",
+    "logdetJ": "logdet_J",
+    "logdet_cov": "logdet_cov",
+    "condH_log10_max": "condH_log10",
+    "condK_log10_max": "condK_log10",
+    "flow_norm_mean_max": "flow_norm_mean",
+}
+
+_DEFAULT_STABILITY_KEYS = (
+    "condJ_log10_max",
+    "logdetJ",
+    "logdet_cov",
+    "condH_log10_max",
+    "condK_log10_max",
+    "flow_norm_mean_max",
+)
+
+
+def _resolve_stability_key_specs(keys: Optional[Sequence[str]]) -> List[Tuple[str, str]]:
+    key_order = list(_DEFAULT_STABILITY_KEYS if keys is None else keys)
+    specs: List[Tuple[str, str]] = []
+    seen = set()
+    for key in key_order:
+        key = str(key)
+        if key in seen:
+            continue
+        seen.add(key)
+        specs.append((key, _STABILITY_KEY_LABELS.get(key, key)))
+    return specs
 
 
 def plot_stability_series(
@@ -61,6 +92,7 @@ def plot_stability_over_time(
     diagnostics: Dict[str, Any],
     band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
     show: bool = False,
+    keys: Optional[Sequence[str]] = None,
 ) -> None:
     """Plot stability diagnostics over time.
     
@@ -69,14 +101,10 @@ def plot_stability_over_time(
         diagnostics: Dictionary containing diagnostic arrays
         band_percentiles: (low, high) percentiles for bands
         show: Whether to display plots
+        keys: Optional list of diagnostic keys to plot. If omitted, plots all
+            supported stability keys in default order.
     """
-    key_specs = [
-        ("logdet_cov", "logdet_cov"),
-        ("condH_log10_max", "condH_log10"),
-        ("condJ_log10_max", "condJ_log10"),
-        ("condK_log10_max", "condK_log10"),
-        ("flow_norm_mean_max", "flow_norm_mean"),
-    ]
+    key_specs = _resolve_stability_key_specs(keys)
     for key, label in key_specs:
         val = diagnostics.get(key)
         if val is None:

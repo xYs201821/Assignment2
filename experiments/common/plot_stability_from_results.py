@@ -2,76 +2,15 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 
-
-def _plot_stability_series(
-    path: Path,
-    values: np.ndarray,
-    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
-    show: bool = False,
-    title: Optional[str] = None,
-) -> None:
-    import matplotlib.pyplot as plt
-
-    arr = np.asarray(values)
-    if arr.ndim == 1:
-        mean = arr
-        lo = hi = None
-    else:
-        flat = arr.reshape(-1, arr.shape[-1])
-        mean = np.mean(flat, axis=0)
-        if band_percentiles is None:
-            lo = hi = None
-        else:
-            p_lo, p_hi = band_percentiles
-            lo = np.percentile(flat, p_lo, axis=0)
-            hi = np.percentile(flat, p_hi, axis=0)
-
-    t = np.arange(mean.shape[0])
-    fig, ax = plt.subplots(1, 1, figsize=(7, 3.5))
-    ax.plot(t, mean, color="C0", linewidth=1.6)
-    if lo is not None and hi is not None:
-        ax.fill_between(t, lo, hi, color="C0", alpha=0.25, linewidth=0)
-    ax.set_xlabel("time")
-    ax.grid(True, linestyle=":")
-    if title:
-        ax.set_title(title)
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    if show:
-        plt.show()
-    plt.close(fig)
-
-
-def _plot_stability_over_time(
-    output_dir: Path,
-    diagnostics: Dict[str, Any],
-    band_percentiles: Optional[Tuple[float, float]] = (25.0, 75.0),
-    show: bool = False,
-) -> None:
-    key_specs = [
-        ("logdet_cov", "logdet_cov"),
-        ("condH_log10_max", "condH_log10"),
-        ("condJ_log10_max", "condJ_log10"),
-        ("condK_log10_max", "condK_log10"),
-        ("flow_norm_mean_max", "flow_norm_mean"),
-    ]
-    for key, label in key_specs:
-        val = diagnostics.get(key)
-        if val is None:
-            continue
-        title = f"stability_{label}"
-        path = output_dir / f"{title}.png"
-        _plot_stability_series(
-            path,
-            np.asarray(val),
-            band_percentiles=band_percentiles,
-            show=show,
-            title=title,
-        )
+try:
+    from experiments.common.plot_utils import plot_stability_over_time
+except ModuleNotFoundError:
+    # Supports running this file directly from experiments/common.
+    from plot_utils import plot_stability_over_time
 
 
 def _logdet_from_cov(cov: np.ndarray, eps: float = 1e-12) -> np.ndarray:
@@ -130,6 +69,12 @@ def main() -> None:
         help="Percentile band for plots (default: 25 75).",
     )
     parser.add_argument(
+        "--keys",
+        nargs="+",
+        default=None,
+        help="Stability diagnostic keys to plot (default: all supported keys).",
+    )
+    parser.add_argument(
         "--no-band",
         action="store_true",
         help="Disable percentile band shading.",
@@ -148,7 +93,13 @@ def main() -> None:
         cov = diagnostics.get("cov")
         if cov is not None:
             diagnostics["logdet_cov"] = _logdet_from_cov(cov)
-    _plot_stability_over_time(output_dir, diagnostics, band_percentiles=band, show=args.show)
+    plot_stability_over_time(
+        output_dir,
+        diagnostics,
+        band_percentiles=band,
+        show=args.show,
+        keys=args.keys,
+    )
     print(f"Loaded: {diag_path}")
     print(f"Saved plots to: {output_dir}")
 
