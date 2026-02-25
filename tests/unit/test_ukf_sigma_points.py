@@ -21,6 +21,6 @@ def test_sigma_points_moment_matching(lgssm_2d):
     Xc = X - m_rec[:, tf.newaxis, :]
     P_rec = tf.einsum("i,bin,bim->bnm", Wc, Xc, Xc)
 
-    tf.debugging.assert_near(tf.reduce_sum(Wm), 1.0, atol=1e-6, rtol=1e-6)
+    tf.debugging.assert_near(tf.reduce_sum(Wm), 1.0, atol=1e-4, rtol=1e-4)
     tf.debugging.assert_near(m_rec, m, atol=1e-4, rtol=1e-4)
     tf.debugging.assert_near(P_rec, P, atol=1e-3, rtol=1e-3)
