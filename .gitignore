@@ -218,3 +218,11 @@ __marimo__/
 .venv/
 *.png
 .vscode/
+artifacts/
+results/
+runs/
+plots/
+stdout
+.mpl/
+.mplconfig/
+.DS_Store

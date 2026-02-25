@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import tensorflow as tf
 
-from src.ssm import StochasticVolatilitySSM
+from src.ssm import StochasticVolatilitySSM, VRNNBinarySSM
 
 pytestmark = pytest.mark.unit
 
@@ -70,3 +70,52 @@ def test_state_cov_matches_manual(lgssm_2d):
     resid = x - mean[:, tf.newaxis, :]
     manual = tf.einsum("bn,bni,bnj->bij", w, resid, resid)
     tf.debugging.assert_near(cov, manual, atol=1e-6, rtol=1e-6)
+
+
+def test_vrnn_binary_ssm_simulation_shapes_and_binary_obs():
+    ssm = VRNNBinarySSM(
+        obs_dim=11,
+        latent_dim=3,
+        recurrent_dim=5,
+        embed_dim=7,
+        transition_hidden_dim=9,
+        emission_hidden_dim=9,
+        seed=123,
+        trainable=True,
+    )
+
+    x_traj, y_traj = ssm.simulate(T=6, shape=(2,))
+    assert x_traj.shape == (2, 6, 8)
+    assert y_traj.shape == (2, 6, 11)
+
+    y_unique = np.unique(y_traj.numpy())
+    assert set(np.asarray(y_unique).tolist()).issubset({0.0, 1.0})
+
+    obs_dist = ssm.observation_dist(x_traj[:, 0, :])
+    log_prob = obs_dist.log_prob(y_traj[:, 0, :])
+    assert log_prob.shape == (2,)
+    tf.debugging.assert_all_finite(log_prob, "VRNN observation log_prob must be finite")
+
+
+def test_vrnn_transition_depends_on_previous_observation():
+    ssm = VRNNBinarySSM(
+        obs_dim=6,
+        latent_dim=2,
+        recurrent_dim=4,
+        embed_dim=8,
+        y_embed_dim=8,
+        transition_hidden_dim=10,
+        emission_hidden_dim=10,
+        seed=321,
+        trainable=False,
+        deterministic_r=True,
+    )
+    x_prev = tf.zeros([3, 4 + 2], dtype=tf.float32)
+    y_prev_zeros = tf.zeros([3, 6], dtype=tf.float32)
+    y_prev_ones = tf.ones([3, 6], dtype=tf.float32)
+
+    x_loc_zeros = ssm.f(x_prev, y_prev=y_prev_zeros)
+    x_loc_ones = ssm.f(x_prev, y_prev=y_prev_ones)
+
+    delta = tf.reduce_max(tf.abs(x_loc_zeros - x_loc_ones))
+    tf.debugging.assert_greater(delta, tf.constant(1e-6, dtype=tf.float32))

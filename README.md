@@ -39,21 +39,21 @@ Shape conventions:
 - init: A, B, C, D, m0, P0, jitter, seed
 - f(x) = A x, h(x) = C x
 - cov_eps_x = B B^T, cov_eps_y = D D^T
-- used in experiments/exp1_linear_gaussian.py 
+- used in experiments/exp1/exp1_linear_gaussian.py 
 
 ### StochasticVolatilitySSM (exp2a)
 - file: src/ssm/stochastic_volatility.py
 - init: alpha, sigma, beta, mu, noise_scale_func, obs_mode, obs_eps, seed
 - nonlinear obs; obs_mode in config is "logy2"
 - overrides f_with_noise and h_with_noise (non-additive noise)
-- used in experiments/exp2a_stochastic_vol.py 
+- used in experiments/exp2a/exp2a_stochastic_vol.py 
 
 ### RangeBearingSSM (exp2b)
 - file: src/ssm/range_bearing.py
 - init: motion_model (ConstantVelocityMotionModel), cov_eps_y, jitter, seed
 - observation returns [range, bearing] with angle wrapping
 - overrides innovation and measurement_mean/residual for bearing
-- used in experiments/exp2b_range_bearing.py 
+- used in experiments/exp2b/exp2b_range_bearing.py 
 
 ## Filter interfaces
 
@@ -68,14 +68,13 @@ UnscentedKalmanFilter(ssm, alpha, beta, kappa, jitter, joseph)
 
 Call pattern:
 - filt.warmup(batch_size)   # used in experiments to trace tf.function
-- out = filt.filter(y, m0=None, P0=None, memory_sampler=None)
+- out = filt.filter(y, m0=None, P0=None)
 
 Outputs (dict):
 - m_filt: [batch, T, dx]
 - P_filt: [batch, T, dx, dx]
 - m_pred, P_pred: one-step predictions
 - cond_P: condition numbers
-- step_time_s, memory_rss, memory_gpu (optional)
 
 SSM requirements:
 - KF expects LinearGaussianSSM with A, C and cov_eps_x/cov_eps_y
@@ -98,19 +97,18 @@ Common call pattern:
       resample="auto", # 'auto': only resample when below threshold; 'always': always resample; 'never' never resample
       init_dist=None,
       init_seed=None,
-      init_particles=None, 
-      memory_sampler=None,
+      init_particles=None,
   )
 
 Outputs:
 - x_seq: [batch, T, N, dx]
 - w_seq: [batch, T, N]
-- diagnostics: step_time_s, m_pred, P_pred, x_pred, w_pre, plus flow-specific stats
+- diagnostics: m_pred, P_pred, x_pred, w_pre, plus flow-specific stats
 - parents: resampling parent indices [batch, T, N]
 
 Notes:
 - reweight/resample can be "never", "auto", "always" (or bool/int)
-- init_dist is a callable: init_dist(shape) -> tfd.Distribution (see build_init_dist)
+- init_dist provides .sample(shape, seed) or is a callable returning a distribution (see build_init_dist)
 - init_particles can be used to seed PF/flows (used in exp2b)
 - either provide init_particles or init_dist
 
@@ -122,8 +120,8 @@ KernelParticleFlow specific args:
 
 ## Experiment wiring (exp1-2)
 
-All experiments build filters via experiments/filter_cfg.py and run them via
-experiments/runner.py: run_filter(ssm, y_obs, method, **cfg).
+All experiments build filters via experiments/common/filter_cfg.py and run them via
+experiments/common/runner.py: run_filter(ssm, y_obs, method, **cfg).
 
 Key config blocks in exp*_config.yaml:
 - filters.methods: list of method names (kf, ekf, ukf, pf, edh, ledh, edh(pfpf), ledh(pfpf), kflow_diag, kflow_scalar)
