@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import tensorflow as tf
+
+
+def to_stateless_seed(seed: tf.Tensor | int) -> tf.Tensor:
+    seed_t = tf.convert_to_tensor(seed, dtype=tf.int32)
+    if seed_t.shape.rank == 0:
+        return tf.stack([seed_t, seed_t + tf.constant(1, tf.int32)], axis=0)
+    seed_t = tf.reshape(seed_t, [-1])
+    if tf.shape(seed_t)[0] >= 2:
+        return tf.stack([seed_t[0], seed_t[1]], axis=0)
+    return tf.stack([seed_t[0], seed_t[0] + tf.constant(1, tf.int32)], axis=0)
+
+
+def split_seed(seed: tf.Tensor, n: int) -> tf.Tensor:
+    return tf.random.experimental.stateless_split(to_stateless_seed(seed), n)
+
+
+def systematic_resample_indices(weights: tf.Tensor, seed: tf.Tensor) -> tf.Tensor:
+    weights = tf.convert_to_tensor(weights, dtype=tf.float32)
+    shape = tf.shape(weights)
+    n_particles = shape[-1]
+    batch = tf.reduce_prod(shape[:-1])
+    w2 = tf.reshape(weights, [batch, n_particles])
+    cdf = tf.cumsum(w2, axis=-1)
+    seed = to_stateless_seed(seed)
+    u0 = tf.random.stateless_uniform(
+        [batch, 1],
+        seed=seed,
+        minval=0.0,
+        maxval=1.0 / tf.cast(n_particles, tf.float32),
+        dtype=tf.float32,
+    )
+    js = tf.cast(tf.range(n_particles)[tf.newaxis, :], tf.float32)
+    u = u0 + js / tf.cast(n_particles, tf.float32)
+    idx = tf.searchsorted(cdf, u, side="left")
+    idx = tf.clip_by_value(idx, 0, n_particles - 1)
+    return tf.reshape(idx, shape)
+
+
+def gather_particles(x: tf.Tensor, idx: tf.Tensor) -> tf.Tensor:
+    shape = tf.shape(x)
+    batch = tf.reduce_prod(shape[:-2])
+    x_flat = tf.reshape(x, [batch, shape[-2], shape[-1]])
+    idx_flat = tf.reshape(idx, [batch, shape[-2]])
+    out_flat = tf.gather(x_flat, idx_flat, batch_dims=1)
+    return tf.reshape(out_flat, shape)
+
+
+def pairwise_distance(x: tf.Tensor) -> tf.Tensor:
+    x_sq = tf.reduce_sum(tf.square(x), axis=-1, keepdims=True)
+    dist = x_sq - 2.0 * tf.matmul(x, x, transpose_b=True) + tf.transpose(x_sq, perm=[0, 2, 1])
+    return tf.maximum(dist, tf.zeros_like(dist))
+
+
+def sinkhorn_log_plan(
+    log_a: tf.Tensor,
+    log_b: tf.Tensor,
+    cost: tf.Tensor,
+    epsilon: float,
+    num_iters: int,
+) -> tf.Tensor:
+    eps = tf.cast(epsilon, cost.dtype)
+    log_k = -cost / eps
+    f = tf.zeros_like(log_a)
+    g = tf.zeros_like(log_b)
+    for _ in range(int(num_iters)):
+        f = log_a - tf.reduce_logsumexp(log_k + g[:, tf.newaxis, :], axis=-1)
+        g = log_b - tf.reduce_logsumexp(log_k + f[:, :, tf.newaxis], axis=-2)
+    return f[:, :, tf.newaxis] + log_k + g[:, tf.newaxis, :]
+
+
+@dataclass
+class StandardResampler:
+    def resample(self, x: tf.Tensor, log_w: tf.Tensor, seed: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        w = tf.exp(log_w)
+        idx = systematic_resample_indices(w, seed)
+        x_new = gather_particles(x, idx)
+        n_particles = tf.shape(log_w)[-1]
+        log_uniform = -tf.math.log(tf.cast(n_particles, log_w.dtype))
+        log_w_new = tf.fill(tf.shape(log_w), log_uniform)
+        return x_new, log_w_new, idx
+
+
+@dataclass
+class OTResampler:
+    epsilon: float = 0.1
+    num_iters: int = 50
+    jitter: float = 1e-8
+
+    def resample(self, x: tf.Tensor, log_w: tf.Tensor, seed: tf.Tensor | None = None) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        del seed
+        log_w = log_w - tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
+        n_particles = tf.shape(x)[-2]
+        log_uniform = -tf.math.log(tf.cast(n_particles, x.dtype))
+        log_b = tf.fill(tf.shape(log_w), log_uniform)
+        cost = pairwise_distance(x)
+        log_plan = sinkhorn_log_plan(log_w, log_b, cost, epsilon=self.epsilon, num_iters=self.num_iters)
+        plan = tf.exp(log_plan)
+        col_mass = tf.reduce_sum(plan, axis=-2)
+        weighted_sum = tf.einsum("bij,bid->bjd", plan, x)
+        x_new = weighted_sum / tf.maximum(col_mass[..., tf.newaxis], tf.cast(self.jitter, x.dtype))
+        log_w_new = tf.fill(tf.shape(log_w), log_uniform)
+        parent = tf.argmax(plan, axis=-2, output_type=tf.int32)
+        return x_new, log_w_new, parent
+

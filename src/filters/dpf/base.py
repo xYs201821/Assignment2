@@ -41,8 +41,9 @@ class DPFBase(ParticleFilter):
         """Set proposal.
 
         Proposal protocol:
-          - callable(ssm, x_prev, y_t, seed=None) -> x_pred OR (x_pred, log_q)
-          - object with .sample(ssm, x_prev, y_t, seed=None), optional .log_prob(...)
+          - callable(ssm, x_prev, y_t, seed=None, y_prev=None, log_w_prev=None)
+            -> x_pred OR (x_pred, log_q)
+          - object with .sample(ssm, x_prev, y_t, seed=None, ...), optional .log_prob(...)
         """
         self.proposal = proposal if proposal is not None else BootstrapProposal()
 
@@ -71,11 +72,21 @@ class DPFBase(ParticleFilter):
             return out[0], out[1]
         return out, None
 
-    def _sample_proposal(self, x_prev, y_t, y_prev=None):
+    def _sample_proposal(self, x_prev, y_t, y_prev=None, log_w_prev=None):
         seed = self.ssm._tfp_seed()
         proposal = self.proposal
         if callable(proposal):
-            out = proposal(self.ssm, x_prev, y_t, seed=seed)
+            try:
+                out = proposal(
+                    self.ssm,
+                    x_prev,
+                    y_t,
+                    seed=seed,
+                    y_prev=y_prev,
+                    log_w_prev=log_w_prev,
+                )
+            except TypeError:
+                out = proposal(self.ssm, x_prev, y_t, seed=seed)
         elif hasattr(proposal, "sample"):
             if isinstance(proposal, Proposal):
                 out = proposal.sample(
@@ -84,6 +95,7 @@ class DPFBase(ParticleFilter):
                     y_t,
                     seed=seed,
                     y_prev=y_prev,
+                    log_w_prev=log_w_prev,
                 )
             else:
                 out = proposal.sample(self.ssm, x_prev, y_t, seed=seed)
@@ -102,6 +114,7 @@ class DPFBase(ParticleFilter):
                         x_prev,
                         y_t,
                         y_prev=y_prev,
+                        log_w_prev=log_w_prev,
                     )
                 else:
                     log_q = proposal.log_prob(self.ssm, x_pred, x_prev, y_t)
@@ -296,6 +309,7 @@ class DPFBase(ParticleFilter):
             x_prev,
             y_t,
             y_prev=y_prev,
+            log_w_prev=log_w_prev,
         )
 
         loglik = self._observation_log_prob(x_pred, y_t)

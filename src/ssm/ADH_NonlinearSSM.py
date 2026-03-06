@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Mapping
+
 import tensorflow as tf
 import tensorflow_probability as tfp
 
@@ -59,12 +61,49 @@ class ADHNonlinearSSM(SSM):
 
         self.m0 = tf.convert_to_tensor([x0_mean, t0], dtype=_dc.DTYPE)
         self.P0 = tf.linalg.diag(tf.convert_to_tensor([x0_var, t0_var], dtype=_dc.DTYPE))
-
-        q_x = self.sigma_v ** 2
-        q_t = self.t_process_var
-        self.cov_eps_x = tf.linalg.diag(tf.convert_to_tensor([q_x, q_t], dtype=_dc.DTYPE))
-        self.cov_eps_y = tf.reshape(self.sigma_w ** 2, [1, 1])
         self.L0 = tf.linalg.cholesky(self.P0)
+        self._refresh_cached_covariances()
+
+    @staticmethod
+    def _to_scalar(value) -> tf.Tensor:
+        return tf.reshape(tf.convert_to_tensor(value, dtype=_dc.DTYPE), [])
+
+    def _resolve_runtime_params(
+        self,
+        params: Mapping[str, tf.Tensor | float] | None = None,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
+        if params is None:
+            return (
+                self._to_scalar(self.sigma_v),
+                self._to_scalar(self.sigma_w),
+            )
+        if not isinstance(params, Mapping):
+            raise TypeError("params must be a mapping or None.")
+        sigma_v = params.get("sigma_v", self.sigma_v)
+        sigma_w = params.get("sigma_w", self.sigma_w)
+        return (
+            self._to_scalar(sigma_v),
+            self._to_scalar(sigma_w),
+        )
+
+    def process_cov(self, params: Mapping[str, tf.Tensor | float] | None = None) -> tf.Tensor:
+        sigma_v, _ = self._resolve_runtime_params(params)
+        return tf.linalg.diag(tf.stack([sigma_v**2, self._to_scalar(self.t_process_var)], axis=0))
+
+    def observation_cov(self, params: Mapping[str, tf.Tensor | float] | None = None) -> tf.Tensor:
+        _, sigma_w = self._resolve_runtime_params(params)
+        return tf.reshape(sigma_w**2, [1, 1])
+
+    def current_params(self) -> dict[str, tf.Tensor]:
+        sigma_v, sigma_w = self._resolve_runtime_params(None)
+        return {
+            "sigma_v": sigma_v,
+            "sigma_w": sigma_w,
+        }
+
+    def _refresh_cached_covariances(self) -> None:
+        self.cov_eps_x = self.process_cov()
+        self.cov_eps_y = self.observation_cov()
         self.Lq = tf.linalg.cholesky(self.cov_eps_x)
         self.Lr = tf.linalg.cholesky(self.cov_eps_y)
 
@@ -97,13 +136,8 @@ class ADHNonlinearSSM(SSM):
             t0v_new = t0v_cur if t0_var is None else tf.cast(t0_var, _dc.DTYPE)
             self.P0 = tf.linalg.diag(tf.stack([x0v_new, t0v_new], axis=0))
 
-        self.cov_eps_x = tf.linalg.diag(
-            tf.convert_to_tensor([self.sigma_v ** 2, self.t_process_var], dtype=_dc.DTYPE)
-        )
-        self.cov_eps_y = tf.reshape(self.sigma_w ** 2, [1, 1])
         self.L0 = tf.linalg.cholesky(self.P0)
-        self.Lq = tf.linalg.cholesky(self.cov_eps_x)
-        self.Lr = tf.linalg.cholesky(self.cov_eps_y)
+        self._refresh_cached_covariances()
 
     @property
     def state_dim(self) -> int:
@@ -128,8 +162,9 @@ class ADHNonlinearSSM(SSM):
             + 8.0 * tf.cos(1.2 * t_next)
         )
 
-    def f(self, z, **kwargs):
+    def f(self, z, params=None, **kwargs):
         """Deterministic transition mean over augmented state."""
+        del params, kwargs
         z = tf.convert_to_tensor(z, dtype=_dc.DTYPE)
         x_prev = z[..., 0]
         t_prev = z[..., 1]
@@ -137,8 +172,9 @@ class ADHNonlinearSSM(SSM):
         x_next = self._x_drift(x_prev, t_next)
         return tf.stack([x_next, t_next], axis=-1)
 
-    def h(self, z, **kwargs):
+    def h(self, z, params=None, **kwargs):
         """Observation mean (depends on x component only)."""
+        del params, kwargs
         z = tf.convert_to_tensor(z, dtype=_dc.DTYPE)
         x = z[..., 0]
         return (tf.square(x) / 20.0)[..., tf.newaxis]
@@ -151,30 +187,36 @@ class ADHNonlinearSSM(SSM):
 
     def transition_dist(self, z_prev, **kwargs):
         """Transition distribution p(z_n | z_{n-1})."""
-        loc = self.f(z_prev)
-        scale_diag = tf.stack([self.sigma_v, tf.sqrt(self.t_process_var)], axis=0)
+        params = kwargs.get("params")
+        sigma_v, _ = self._resolve_runtime_params(params)
+        loc = self.f(z_prev, params=params)
+        scale_diag = tf.stack([sigma_v, tf.sqrt(self._to_scalar(self.t_process_var))], axis=0)
         scale_diag = tf.broadcast_to(scale_diag, tf.shape(loc))
         return tfd.MultivariateNormalDiag(loc=loc, scale_diag=scale_diag)
 
     def observation_dist(self, z, **kwargs):
         """Observation distribution p(y_n | z_n)."""
-        loc = self.h(z)
-        scale = tf.ones_like(loc) * self.sigma_w
+        params = kwargs.get("params")
+        _, sigma_w = self._resolve_runtime_params(params)
+        loc = self.h(z, params=params)
+        scale = tf.ones_like(loc) * sigma_w
         return tfd.MultivariateNormalDiag(loc=loc, scale_diag=scale)
 
-    def f_with_noise(self, z, q, **kwargs):
+    def f_with_noise(self, z, q, params=None, **kwargs):
         """Transition with additive process noise."""
+        del kwargs
         z = tf.convert_to_tensor(z, dtype=_dc.DTYPE)
         q = tf.convert_to_tensor(q, dtype=_dc.DTYPE)
-        return self.f(z) + q
+        return self.f(z, params=params) + q
 
-    def h_with_noise(self, z, r, **kwargs):
+    def h_with_noise(self, z, r, params=None, **kwargs):
         """Observation with additive measurement noise."""
+        del kwargs
         z = tf.convert_to_tensor(z, dtype=_dc.DTYPE)
         r = tf.convert_to_tensor(r, dtype=_dc.DTYPE)
-        return self.h(z) + r
+        return self.h(z, params=params) + r
 
-    def jacobian_f_x(self, z, q):
+    def jacobian_f_x(self, z, q, params=None):
         """Analytic Jacobian of f_with_noise wrt state z."""
         z = tf.convert_to_tensor(z, dtype=_dc.DTYPE)
         q = tf.convert_to_tensor(q, dtype=_dc.DTYPE)
@@ -191,29 +233,29 @@ class ADHNonlinearSSM(SSM):
             tf.shape(row1),
         )
         J = tf.stack([row1, row2], axis=-2)
-        return J, self.f_with_noise(z, q)
+        return J, self.f_with_noise(z, q, params=params)
 
-    def jacobian_f_q(self, z, q):
+    def jacobian_f_q(self, z, q, params=None):
         """Analytic Jacobian of f_with_noise wrt process noise q (identity)."""
         z = tf.convert_to_tensor(z, dtype=_dc.DTYPE)
         q = tf.convert_to_tensor(q, dtype=_dc.DTYPE)
         batch_shape = tf.shape(z)[:-1]
         eye = tf.eye(self.q_dim, batch_shape=batch_shape, dtype=_dc.DTYPE)
-        return eye, self.f_with_noise(z, q)
+        return eye, self.f_with_noise(z, q, params=params)
 
-    def jacobian_h_x(self, z, r):
+    def jacobian_h_x(self, z, r, params=None):
         """Analytic Jacobian of h_with_noise wrt state z."""
         z = tf.convert_to_tensor(z, dtype=_dc.DTYPE)
         r = tf.convert_to_tensor(r, dtype=_dc.DTYPE)
         x = z[..., 0]
         row = tf.stack([x / 10.0, tf.zeros_like(x)], axis=-1)
         J = row[..., tf.newaxis, :]
-        return J, self.h_with_noise(z, r)
+        return J, self.h_with_noise(z, r, params=params)
 
-    def jacobian_h_r(self, z, r):
+    def jacobian_h_r(self, z, r, params=None):
         """Analytic Jacobian of h_with_noise wrt measurement noise r (identity)."""
         z = tf.convert_to_tensor(z, dtype=_dc.DTYPE)
         r = tf.convert_to_tensor(r, dtype=_dc.DTYPE)
         batch_shape = tf.shape(z)[:-1]
         eye = tf.eye(self.r_dim, batch_shape=batch_shape, dtype=_dc.DTYPE)
-        return eye, self.h_with_noise(z, r)
+        return eye, self.h_with_noise(z, r, params=params)

@@ -172,6 +172,7 @@ class FlowBase(ParticleFilter, LinearizationMixin):
         m, P = self._prior_from_sample(mu_tilde, w)
 
         x_next, log_det, _ = self._flow_transport(mu_tilde, y_t, m, P, w=w)
+        log_det = self._broadcast_log_det(log_det, log_q0)
         return x_next, log_q0 - log_det
 
     def warmup(self, batch_size=1, T=2, reweight=0, resample=0, y=None):
