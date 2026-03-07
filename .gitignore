@@ -226,3 +226,6 @@ stdout
 .mpl/
 .mplconfig/
 .DS_Store
+
+# Local utility scripts
+scripts/

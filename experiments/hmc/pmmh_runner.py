@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import time
+from types import SimpleNamespace
 from typing import Any, Dict
 
 import numpy as np
@@ -23,55 +23,12 @@ tfd = tfp.distributions
 FLOW_REWEIGHT = "always"
 
 
-@dataclass
-class PMMHConfig:
-    # Outer PMMH chain.
-    num_steps: int = 10000
-    proposal_std_v: float = 0.15  # Desired RW std for sigma_v^2; internally mapped to log-space.
-    proposal_std_w: float = 0.08  # Desired RW std for sigma_w^2; internally mapped to log-space.
-
-    # Inner PF engine.
-    inner_pf: str = "standard"  # {"standard", "ot"}
-    num_particles: int = 1000
-    ess_threshold: float = 0.5
-    resample: str = "auto"  # {"never","auto","always"} via PF normalize logic.
-
-    # Proposal q(x_t | x_{t-1}, y_t) used inside the inner PF.
-    proposal_kind: str = "bootstrap"  # {"bootstrap", "ledh", "edh"}
-    num_lambda: int = 20  # Flow discretization steps for LEDH/EDH.
-    proposal: Any = None  # Optional externally provided proposal object.
-
-    # OT resampling controls (only used when inner_pf == "ot").
-    ot_epsilon: float = 0.1
-    ot_num_iters: int = 50
-    ot_jitter: float = 1e-6
-
-    # Prior on static parameters sigma_v^2 and sigma_w^2.
-    prior_alpha: float = 0.01
-    prior_beta: float = 0.01
-
-    # Initial point for PMMH chain (provided in sigma2-space, sampled in log-sigma2 space).
-    init_sigma2_v: float = 10.0
-    init_sigma2_w: float = 10.0
-
-    # SSM initial-state prior parameters p(z_0).
-    x0_mean: float = 0.0
-    x0_var: float = 5.0
-    t0: float = 0.0
-    t0_var: float = 1e-9
-
-    # Runtime and logging.
-    seed: int = 0
-    verbose: bool = True
-    print_every: int = 50
-
-
 def _log_prior_sigma2_tf(sigma2: tf.Tensor, prior: tfd.Distribution) -> tf.Tensor:
     sigma2 = tf.convert_to_tensor(sigma2, dtype=tf.float32)
     return tf.reduce_sum(prior.log_prob(sigma2))
 
 
-def _build_ssm(cfg: PMMHConfig, sigma2: tf.Tensor) -> ADHNonlinearSSM:
+def _build_ssm(cfg: Any, sigma2: tf.Tensor) -> ADHNonlinearSSM:
     sigma2 = tf.convert_to_tensor(sigma2, dtype=tf.float32)
     sigma_v = tf.reshape(tf.sqrt(sigma2[0]), [])
     sigma_w = tf.reshape(tf.sqrt(sigma2[1]), [])
@@ -97,7 +54,7 @@ def _params_from_unconstrained(unconstrained: tf.Tensor) -> dict[str, tf.Tensor]
     return _params_from_sigma2(unconstrained_to_sigma2(unconstrained))
 
 
-def _build_dpf_proposal(cfg: PMMHConfig):
+def _build_dpf_proposal(cfg: Any):
     if cfg.proposal is not None:
         return cfg.proposal
     return build_pure_proposal(cfg.proposal_kind, num_lambda=int(cfg.num_lambda))
@@ -107,12 +64,13 @@ def _build_inner_pf(
     *,
     ssm: ADHNonlinearSSM,
     y_obs: tf.Tensor,
-    cfg: PMMHConfig,
+    cfg: Any,
 ):
     del y_obs
     proposal = _build_dpf_proposal(cfg)
     resampler = build_resampler(
         cfg.inner_pf,
+        soft_lam=float(cfg.soft_lam),
         ot_epsilon=float(cfg.ot_epsilon),
         ot_num_iters=int(cfg.ot_num_iters),
         ot_jitter=float(cfg.ot_jitter),
@@ -125,7 +83,7 @@ def _build_inner_pf(
     pf = PureParticleFilter(ssm=ssm, proposal=proposal, resampler=resampler, cfg=pf_cfg)
     return pf, str(cfg.inner_pf).strip().lower()
 
-
+@tf.function(reduce_retracing=True)
 def _sum_logz_from_filter(
     pf: Any,
     y_obs: tf.Tensor,
@@ -182,7 +140,8 @@ def _log_rw_density(target: tf.Tensor, loc: tf.Tensor, scale: tf.Tensor) -> tf.T
     return tf.reduce_sum(tfd.Normal(loc=loc, scale=scale).log_prob(target))
 
 
-def run_pmmh(y_obs: tf.Tensor, cfg: PMMHConfig) -> Dict[str, Any]:
+def run_pmmh(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
+    cfg = SimpleNamespace(**cfg)
     rng = tf.random.Generator.from_seed(int(cfg.seed))
     prior = tfd.InverseGamma(
         concentration=tf.convert_to_tensor(cfg.prior_alpha, dtype=tf.float32),

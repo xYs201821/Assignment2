@@ -6,6 +6,7 @@ import tensorflow as tf
 
 from experiments.hmc.pure_resamplers import (
     OTResampler,
+    SoftResampler,
     StandardResampler,
     split_seed,
     to_stateless_seed,
@@ -25,7 +26,7 @@ class PureParticleFilter:
         self.proposal = proposal
         self.resampler = resampler
         self.cfg = cfg
-        self._is_standard_resampler = isinstance(resampler, StandardResampler)
+        self._resampler_needs_seed = isinstance(resampler, (StandardResampler, SoftResampler))
 
     @staticmethod
     def _log_normalize(log_w: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
@@ -91,6 +92,9 @@ class PureParticleFilter:
                 y_prev=y_prev,
                 log_w_prev=log_w_prev,
             )
+            # Restore static shape info lost by proposals with dynamic ops (e.g. LEDH).
+            x_pred = tf.ensure_shape(x_pred, x_prev.shape)
+            log_q  = tf.ensure_shape(log_q,  log_w_prev.shape)
 
             loglik = tf.cast(
                 self.ssm.observation_dist(x_pred, params=params).log_prob(y_t[:, tf.newaxis, :]),
@@ -104,7 +108,7 @@ class PureParticleFilter:
             log_w_n, w_pre, logz_t = self._log_normalize(log_w)
             do_rs = self._should_resample(w_pre, resample_mode)
 
-            if self._is_standard_resampler:
+            if self._resampler_needs_seed:
                 rs_seed = seeds[k + 1] + tf.constant([42, 1024], tf.int32)
                 x_rs, log_w_rs, parent_idx = self.resampler.resample(x_pred, log_w_n, rs_seed)
             else:
@@ -121,6 +125,9 @@ class PureParticleFilter:
             parent_acc = parent_acc.write(k, parent)
             return k + 1, x_t, log_w_next, logz_acc, x_acc, w_acc, parent_acc
 
+        # x_prev0.shape is [None, n, dx] — n and dx are static (known before tracing).
+        # Providing shape_invariants preserves these static dims through the loop,
+        # which allows proposals like LEDH that use dynamic broadcast internally.
         _, _, _, logz_ta, x_ta, w_ta, parent_ta = tf.while_loop(
             cond=cond,
             body=body,
@@ -132,6 +139,15 @@ class PureParticleFilter:
                 x_ta,
                 w_ta,
                 parent_ta,
+            ),
+            shape_invariants=(
+                tf.TensorShape([]),
+                x_prev0.shape,
+                log_w_prev0.shape,
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
             ),
             parallel_iterations=1,
         )
@@ -149,10 +165,12 @@ class PureParticleFilter:
         return x_seq, w_seq, diagnostics, parent_seq
 
 
-def build_resampler(kind: str, *, ot_epsilon: float, ot_num_iters: int, ot_jitter: float):
+def build_resampler(kind: str, *, ot_epsilon: float, ot_num_iters: int, ot_jitter: float, soft_lam: float = 0.95):
     k = str(kind).strip().lower()
     if k == "standard":
         return StandardResampler()
+    if k == "soft":
+        return SoftResampler(lam=float(soft_lam))
     if k == "ot":
         return OTResampler(epsilon=float(ot_epsilon), num_iters=int(ot_num_iters), jitter=float(ot_jitter))
-    raise ValueError("inner_pf must be one of {'standard', 'ot'}")
+    raise ValueError("inner_pf must be one of {'standard', 'soft', 'ot'}")

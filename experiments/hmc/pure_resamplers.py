@@ -86,6 +86,36 @@ class StandardResampler:
 
 
 @dataclass
+class SoftResampler:
+    """Soft resampling: sample from mixture q_i = λ·w_i + (1-λ)/N, then
+    correct importance weights by w_new_i ∝ w_{idx_i} / q_{idx_i}."""
+
+    lam: float = 0.95  # mixing coefficient; 1.0 → pure categorical, 0 → pure uniform
+
+    def resample(self, x: tf.Tensor, log_w: tf.Tensor, seed: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+        log_w = log_w - tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
+        lam = tf.cast(self.lam, log_w.dtype)
+        n = tf.shape(log_w)[-1]
+        log_uniform = -tf.math.log(tf.cast(n, log_w.dtype))
+        log_lam = tf.math.log(tf.clip_by_value(lam, tf.constant(1e-6, log_w.dtype), tf.constant(1.0, log_w.dtype)))
+        log_one_minus_lam = tf.math.log(tf.maximum(1.0 - lam, tf.constant(1e-6, log_w.dtype)))
+
+        log_q = tf.reduce_logsumexp(
+            tf.stack(
+                [log_lam + log_w, log_one_minus_lam + log_uniform * tf.ones_like(log_w)],
+                axis=0,
+            ),
+            axis=0,
+        )
+
+        idx = tf.random.stateless_categorical(log_q, num_samples=n, seed=to_stateless_seed(seed), dtype=tf.int32)
+        x_new = gather_particles(x, idx)
+        log_w_new = tf.gather(log_w, idx, batch_dims=1) - tf.gather(log_q, idx, batch_dims=1)
+        log_w_new = log_w_new - tf.reduce_logsumexp(log_w_new, axis=-1, keepdims=True)
+        return x_new, log_w_new, idx
+
+
+@dataclass
 class OTResampler:
     epsilon: float = 0.1
     num_iters: int = 50

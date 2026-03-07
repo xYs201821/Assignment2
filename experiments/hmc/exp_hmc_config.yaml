@@ -1,0 +1,87 @@
+experiment:
+  # Output directory for results, plots, and .npz files.
+  output_dir: results/exp_hmc
+  # Sampler to use: "hmc" or "pmmh".
+  sampler: hmc
+  # Number of time steps for data simulation.
+  T: 50
+  # Random seed for data generation.
+  data_seed: 123
+  # Random seed for MCMC chain (null → use data_seed).
+  mcmc_seed: null
+  # Thinning: keep one sample every `drop` steps after burn-in.
+  drop: 10
+  # Print progress every N steps. null → num_steps // 10.
+  print_every: 100
+  # Optional tag for output file names. null → auto-generated.
+  tag: pmmh_T50_S12500_bootstrap_standard
+  # Show plots interactively after saving.
+  show: false
+
+true_params:
+  # True noise variances used for data simulation.
+  sigma_v2: 10.0
+  sigma_w2: 1.0
+
+hmc:
+  # Total number of HMC MCMC steps.
+  num_steps: 12500
+  # Burn-in length; null → num_steps // 2.
+  burnin: 2500
+  # Initial HMC leapfrog step size (adapted during warm-up).
+  step_size: 0.05
+  # Number of leapfrog steps per HMC proposal.
+  num_leapfrog_steps: 5
+  # Target Metropolis acceptance probability for dual-averaging adaptation.
+  target_accept_prob: 0.6
+  # Step-size adaptation rate (dual averaging).
+  adaptation_rate: 0.01
+  # Number of adaptation steps; null → burnin.
+  adaptation_steps: null
+  # Seed for the frozen PF used inside HMC (null → no freezing).
+  frozen_pf_seed: 42
+  # Initial sigma_v^2 for chain start.
+  init_sigma_v2: 10.0
+  # Initial sigma_w^2 for chain start.
+  init_sigma_w2: 10.0
+
+pmmh:
+  # Total number of PMMH MCMC steps.
+  num_steps: 10000
+  burnin: 5000
+  # Random-walk proposal SD on sigma_v^2 scale (mapped to log-space internally).
+  proposal_std_v: 0.15
+  # Random-walk proposal SD on sigma_w^2 scale (mapped to log-space internally).
+  proposal_std_w: 0.08
+  # Initial sigma_v^2 for chain start.
+  init_sigma_v2: 10.0
+  # Initial sigma_w^2 for chain start.
+  init_sigma_w2: 10.0
+
+prior:
+  # Inverse-Gamma prior shape on sigma^2 (shared for both parameters).
+  alpha: 0.01
+  # Inverse-Gamma prior scale on sigma^2 (shared for both parameters).
+  beta: 0.01
+
+filter:
+  # Inner PF engine: "standard" or "ot".
+  inner_pf: standard
+  # Proposal distribution inside inner PF: "bootstrap", "ledh", or "edh".
+  proposal_kind: ledh
+  # Number of particles in inner PF.
+  num_particles: 100
+  # ESS threshold for resampling trigger.
+  ess_threshold: 0.5
+  # Resampling mode: "never", "auto", or "always".
+  resample: always
+  # Flow discretization steps for LEDH/EDH proposals.
+  num_lambda: 20
+  # Soft resampling mixture weight λ ∈ (0,1] 
+  soft_lam: 0.95
+  # OT resampling regularization (only used when inner_pf = "ot").
+  ot_epsilon: 0.1
+  # OT Sinkhorn iterations.
+  ot_num_iters: 25
+  # OT jitter for numerical stability.
+  ot_jitter: 1.0e-6

@@ -17,6 +17,7 @@ _EXPERIMENTS = {
     "exp3pt": "experiments.exp3.exp3_transformer_pretrain",
     "exp3plot": "experiments.exp3.plot_exp3_dpf_diagnostics",
     "dai22": "experiments.dai22.exp_dai22",
+    "exp_hmc": "experiments.hmc.hmc_exp",
 }
 
 def _parse_args(argv: List[str]) -> argparse.Namespace:

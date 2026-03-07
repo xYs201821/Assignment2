@@ -57,23 +57,32 @@ def _configure_tf_device(device: str) -> str:
 
 _ACTIVE_DEVICE = _configure_tf_device(_PRESELECTED_DEVICE)
 
-from experiments.hmc.hmc_runner import HMCConfig, run_hmc
-from experiments.hmc.pmmh_runner import PMMHConfig, run_pmmh
+from experiments.common.exp_utils import load_config
+from experiments.hmc.hmc_runner import run_hmc
+from experiments.hmc.pmmh_runner import run_pmmh
 from src.ssm.ADH_NonlinearSSM import ADHNonlinearSSM
+
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("exp_hmc_config.yaml")
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="PMMH/HMC posterior inference for ADH nonlinear SSM."
     )
-    parser.add_argument("--sampler", type=str, choices=["hmc", "pmmh"], default="hmc")
-    parser.add_argument("--T", type=int, default=100)
-    parser.add_argument("--data-seed", type=int, default=123)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help=f"Path to YAML config (default: {DEFAULT_CONFIG_PATH})",
+    )
+    parser.add_argument("--sampler", type=str, choices=["hmc", "pmmh"], default=None)
+    parser.add_argument("--T", type=int, default=None)
+    parser.add_argument("--data-seed", type=int, default=None)
     parser.add_argument("--mcmc-seed", type=int, default=None)
     parser.add_argument("--num-steps", type=int, default=None)
     parser.add_argument("--print-every", type=int, default=None)
     parser.add_argument("--burnin", type=int, default=None)
-    parser.add_argument("--drop", type=int, default=10, help="Keep one sample every `drop` steps after burn-in.")
+    parser.add_argument("--drop", type=int, default=None, help="Keep one sample every `drop` steps after burn-in.")
     parser.add_argument(
         "--device",
         type=str,
@@ -84,9 +93,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--inner-pf",
         type=str,
-        choices=["standard", "ot"],
+        choices=["standard", "soft", "ot"],
         default=None,
     )
+    parser.add_argument("--soft-lam", type=float, default=None, help="Soft resampling λ).")
     parser.add_argument("--proposal-kind", type=str, choices=["bootstrap", "ledh", "edh"], default=None)
     parser.add_argument("--num-particles", type=int, default=None)
     parser.add_argument("--num-lambda", type=int, default=None)
@@ -117,16 +127,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--prior-beta", type=float, default=None)
     parser.add_argument("--init-sigma-v2", type=float, default=None)
     parser.add_argument("--init-sigma-w2", type=float, default=None)
-    parser.add_argument("--true-sigma-v2", type=float, default=10.0)
-    parser.add_argument("--true-sigma-w2", type=float, default=1.0)
-    parser.add_argument("--output-dir", type=Path, default=Path("results/hmc"))
+    parser.add_argument("--true-sigma-v2", type=float, default=None)
+    parser.add_argument("--true-sigma-w2", type=float, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument(
         "--tag",
         type=str,
         default=None,
         help="Optional output tag. Default: {sampler}_T{T}_N{N}_S{steps}",
     )
-    parser.add_argument("--show", action="store_true")
+    parser.add_argument("--show", action="store_true", default=None)
     return parser.parse_args()
 
 
@@ -220,101 +230,120 @@ def _plot_posterior_after_burnin(
     plt.close(fig)
 
 
+def _cv(cli_val, yaml_val, fallback):
+    """CLI > yaml > fallback priority resolution."""
+    if cli_val is not None:
+        return cli_val
+    if yaml_val is not None:
+        return yaml_val
+    return fallback
+
+
+def _build_cfg(args, yaml_cfg: dict, sampler: str) -> dict:
+    """Build the runner config dict from yaml + CLI overrides."""
+    filter_cfg = yaml_cfg.get("filter", {})
+    prior_cfg = yaml_cfg.get("prior", {})
+    sampler_yaml = yaml_cfg.get(sampler, {})
+
+    num_steps = int(_cv(args.num_steps, sampler_yaml.get("num_steps"), 10000))
+    mcmc_seed = _cv(args.mcmc_seed, yaml_cfg.get("experiment", {}).get("mcmc_seed"), 0)
+
+    shared = dict(
+        num_steps      = num_steps,
+        inner_pf       = str(_cv(args.inner_pf,      filter_cfg.get("inner_pf"),      "ot")),
+        proposal_kind  = str(_cv(args.proposal_kind, filter_cfg.get("proposal_kind"), "bootstrap")),
+        num_particles  = int(_cv(args.num_particles, filter_cfg.get("num_particles"),  1000)),
+        num_lambda     = int(_cv(args.num_lambda,    filter_cfg.get("num_lambda"),     20)),
+        ess_threshold  = float(_cv(args.ess_threshold, filter_cfg.get("ess_threshold"), 0.5)),
+        soft_lam       = float(_cv(args.soft_lam,    filter_cfg.get("soft_lam"),      0.95)),
+        ot_epsilon     = float(_cv(args.ot_epsilon,  filter_cfg.get("ot_epsilon"),    0.1)),
+        ot_num_iters   = int(_cv(args.ot_num_iters,  filter_cfg.get("ot_num_iters"),  25)),
+        ot_jitter      = float(_cv(args.ot_jitter,   filter_cfg.get("ot_jitter"),     1e-6)),
+        prior_alpha    = float(_cv(args.prior_alpha, prior_cfg.get("alpha"),          0.01)),
+        prior_beta     = float(_cv(args.prior_beta,  prior_cfg.get("beta"),           0.01)),
+        init_sigma2_v  = float(_cv(args.init_sigma_v2, sampler_yaml.get("init_sigma_v2"), 10.0)),
+        init_sigma2_w  = float(_cv(args.init_sigma_w2, sampler_yaml.get("init_sigma_w2"), 10.0)),
+        seed           = int(mcmc_seed),
+        proposal       = None,
+        x0_mean        = 0.0,
+        x0_var         = 5.0,
+        t0             = 0.0,
+        t0_var         = 1e-9,
+        verbose        = True,
+        print_every    = max(1, int(_cv(args.print_every, yaml_cfg.get("experiment", {}).get("print_every"), num_steps // 10))),
+    )
+
+    if sampler == "hmc":
+        resample = str(_cv(args.resample, filter_cfg.get("resample"), "always"))
+        burnin_raw = _cv(args.burnin, sampler_yaml.get("burnin"), None)
+        return dict(
+            **shared,
+            resample            = resample,
+            burnin              = None if burnin_raw is None else int(burnin_raw),
+            step_size           = float(_cv(args.hmc_step_size,      sampler_yaml.get("step_size"),          0.05)),
+            num_leapfrog_steps  = int(_cv(args.hmc_leapfrog_steps,   sampler_yaml.get("num_leapfrog_steps"), 5)),
+            target_accept_prob  = float(_cv(args.target_accept_prob, sampler_yaml.get("target_accept_prob"), 0.6)),
+            adaptation_rate     = float(_cv(args.adaptation_rate,    sampler_yaml.get("adaptation_rate"),    0.01)),
+            adaptation_steps    = _cv(args.adaptation_steps, sampler_yaml.get("adaptation_steps"), None),
+            frozen_pf_seed      = _cv(args.frozen_pf_seed,   sampler_yaml.get("frozen_pf_seed"),   None),
+        )
+    else:
+        resample = str(_cv(args.resample, filter_cfg.get("resample"), "auto"))
+        return dict(
+            **shared,
+            resample       = resample,
+            proposal_std_v = float(_cv(args.proposal_std_v, sampler_yaml.get("proposal_std_v"), 0.15)),
+            proposal_std_w = float(_cv(args.proposal_std_w, sampler_yaml.get("proposal_std_w"), 0.08)),
+        )
+
+
 def main() -> None:
     args = _parse_args()
+    yaml_cfg = load_config(args.config, [])
+    exp_cfg = yaml_cfg.get("experiment", {})
+    true_cfg = yaml_cfg.get("true_params", {})
+
+    sampler    = str(_cv(args.sampler,    exp_cfg.get("sampler"),   "hmc")).strip().lower()
+    T          = int(_cv(args.T,          exp_cfg.get("T"),         100))
+    data_seed  = int(_cv(args.data_seed,  exp_cfg.get("data_seed"), 123))
+    drop       = max(1, int(_cv(args.drop, exp_cfg.get("drop"),     10)))
+    true_sv2   = float(_cv(args.true_sigma_v2, true_cfg.get("sigma_v2"), 10.0))
+    true_sw2   = float(_cv(args.true_sigma_w2, true_cfg.get("sigma_w2"), 1.0))
+    out_dir    = Path(_cv(args.output_dir, exp_cfg.get("output_dir"), "results/exp_hmc"))
+    show       = bool(_cv(args.show,       exp_cfg.get("show"),      False))
+    tag_override = args.tag or exp_cfg.get("tag")
+
+    print(f"[config] {args.config}")
     print(f"[device] requested={args.device} active={_ACTIVE_DEVICE}")
-    tf.random.set_seed(int(args.data_seed))
-    drop = max(1, int(args.drop))
-    sampler = str(args.sampler).strip().lower()
-    if sampler == "hmc":
-        cfg = HMCConfig()
-    else:
-        cfg = PMMHConfig()
+    tf.random.set_seed(data_seed)
 
-    if args.num_steps is not None:
-        cfg.num_steps = int(args.num_steps)
-    if args.num_particles is not None:
-        cfg.num_particles = int(args.num_particles)
-    if args.inner_pf is not None:
-        cfg.inner_pf = str(args.inner_pf)
-    if args.proposal_kind is not None:
-        cfg.proposal_kind = str(args.proposal_kind)
-    if args.num_lambda is not None:
-        cfg.num_lambda = int(args.num_lambda)
-    if args.ess_threshold is not None:
-        cfg.ess_threshold = float(args.ess_threshold)
-    if args.resample is not None:
-        cfg.resample = str(args.resample)
-    if args.ot_epsilon is not None:
-        cfg.ot_epsilon = float(args.ot_epsilon)
-    if args.ot_num_iters is not None:
-        cfg.ot_num_iters = int(args.ot_num_iters)
-    if args.ot_jitter is not None:
-        cfg.ot_jitter = float(args.ot_jitter)
-    if args.prior_alpha is not None:
-        cfg.prior_alpha = float(args.prior_alpha)
-    if args.prior_beta is not None:
-        cfg.prior_beta = float(args.prior_beta)
-    if args.init_sigma_v2 is not None:
-        cfg.init_sigma2_v = float(args.init_sigma_v2)
-    if args.init_sigma_w2 is not None:
-        cfg.init_sigma2_w = float(args.init_sigma_w2)
-    if args.mcmc_seed is not None:
-        cfg.seed = int(args.mcmc_seed)
+    cfg = _build_cfg(args, yaml_cfg, sampler)
 
-    if sampler == "hmc":
-        if args.burnin is not None:
-            cfg.burnin = int(args.burnin)
-        if args.hmc_step_size is not None:
-            cfg.step_size = float(args.hmc_step_size)
-        if args.hmc_leapfrog_steps is not None:
-            cfg.num_leapfrog_steps = int(args.hmc_leapfrog_steps)
-        if args.target_accept_prob is not None:
-            cfg.target_accept_prob = float(args.target_accept_prob)
-        if args.adaptation_rate is not None:
-            cfg.adaptation_rate = float(args.adaptation_rate)
-        if args.adaptation_steps is not None:
-            cfg.adaptation_steps = int(args.adaptation_steps)
-        if args.frozen_pf_seed is not None:
-            cfg.frozen_pf_seed = int(args.frozen_pf_seed)
-    else:
-        if args.proposal_std_v is not None:
-            cfg.proposal_std_v = float(args.proposal_std_v)
-        if args.proposal_std_w is not None:
-            cfg.proposal_std_w = float(args.proposal_std_w)
-
-    if args.print_every is not None:
-        cfg.print_every = max(1, int(args.print_every))
-    else:
-        cfg.print_every = max(1, int(cfg.num_steps) // 10)
-    cfg.verbose = True
-
-    out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tag = args.tag or f"{sampler}_T{int(args.T)}_N{int(cfg.num_particles)}_S{int(cfg.num_steps)}"
+    tag = tag_override or f"{sampler}_T{T}_N{cfg['num_particles']}_S{cfg['num_steps']}"
 
     true_ssm = ADHNonlinearSSM(
-        sigma_v=math.sqrt(float(args.true_sigma_v2)),
-        sigma_w=math.sqrt(float(args.true_sigma_w2)),
-        seed=int(args.data_seed),
+        sigma_v=math.sqrt(true_sv2),
+        sigma_w=math.sqrt(true_sw2),
+        seed=data_seed,
     )
-    x_true, y_obs = true_ssm.simulate(T=int(args.T), shape=[1])
+    x_true, y_obs = true_ssm.simulate(T=T, shape=[1])
 
     if sampler == "hmc":
         result = run_hmc(y_obs, cfg)
     else:
         result = run_pmmh(y_obs, cfg)
-    inner_pf = str(result.get("inner_pf", cfg.inner_pf)).strip().lower()
+    inner_pf = str(result.get("inner_pf", cfg["inner_pf"])).strip().lower()
     if inner_pf == "standard":
         print(
-            f"[inner] standard proposal={cfg.proposal_kind} num_particles={cfg.num_particles} "
-            f"num_lambda={cfg.num_lambda} resample={cfg.resample}"
+            f"[inner] standard proposal={cfg['proposal_kind']} num_particles={cfg['num_particles']} "
+            f"num_lambda={cfg['num_lambda']} resample={cfg['resample']}"
         )
     elif inner_pf == "ot":
         print(
-            f"[inner] ot proposal={cfg.proposal_kind} num_particles={cfg.num_particles} "
-            f"num_lambda={cfg.num_lambda} resample={cfg.resample} "
-            f"ot_eps={cfg.ot_epsilon} ot_iters={cfg.ot_num_iters}"
+            f"[inner] ot proposal={cfg['proposal_kind']} num_particles={cfg['num_particles']} "
+            f"num_lambda={cfg['num_lambda']} resample={cfg['resample']} "
+            f"ot_eps={cfg['ot_epsilon']} ot_iters={cfg['ot_num_iters']}"
         )
 
     x_np = x_true.numpy()[0, :, 0]
@@ -335,14 +364,14 @@ def main() -> None:
         sigma2_chain,
         burnin=burnin,
         plot_path=plot_path,
-        show=args.show,
+        show=show,
     )
     _plot_posterior_after_burnin(
         sigma_samples=sigma_chain_post_thinned,
-        true_sigma_v=float(np.sqrt(float(args.true_sigma_v2))),
-        true_sigma_w=float(np.sqrt(float(args.true_sigma_w2))),
+        true_sigma_v=float(np.sqrt(true_sv2)),
+        true_sigma_w=float(np.sqrt(true_sw2)),
         plot_path=posterior_plot_path,
-        show=args.show,
+        show=show,
     )
 
     save_payload = {

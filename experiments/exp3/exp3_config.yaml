@@ -53,7 +53,7 @@ dpf:
   diffusion:
     diff_a: -0.001
     diff_T: 1.0
-    diff_steps: 10
+    diff_steps: 5
     diff_ode: true
     diff_eps: 1e-6
 
@@ -70,8 +70,8 @@ dpf:
     # Default keeps pretrain outputs inside the same experiment folder.
     pretrain_output_root: "{experiment_dir}/transformer_pretrain"
     # Optional overrides for auto pretraining:
-    pretrain_steps: 2000
-    pretrain_batch_size: 128
+    pretrain_steps: 1024
+    pretrain_batch_size: 1
     pretrain_lr: 5e-2
     pretrain_log_every: 100
     pretrain_loss: energy
