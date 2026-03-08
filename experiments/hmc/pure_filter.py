@@ -125,9 +125,6 @@ class PureParticleFilter:
             parent_acc = parent_acc.write(k, parent)
             return k + 1, x_t, log_w_next, logz_acc, x_acc, w_acc, parent_acc
 
-        # x_prev0.shape is [None, n, dx] — n and dx are static (known before tracing).
-        # Providing shape_invariants preserves these static dims through the loop,
-        # which allows proposals like LEDH that use dynamic broadcast internally.
         _, _, _, logz_ta, x_ta, w_ta, parent_ta = tf.while_loop(
             cond=cond,
             body=body,

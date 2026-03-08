@@ -8,6 +8,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
+from experiments.hmc.diagnostics import compute_chain_ess
 from src.ssm.ADH_NonlinearSSM import ADHNonlinearSSM
 from experiments.hmc.parameterization import (
     log_abs_det_jacobian,
@@ -102,8 +103,8 @@ def _sum_logz_from_filter(
     return tf.reduce_sum(log_z[0])
 
 
-def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
-    cfg = SimpleNamespace(**cfg)
+def _prepare_gradient_mcmc(y_obs: tf.Tensor, cfg_dict: dict) -> dict[str, Any]:
+    cfg = SimpleNamespace(**cfg_dict)
     prior = tfd.InverseGamma(
         concentration=tf.convert_to_tensor(cfg.prior_alpha, dtype=tf.float32),
         scale=tf.convert_to_tensor(cfg.prior_beta, dtype=tf.float32),
@@ -140,13 +141,111 @@ def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
         lp = _log_prior_sigma2_tf(sigma2, prior)
         return ll + lp + log_abs_det_jacobian(unconstrained)
 
+    return {
+        "cfg": cfg,
+        "prior": prior,
+        "pf": pf,
+        "inner_pf": inner_pf,
+        "y_obs": y_obs,
+        "num_steps": num_steps,
+        "burnin": burnin,
+        "adaptation_steps": adaptation_steps,
+        "init_unconstrained": init_unconstrained,
+        "frozen_pf_seed": frozen_pf_seed,
+        "frozen_pf_seed_t": frozen_pf_seed_t,
+        "target_log_prob_fn": target_log_prob_fn,
+    }
+
+
+def _finalize_gradient_mcmc(
+    ctx: dict[str, Any],
+    *,
+    log_sigma2_chain: np.ndarray,
+    accept: np.ndarray,
+    elapsed: float,
+) -> Dict[str, Any]:
+    cfg = ctx["cfg"]
+    prior = ctx["prior"]
+    pf = ctx["pf"]
+    y_obs = ctx["y_obs"]
+    burnin = int(ctx["burnin"])
+    inner_pf = ctx["inner_pf"]
+    frozen_pf_seed = int(ctx["frozen_pf_seed"])
+    frozen_pf_seed_t = ctx["frozen_pf_seed_t"]
+
+    num_results = int(log_sigma2_chain.shape[0])
+    unconstrained_t = tf.convert_to_tensor(log_sigma2_chain, dtype=tf.float32)
+    sigma2_samples = unconstrained_to_sigma2(unconstrained_t)
+    sigma2_chain = np.asarray(sigma2_samples.numpy(), dtype=np.float64)
+    log_sigma2_chain64 = np.asarray(log_sigma2_chain, dtype=np.float64)
+
+    logprior_chain = np.asarray(
+        tf.reduce_sum(prior.log_prob(tf.cast(sigma2_samples, tf.float32)), axis=-1).numpy(),
+        dtype=np.float32,
+    )
+    loglik_chain = np.zeros(num_results, dtype=np.float32)
+    logtarget_chain = np.zeros(num_results, dtype=np.float32)
+    for i in range(num_results):
+        ll_i = _sum_logz_from_filter(
+            pf=pf,
+            y_obs=y_obs,
+            resample=cfg.resample,
+            params=_params_from_sigma2(tf.cast(sigma2_samples[i], tf.float32)),
+            seed=frozen_pf_seed_t,
+        )
+        loglik_chain[i] = float(ll_i.numpy())
+        logtarget_chain[i] = float(loglik_chain[i] + logprior_chain[i] + np.sum(log_sigma2_chain64[i]))
+
+    logpost_chain = loglik_chain + logprior_chain
+    burnin = max(0, min(burnin, num_results))
+    tail = sigma2_chain[burnin:] if burnin < num_results else sigma2_chain
+    chain_diag = compute_chain_ess(sigma2_chain, burnin=burnin)
+
+    return {
+        "sigma2_chain": sigma2_chain,
+        "log_sigma2_chain": log_sigma2_chain64,
+        "accept": accept,
+        "accept_rate": float(np.mean(accept)),
+        "loglik_chain": loglik_chain,
+        "logprior_chain": logprior_chain,
+        "logpost_chain": logpost_chain,
+        "logtarget_chain": logtarget_chain,
+        "burnin": int(burnin),
+        "posterior_mean_sigma2": np.mean(tail, axis=0),
+        "posterior_std_sigma2": np.std(tail, axis=0),
+        "runtime_sec": float(elapsed),
+        "num_steps": int(num_results),
+        "inner_pf": inner_pf,
+        "proposal_kind": str(cfg.proposal_kind),
+        "num_particles": int(cfg.num_particles),
+        "num_lambda": int(cfg.num_lambda),
+        "reweight": FLOW_REWEIGHT,
+        "resample": str(cfg.resample),
+        "ot_epsilon": float(cfg.ot_epsilon),
+        "ot_num_iters": int(cfg.ot_num_iters),
+        "ot_jitter": float(cfg.ot_jitter),
+        "frozen_pf_seed": frozen_pf_seed,
+        **chain_diag,
+    }
+
+
+def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
+    ctx = _prepare_gradient_mcmc(y_obs, cfg)
+    cfg = ctx["cfg"]
+    num_steps = int(ctx["num_steps"])
+    burnin = int(ctx["burnin"])
+    adaptation_steps = int(ctx["adaptation_steps"])
+    inner_pf = ctx["inner_pf"]
+    target_log_prob_fn = ctx["target_log_prob_fn"]
+    current_state = ctx["init_unconstrained"]
+
     kernel = tfp.mcmc.SimpleStepSizeAdaptation(
         inner_kernel=tfp.mcmc.HamiltonianMonteCarlo(
             target_log_prob_fn=target_log_prob_fn,
             step_size=tf.convert_to_tensor(cfg.step_size, dtype=tf.float32),
             num_leapfrog_steps=int(cfg.num_leapfrog_steps),
         ),
-        num_adaptation_steps=int(adaptation_steps),
+        num_adaptation_steps=adaptation_steps,
         target_accept_prob=float(cfg.target_accept_prob),
         adaptation_rate=float(cfg.adaptation_rate),
     )
@@ -165,15 +264,13 @@ def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
         )
         print("[HMC] compiling single-step graph (first step may take a while)...", flush=True)
 
-    current_state = init_unconstrained
     kernel_results = kernel.bootstrap_results(current_state)
 
     log_sigma2_chain = np.empty((num_steps, 2), dtype=np.float32)
-    accept          = np.zeros(num_steps, dtype=np.int32)
+    accept = np.zeros(num_steps, dtype=np.int32)
     step_size_chain = np.empty(num_steps, dtype=np.float32)
 
     accepted_count = 0
-    completed = 0
     print_every = max(1, int(cfg.print_every))
     t_start = time.perf_counter()
 
@@ -181,12 +278,11 @@ def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
         current_state, kernel_results = _one_step(current_state, kernel_results)
         inner = kernel_results.inner_results
         is_accepted = bool(inner.is_accepted.numpy())
-        step_size   = float(kernel_results.new_step_size.numpy())
+        step_size = float(kernel_results.new_step_size.numpy())
 
         log_sigma2_chain[i] = current_state.numpy()
-        accept[i]           = int(is_accepted)
-        step_size_chain[i]  = step_size
-        completed += 1
+        accept[i] = int(is_accepted)
+        step_size_chain[i] = step_size
 
         if is_accepted:
             accepted_count += 1
@@ -194,75 +290,157 @@ def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
         if cfg.verbose:
             step_num = i + 1
             if step_num == 1 or step_num % print_every == 0 or step_num == num_steps:
+                sigma2_current = np.exp(log_sigma2_chain[i].astype(np.float64))
                 print(
                     f"[HMC] step {step_num}/{num_steps} "
                     f"accept_rate={accepted_count / step_num:.3f} "
+                    f"sigma_v2={float(sigma2_current[0]):.3f} "
+                    f"sigma_w2={float(sigma2_current[1]):.3f} "
                     f"step_size={step_size:.5f}",
                     flush=True,
                 )
-    elapsed    = time.perf_counter() - t_start
-    num_results = completed
-
-    unconstrained_t = tf.convert_to_tensor(log_sigma2_chain, dtype=tf.float32)
-    sigma2_samples  = unconstrained_to_sigma2(unconstrained_t)
-    sigma2_chain    = np.asarray(sigma2_samples.numpy(), dtype=np.float64)
-    log_sigma2_chain = log_sigma2_chain.astype(np.float64)
-
-    logprior_chain = np.asarray(
-        tf.reduce_sum(prior.log_prob(tf.cast(sigma2_samples, tf.float32)), axis=-1).numpy(),
-        dtype=np.float32,
+    elapsed = time.perf_counter() - t_start
+    result = _finalize_gradient_mcmc(
+        ctx,
+        log_sigma2_chain=log_sigma2_chain,
+        accept=accept,
+        elapsed=elapsed,
     )
-    loglik_chain   = np.zeros(num_results, dtype=np.float32)
-    logtarget_chain = np.zeros(num_results, dtype=np.float32)
-    for i in range(num_results):
-        ll_i = _sum_logz_from_filter(
-            pf=pf,
-            y_obs=y_obs,
-            resample=cfg.resample,
-            params=_params_from_sigma2(tf.cast(sigma2_samples[i], tf.float32)),
-            seed=frozen_pf_seed_t,
-        )
-        loglik_chain[i]    = float(ll_i.numpy())
-        logtarget_chain[i] = float(loglik_chain[i] + logprior_chain[i] + np.sum(log_sigma2_chain[i]))
-
-    logpost_chain = loglik_chain + logprior_chain
-
-    burnin = max(0, min(burnin, num_results))
-    tail   = sigma2_chain[burnin:] if burnin < num_results else sigma2_chain
     if cfg.verbose:
+        sigma2_chain = np.asarray(result["sigma2_chain"], dtype=np.float64)
+        burnin_used = int(result["burnin"])
+        tail = sigma2_chain[burnin_used:] if burnin_used < sigma2_chain.shape[0] else sigma2_chain
         std = np.std(tail, axis=0) if tail.size else np.zeros(2, dtype=np.float64)
         print(
-            f"[HMC] done steps={num_results} burnin={burnin} acc={float(np.mean(accept)):.3f} "
+            f"[HMC] done steps={int(result['num_steps'])} burnin={burnin_used} acc={float(np.mean(accept)):.3f} "
             f"step_size_final={step_size_chain[-1]:.5f} "
             f"std_v2={float(std[0]):.4f} std_w2={float(std[1]):.4f}",
             flush=True,
         )
 
-    return {
-        "sigma2_chain":          sigma2_chain,
-        "log_sigma2_chain":      log_sigma2_chain,
-        "accept":                accept,
-        "accept_rate":           float(np.mean(accept)),
-        "loglik_chain":          loglik_chain,
-        "logprior_chain":        logprior_chain,
-        "logpost_chain":         logpost_chain,
-        "logtarget_chain":       logtarget_chain,
-        "burnin":                int(burnin),
-        "posterior_mean_sigma2": np.mean(tail, axis=0),
-        "posterior_std_sigma2":  np.std(tail, axis=0),
-        "runtime_sec":           float(elapsed),
-        "num_steps":             int(num_results),
-        "inner_pf":              inner_pf,
-        "proposal_kind":         str(cfg.proposal_kind),
-        "num_particles":         int(cfg.num_particles),
-        "num_lambda":            int(cfg.num_lambda),
-        "reweight":              FLOW_REWEIGHT,
-        "resample":              str(cfg.resample),
-        "ot_epsilon":            float(cfg.ot_epsilon),
-        "ot_num_iters":          int(cfg.ot_num_iters),
-        "ot_jitter":             float(cfg.ot_jitter),
-        "frozen_pf_seed":        int(frozen_pf_seed),
-        "step_size_final":       float(step_size_chain[-1]),
-        "num_leapfrog_steps":    int(cfg.num_leapfrog_steps),
-        "target_accept_prob":    float(cfg.target_accept_prob),
-    }
+    result.update(
+        {
+            "step_size_final": float(step_size_chain[-1]),
+            "num_leapfrog_steps": int(cfg.num_leapfrog_steps),
+            "target_accept_prob": float(cfg.target_accept_prob),
+        }
+    )
+    return result
+
+
+def run_nuts(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
+    ctx = _prepare_gradient_mcmc(y_obs, cfg)
+    cfg = ctx["cfg"]
+    num_steps = int(ctx["num_steps"])
+    burnin = int(ctx["burnin"])
+    adaptation_steps = int(ctx["adaptation_steps"])
+    inner_pf = ctx["inner_pf"]
+    target_log_prob_fn = ctx["target_log_prob_fn"]
+    current_state = ctx["init_unconstrained"]
+
+    kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
+        inner_kernel=tfp.mcmc.NoUTurnSampler(
+            target_log_prob_fn=target_log_prob_fn,
+            step_size=tf.convert_to_tensor(cfg.step_size, dtype=tf.float32),
+            max_tree_depth=int(cfg.max_tree_depth),
+        ),
+        num_adaptation_steps=adaptation_steps,
+        target_accept_prob=float(cfg.target_accept_prob),
+        exploration_shrinkage=float(cfg.adaptation_rate),
+    )
+
+    @tf.function(reduce_retracing=True)
+    def _one_step(state, kernel_results):
+        return kernel.one_step(state, kernel_results)
+
+    if cfg.verbose:
+        T_obs = int(tf.shape(y_obs)[1]) if y_obs.shape.rank and y_obs.shape.rank >= 2 else "unknown"
+        print(
+            f"[NUTS] start steps={num_steps} burnin={burnin} max_tree_depth={int(cfg.max_tree_depth)} "
+            f"T={T_obs} num_particles={int(cfg.num_particles)} "
+            f"inner_pf={inner_pf} proposal={cfg.proposal_kind}",
+            flush=True,
+        )
+        print("[NUTS] compiling single-step graph (first step may take a while)...", flush=True)
+
+    kernel_results = kernel.bootstrap_results(current_state)
+
+    log_sigma2_chain = np.empty((num_steps, 2), dtype=np.float32)
+    accept = np.zeros(num_steps, dtype=np.int32)
+    step_size_chain = np.empty(num_steps, dtype=np.float32)
+    leapfrogs_chain = np.empty(num_steps, dtype=np.int32)
+    max_depth_hits = np.zeros(num_steps, dtype=np.int32)
+    divergences = np.zeros(num_steps, dtype=np.int32)
+
+    accepted_count = 0
+    print_every = max(1, int(cfg.print_every))
+    t_start = time.perf_counter()
+
+    for i in range(num_steps):
+        current_state, kernel_results = _one_step(current_state, kernel_results)
+        inner = kernel_results.inner_results
+        is_accepted = bool(inner.is_accepted.numpy())
+        step_size = float(kernel_results.new_step_size.numpy())
+        leapfrogs_taken = int(inner.leapfrogs_taken.numpy())
+        reach_max_depth = bool(inner.reach_max_depth.numpy())
+        has_divergence = bool(inner.has_divergence.numpy())
+
+        log_sigma2_chain[i] = current_state.numpy()
+        accept[i] = int(is_accepted)
+        step_size_chain[i] = step_size
+        leapfrogs_chain[i] = leapfrogs_taken
+        max_depth_hits[i] = int(reach_max_depth)
+        divergences[i] = int(has_divergence)
+
+        if is_accepted:
+            accepted_count += 1
+
+        if cfg.verbose:
+            step_num = i + 1
+            if step_num == 1 or step_num % print_every == 0 or step_num == num_steps:
+                sigma2_current = np.exp(log_sigma2_chain[i].astype(np.float64))
+                print(
+                    f"[NUTS] step {step_num}/{num_steps} "
+                    f"accept_rate={accepted_count / step_num:.3f} "
+                    f"sigma_v2={float(sigma2_current[0]):.3f} "
+                    f"sigma_w2={float(sigma2_current[1]):.3f} "
+                    f"step_size={step_size:.5f} "
+                    f"leapfrogs={leapfrogs_taken} "
+                    f"max_depth_hit={int(reach_max_depth)} "
+                    f"divergence={int(has_divergence)}",
+                    flush=True,
+                )
+    elapsed = time.perf_counter() - t_start
+    result = _finalize_gradient_mcmc(
+        ctx,
+        log_sigma2_chain=log_sigma2_chain,
+        accept=accept,
+        elapsed=elapsed,
+    )
+    if cfg.verbose:
+        sigma2_chain = np.asarray(result["sigma2_chain"], dtype=np.float64)
+        burnin_used = int(result["burnin"])
+        tail = sigma2_chain[burnin_used:] if burnin_used < sigma2_chain.shape[0] else sigma2_chain
+        std = np.std(tail, axis=0) if tail.size else np.zeros(2, dtype=np.float64)
+        print(
+            f"[NUTS] done steps={int(result['num_steps'])} burnin={burnin_used} acc={float(np.mean(accept)):.3f} "
+            f"step_size_final={step_size_chain[-1]:.5f} "
+            f"mean_leapfrogs={float(np.mean(leapfrogs_chain)):.2f} "
+            f"max_depth_rate={float(np.mean(max_depth_hits)):.3f} "
+            f"divergence_rate={float(np.mean(divergences)):.3f} "
+            f"std_v2={float(std[0]):.4f} std_w2={float(std[1]):.4f}",
+            flush=True,
+        )
+
+    result.update(
+        {
+            "step_size_final": float(step_size_chain[-1]),
+            "max_tree_depth": int(cfg.max_tree_depth),
+            "leapfrogs_chain": leapfrogs_chain,
+            "mean_leapfrogs": float(np.mean(leapfrogs_chain)),
+            "max_depth_hit_rate": float(np.mean(max_depth_hits)),
+            "divergence_rate": float(np.mean(divergences)),
+            "target_accept_prob": float(cfg.target_accept_prob),
+        }
+    )
+    return result

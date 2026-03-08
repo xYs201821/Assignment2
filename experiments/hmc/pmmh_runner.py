@@ -8,6 +8,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow_probability as tfp
 
+from experiments.hmc.diagnostics import compute_chain_ess
 from src.ssm.ADH_NonlinearSSM import ADHNonlinearSSM
 from experiments.hmc.parameterization import (
     log_abs_det_jacobian,
@@ -238,6 +239,7 @@ def run_pmmh(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
     burnin = num_steps // 2
     sigma2_chain64 = sigma2_chain.astype(np.float64)
     tail = sigma2_chain64[burnin:] if burnin < sigma2_chain64.shape[0] else sigma2_chain64
+    chain_diag = compute_chain_ess(sigma2_chain64, burnin=burnin)
 
     return {
         "sigma2_chain": sigma2_chain64,
@@ -263,4 +265,5 @@ def run_pmmh(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
         "ot_epsilon": float(cfg.ot_epsilon),
         "ot_num_iters": int(cfg.ot_num_iters),
         "ot_jitter": float(cfg.ot_jitter),
+        **chain_diag,
     }

@@ -58,7 +58,7 @@ def _configure_tf_device(device: str) -> str:
 _ACTIVE_DEVICE = _configure_tf_device(_PRESELECTED_DEVICE)
 
 from experiments.common.exp_utils import load_config
-from experiments.hmc.hmc_runner import run_hmc
+from experiments.hmc.hmc_runner import run_hmc, run_nuts
 from experiments.hmc.pmmh_runner import run_pmmh
 from src.ssm.ADH_NonlinearSSM import ADHNonlinearSSM
 
@@ -67,7 +67,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("exp_hmc_config.yaml")
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="PMMH/HMC posterior inference for ADH nonlinear SSM."
+        description="PMMH/HMC/NUTS posterior inference for ADH nonlinear SSM."
     )
     parser.add_argument(
         "--config",
@@ -75,7 +75,7 @@ def _parse_args() -> argparse.Namespace:
         default=DEFAULT_CONFIG_PATH,
         help=f"Path to YAML config (default: {DEFAULT_CONFIG_PATH})",
     )
-    parser.add_argument("--sampler", type=str, choices=["hmc", "pmmh"], default=None)
+    parser.add_argument("--sampler", type=str, choices=["hmc", "nuts", "pmmh"], default=None)
     parser.add_argument("--T", type=int, default=None)
     parser.add_argument("--data-seed", type=int, default=None)
     parser.add_argument("--mcmc-seed", type=int, default=None)
@@ -112,8 +112,10 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="PMMH proposal SD interpreted on sigma_w^2 scale; internally mapped to log-space.",
     )
-    parser.add_argument("--hmc-step-size", type=float, default=None)
-    parser.add_argument("--hmc-leapfrog-steps", type=int, default=None)
+    parser.add_argument("--hmc-step-size", dest="hmc_step_size", type=float, default=None)
+    parser.add_argument("--hmc-leapfrog-steps", dest="hmc_leapfrog_steps", type=int, default=None)
+    parser.add_argument("--nuts-step-size", dest="nuts_step_size", type=float, default=None)
+    parser.add_argument("--nuts-max-tree-depth", dest="nuts_max_tree_depth", type=int, default=None)
     parser.add_argument("--target-accept-prob", type=float, default=None)
     parser.add_argument("--adaptation-rate", type=float, default=None)
     parser.add_argument("--adaptation-steps", type=int, default=None)
@@ -238,7 +240,6 @@ def _cv(cli_val, yaml_val, fallback):
         return yaml_val
     return fallback
 
-
 def _build_cfg(args, yaml_cfg: dict, sampler: str) -> dict:
     """Build the runner config dict from yaml + CLI overrides."""
     filter_cfg = yaml_cfg.get("filter", {})
@@ -280,8 +281,22 @@ def _build_cfg(args, yaml_cfg: dict, sampler: str) -> dict:
             **shared,
             resample            = resample,
             burnin              = None if burnin_raw is None else int(burnin_raw),
-            step_size           = float(_cv(args.hmc_step_size,      sampler_yaml.get("step_size"),          0.05)),
-            num_leapfrog_steps  = int(_cv(args.hmc_leapfrog_steps,   sampler_yaml.get("num_leapfrog_steps"), 5)),
+            step_size           = float(_cv(args.hmc_step_size, sampler_yaml.get("step_size"), 0.05)),
+            num_leapfrog_steps  = int(_cv(args.hmc_leapfrog_steps, sampler_yaml.get("num_leapfrog_steps"), 5)),
+            target_accept_prob  = float(_cv(args.target_accept_prob, sampler_yaml.get("target_accept_prob"), 0.6)),
+            adaptation_rate     = float(_cv(args.adaptation_rate,    sampler_yaml.get("adaptation_rate"),    0.01)),
+            adaptation_steps    = _cv(args.adaptation_steps, sampler_yaml.get("adaptation_steps"), None),
+            frozen_pf_seed      = _cv(args.frozen_pf_seed,   sampler_yaml.get("frozen_pf_seed"),   None),
+        )
+    elif sampler == "nuts":
+        resample = str(_cv(args.resample, filter_cfg.get("resample"), "always"))
+        burnin_raw = _cv(args.burnin, sampler_yaml.get("burnin"), None)
+        return dict(
+            **shared,
+            resample            = resample,
+            burnin              = None if burnin_raw is None else int(burnin_raw),
+            step_size           = float(_cv(args.nuts_step_size, sampler_yaml.get("step_size"), 0.05)),
+            max_tree_depth      = int(_cv(args.nuts_max_tree_depth, sampler_yaml.get("max_tree_depth"), 10)),
             target_accept_prob  = float(_cv(args.target_accept_prob, sampler_yaml.get("target_accept_prob"), 0.6)),
             adaptation_rate     = float(_cv(args.adaptation_rate,    sampler_yaml.get("adaptation_rate"),    0.01)),
             adaptation_steps    = _cv(args.adaptation_steps, sampler_yaml.get("adaptation_steps"), None),
@@ -303,7 +318,7 @@ def main() -> None:
     exp_cfg = yaml_cfg.get("experiment", {})
     true_cfg = yaml_cfg.get("true_params", {})
 
-    sampler    = str(_cv(args.sampler,    exp_cfg.get("sampler"),   "hmc")).strip().lower()
+    sampler = str(_cv(args.sampler, exp_cfg.get("sampler"), "hmc")).strip().lower()
     T          = int(_cv(args.T,          exp_cfg.get("T"),         100))
     data_seed  = int(_cv(args.data_seed,  exp_cfg.get("data_seed"), 123))
     drop       = max(1, int(_cv(args.drop, exp_cfg.get("drop"),     10)))
@@ -331,6 +346,8 @@ def main() -> None:
 
     if sampler == "hmc":
         result = run_hmc(y_obs, cfg)
+    elif sampler == "nuts":
+        result = run_nuts(y_obs, cfg)
     else:
         result = run_pmmh(y_obs, cfg)
     inner_pf = str(result.get("inner_pf", cfg["inner_pf"])).strip().lower()
@@ -392,6 +409,25 @@ def main() -> None:
         save_payload["log_sigma2_chain"] = np.asarray(result["log_sigma2_chain"])
     if "logtarget_chain" in result:
         save_payload["logtarget_chain"] = np.asarray(result["logtarget_chain"])
+    if "leapfrogs_chain" in result:
+        save_payload["leapfrogs_chain"] = np.asarray(result["leapfrogs_chain"])
+    if "step_size_final" in result:
+        save_payload["step_size_final"] = np.float64(result["step_size_final"])
+    if "num_leapfrog_steps" in result:
+        save_payload["num_leapfrog_steps"] = np.int32(result["num_leapfrog_steps"])
+    if "max_tree_depth" in result:
+        save_payload["max_tree_depth"] = np.int32(result["max_tree_depth"])
+    if "mean_leapfrogs" in result:
+        save_payload["mean_leapfrogs"] = np.float64(result["mean_leapfrogs"])
+    if "max_depth_hit_rate" in result:
+        save_payload["max_depth_hit_rate"] = np.float64(result["max_depth_hit_rate"])
+    if "divergence_rate" in result:
+        save_payload["divergence_rate"] = np.float64(result["divergence_rate"])
+    if "chain_ess" in result:
+        save_payload["chain_ess_sigma2"] = np.asarray(result["chain_ess"], dtype=np.float64)
+        save_payload["chain_ess_min_sigma2"] = np.float64(result["chain_ess_min"])
+        save_payload["chain_ess_num_samples"] = np.int32(result["chain_ess_num_samples"])
+        save_payload["chain_ess_burnin_used"] = np.int32(result["chain_ess_burnin_used"])
     np.savez(data_path, **save_payload)
 
     mean_v2, mean_w2 = np.mean(sigma2_chain_post_thinned, axis=0)
@@ -403,6 +439,17 @@ def main() -> None:
     print(f"[done] plot saved:   {posterior_plot_path}")
     print(f"[post] burnin={burnin} drop={drop} kept={sigma_chain_post_thinned.shape[0]}")
     print(f"[{sampler.upper()}] accept_rate={result['accept_rate']:.3f} runtime_sec={result['runtime_sec']:.2f}")
+    if "chain_ess" in result:
+        chain_ess = np.asarray(result["chain_ess"], dtype=np.float64)
+        ess_labels = ("sigma_v2", "sigma_w2")
+        ess_text = " ".join(
+            f"{label}={value:.2f}" for label, value in zip(ess_labels, chain_ess, strict=False)
+        )
+        print(
+            f"[post] chain_ess(sigma^2) {ess_text} "
+            f"min={float(result['chain_ess_min']):.2f} "
+            f"draws={int(result['chain_ess_num_samples'])}"
+        )
     print(f"[post] sigma_v2 mean={mean_v2:.4f} std={std_v2:.4f}")
     print(f"[post] sigma_w2 mean={mean_w2:.4f} std={std_w2:.4f}")
     print(f"[post] sigma_v  mean={mean_v:.4f} std={std_v:.4f}")
