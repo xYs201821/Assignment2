@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 import numpy as np
 import tensorflow as tf
@@ -21,6 +21,7 @@ from experiments.hmc.pure_proposals import build_pure_proposal
 
 tfd = tfp.distributions
 FLOW_REWEIGHT = "always"
+ProgressCallback = Callable[[int, Dict[str, float], str | None], None]
 
 
 def _log_prior_sigma2_tf(sigma2: tf.Tensor, prior: tfd.Distribution) -> tf.Tensor:
@@ -52,6 +53,16 @@ def _params_from_sigma2(sigma2: tf.Tensor) -> dict[str, tf.Tensor]:
 
 def _params_from_unconstrained(unconstrained: tf.Tensor) -> dict[str, tf.Tensor]:
     return _params_from_sigma2(unconstrained_to_sigma2(unconstrained))
+
+
+def _emit_progress(
+    progress_callback: ProgressCallback | None,
+    step: int,
+    metrics: Dict[str, float],
+    message: str | None = None,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(step, metrics, message)
 
 
 def _build_dpf_proposal(cfg: Any):
@@ -229,7 +240,12 @@ def _finalize_gradient_mcmc(
     }
 
 
-def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
+def run_hmc(
+    y_obs: tf.Tensor,
+    cfg: dict,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> Dict[str, Any]:
     ctx = _prepare_gradient_mcmc(y_obs, cfg)
     cfg = ctx["cfg"]
     num_steps = int(ctx["num_steps"])
@@ -279,6 +295,7 @@ def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
         inner = kernel_results.inner_results
         is_accepted = bool(inner.is_accepted.numpy())
         step_size = float(kernel_results.new_step_size.numpy())
+        sigma2_current = np.exp(current_state.numpy().astype(np.float64))
 
         log_sigma2_chain[i] = current_state.numpy()
         accept[i] = int(is_accepted)
@@ -289,16 +306,41 @@ def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
 
         if cfg.verbose:
             step_num = i + 1
+            message = None
             if step_num == 1 or step_num % print_every == 0 or step_num == num_steps:
-                sigma2_current = np.exp(log_sigma2_chain[i].astype(np.float64))
-                print(
+                message = (
                     f"[HMC] step {step_num}/{num_steps} "
                     f"accept_rate={accepted_count / step_num:.3f} "
                     f"sigma_v2={float(sigma2_current[0]):.3f} "
                     f"sigma_w2={float(sigma2_current[1]):.3f} "
-                    f"step_size={step_size:.5f}",
-                    flush=True,
+                    f"step_size={step_size:.5f}"
                 )
+                print(message, flush=True)
+            _emit_progress(
+                progress_callback,
+                step_num,
+                {
+                    "accept_rate": float(accepted_count / step_num),
+                    "accepted": float(int(is_accepted)),
+                    "sigma_v2": float(sigma2_current[0]),
+                    "sigma_w2": float(sigma2_current[1]),
+                    "step_size": float(step_size),
+                },
+                message,
+            )
+        else:
+            step_num = i + 1
+            _emit_progress(
+                progress_callback,
+                step_num,
+                {
+                    "accept_rate": float(accepted_count / step_num),
+                    "accepted": float(int(is_accepted)),
+                    "sigma_v2": float(sigma2_current[0]),
+                    "sigma_w2": float(sigma2_current[1]),
+                    "step_size": float(step_size),
+                },
+            )
     elapsed = time.perf_counter() - t_start
     result = _finalize_gradient_mcmc(
         ctx,
@@ -328,7 +370,12 @@ def run_hmc(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
     return result
 
 
-def run_nuts(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
+def run_nuts(
+    y_obs: tf.Tensor,
+    cfg: dict,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> Dict[str, Any]:
     ctx = _prepare_gradient_mcmc(y_obs, cfg)
     cfg = ctx["cfg"]
     num_steps = int(ctx["num_steps"])
@@ -384,6 +431,7 @@ def run_nuts(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
         leapfrogs_taken = int(inner.leapfrogs_taken.numpy())
         reach_max_depth = bool(inner.reach_max_depth.numpy())
         has_divergence = bool(inner.has_divergence.numpy())
+        sigma2_current = np.exp(current_state.numpy().astype(np.float64))
 
         log_sigma2_chain[i] = current_state.numpy()
         accept[i] = int(is_accepted)
@@ -397,9 +445,9 @@ def run_nuts(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
 
         if cfg.verbose:
             step_num = i + 1
+            message = None
             if step_num == 1 or step_num % print_every == 0 or step_num == num_steps:
-                sigma2_current = np.exp(log_sigma2_chain[i].astype(np.float64))
-                print(
+                message = (
                     f"[NUTS] step {step_num}/{num_steps} "
                     f"accept_rate={accepted_count / step_num:.3f} "
                     f"sigma_v2={float(sigma2_current[0]):.3f} "
@@ -407,9 +455,40 @@ def run_nuts(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
                     f"step_size={step_size:.5f} "
                     f"leapfrogs={leapfrogs_taken} "
                     f"max_depth_hit={int(reach_max_depth)} "
-                    f"divergence={int(has_divergence)}",
-                    flush=True,
+                    f"divergence={int(has_divergence)}"
                 )
+                print(message, flush=True)
+            _emit_progress(
+                progress_callback,
+                step_num,
+                {
+                    "accept_rate": float(accepted_count / step_num),
+                    "accepted": float(int(is_accepted)),
+                    "sigma_v2": float(sigma2_current[0]),
+                    "sigma_w2": float(sigma2_current[1]),
+                    "step_size": float(step_size),
+                    "leapfrogs": float(leapfrogs_taken),
+                    "max_depth_hit": float(int(reach_max_depth)),
+                    "divergence": float(int(has_divergence)),
+                },
+                message,
+            )
+        else:
+            step_num = i + 1
+            _emit_progress(
+                progress_callback,
+                step_num,
+                {
+                    "accept_rate": float(accepted_count / step_num),
+                    "accepted": float(int(is_accepted)),
+                    "sigma_v2": float(sigma2_current[0]),
+                    "sigma_w2": float(sigma2_current[1]),
+                    "step_size": float(step_size),
+                    "leapfrogs": float(leapfrogs_taken),
+                    "max_depth_hit": float(int(reach_max_depth)),
+                    "divergence": float(int(has_divergence)),
+                },
+            )
     elapsed = time.perf_counter() - t_start
     result = _finalize_gradient_mcmc(
         ctx,

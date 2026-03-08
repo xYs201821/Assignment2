@@ -45,17 +45,18 @@ class PureBootstrapProposal:
         *,
         params: dict[str, tf.Tensor],
         seed: tf.Tensor | int,
+        time_index: tf.Tensor | int | None = None,
         y_prev: tf.Tensor | None = None,
         log_w_prev: tf.Tensor | None = None,
     ) -> tuple[tf.Tensor, tf.Tensor]:
         del y_t, log_w_prev
-        dist = ssm.transition_dist(x_prev, y_prev=y_prev, params=params)
+        dist = ssm.transition_dist(x_prev, y_prev=y_prev, params=params, time_index=time_index)
         x = tf.cast(dist.sample(seed=_to_seed(seed)), tf.float32)
         log_q = tf.cast(dist.log_prob(x), tf.float32)
         return x, log_q
 
 
-def _edh_flow_solution(lam, h, p, r, y_tilde, m0, jitter=1e-5):
+def _edh_flow_solution(lam, h, p, r, y_tilde, m0, jitter=1e-3):
     hph = quadratic_matmul(h, p, h)
     lam_b = lam[..., tf.newaxis, tf.newaxis]
     s = lam_b * hph + r
@@ -71,7 +72,7 @@ def _edh_flow_solution(lam, h, p, r, y_tilde, m0, jitter=1e-5):
     return a, b + am0
 
 
-def _ledh_flow_solution(lam, h, p, r, y_tilde, m0, jitter=1e-5):
+def _ledh_flow_solution(lam, h, p, r, y_tilde, m0, jitter=1e-3):
     hph = quadratic_matmul(h, p, h)
     lam_b = lam[..., tf.newaxis, tf.newaxis]
     s = lam_b * hph + r
@@ -100,11 +101,12 @@ class PureEDHProposal:
         *,
         params: dict[str, tf.Tensor],
         seed: tf.Tensor | int,
+        time_index: tf.Tensor | int | None = None,
         y_prev: tf.Tensor | None = None,
         log_w_prev: tf.Tensor | None = None,
     ) -> tuple[tf.Tensor, tf.Tensor]:
         seeds = tf.random.experimental.stateless_split(_to_seed(seed), 2)
-        trans_dist = ssm.transition_dist(x_prev, y_prev=y_prev, params=params)
+        trans_dist = ssm.transition_dist(x_prev, y_prev=y_prev, params=params, time_index=time_index)
         mu = tf.cast(trans_dist.sample(seed=seeds[0]), tf.float32)
         log_q0 = tf.cast(trans_dist.log_prob(mu), tf.float32)
         if log_w_prev is None:
@@ -163,11 +165,12 @@ class PureLEDHProposal:
         *,
         params: dict[str, tf.Tensor],
         seed: tf.Tensor | int,
+        time_index: tf.Tensor | int | None = None,
         y_prev: tf.Tensor | None = None,
         log_w_prev: tf.Tensor | None = None,
     ) -> tuple[tf.Tensor, tf.Tensor]:
         seeds = tf.random.experimental.stateless_split(_to_seed(seed), 2)
-        trans_dist = ssm.transition_dist(x_prev, y_prev=y_prev, params=params)
+        trans_dist = ssm.transition_dist(x_prev, y_prev=y_prev, params=params, time_index=time_index)
         mu = tf.cast(trans_dist.sample(seed=seeds[0]), tf.float32)
         log_q0 = tf.cast(trans_dist.log_prob(mu), tf.float32)
         if log_w_prev is None:
@@ -223,4 +226,3 @@ def build_pure_proposal(kind: str, num_lambda: int) -> object:
     if k == "edh":
         return PureEDHProposal(num_lambda=int(num_lambda))
     raise ValueError("proposal_kind must be one of {'bootstrap', 'ledh', 'edh'}")
-

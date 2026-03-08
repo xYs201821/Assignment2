@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from types import SimpleNamespace
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 import numpy as np
 import tensorflow as tf
@@ -22,6 +22,7 @@ from experiments.hmc.pure_proposals import build_pure_proposal
 
 tfd = tfp.distributions
 FLOW_REWEIGHT = "always"
+ProgressCallback = Callable[[int, Dict[str, float], str | None], None]
 
 
 def _log_prior_sigma2_tf(sigma2: tf.Tensor, prior: tfd.Distribution) -> tf.Tensor:
@@ -141,7 +142,22 @@ def _log_rw_density(target: tf.Tensor, loc: tf.Tensor, scale: tf.Tensor) -> tf.T
     return tf.reduce_sum(tfd.Normal(loc=loc, scale=scale).log_prob(target))
 
 
-def run_pmmh(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
+def _emit_progress(
+    progress_callback: ProgressCallback | None,
+    step: int,
+    metrics: Dict[str, float],
+    message: str | None = None,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(step, metrics, message)
+
+
+def run_pmmh(
+    y_obs: tf.Tensor,
+    cfg: dict,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> Dict[str, Any]:
     cfg = SimpleNamespace(**cfg)
     rng = tf.random.Generator.from_seed(int(cfg.seed))
     prior = tfd.InverseGamma(
@@ -221,19 +237,34 @@ def run_pmmh(y_obs: tf.Tensor, cfg: dict) -> Dict[str, Any]:
         logprior_chain[i] = float(lp.numpy())
         logpost_chain[i] = float(lpost.numpy())
         logtarget_chain[i] = float(ltarget.numpy())
+        step_num = i + 1
+        acc_rate = float(np.mean(accept[:step_num]))
+        metrics = {
+            "accept_rate": acc_rate,
+            "accepted": float(int(accepted)),
+            "sigma_v2": float(sigma2[0].numpy()),
+            "sigma_w2": float(sigma2[1].numpy()),
+            "loglik": float(loglik_chain[i]),
+            "logpost": float(logpost_chain[i]),
+        }
 
-        if cfg.verbose and ((i + 1) % max(1, int(cfg.print_every)) == 0):
-            window_end = i + 1
+        if cfg.verbose and (step_num % max(1, int(cfg.print_every)) == 0):
+            window_end = step_num
             win = sigma2_chain[last_report_end:window_end]
             se_v2 = _window_se(win[:, 0])
             se_w2 = _window_se(win[:, 1])
-            acc_rate = float(np.mean(accept[:window_end]))
-            print(
+            metrics["se_v2"] = se_v2
+            metrics["se_w2"] = se_w2
+            message = (
                 f"[PMMH] step={window_end}/{num_steps} acc={acc_rate:.3f} "
                 f"sigma_v2={float(sigma2[0].numpy()):.3f} sigma_w2={float(sigma2[1].numpy()):.3f} "
                 f"se_v2={se_v2:.3f} se_w2={se_w2:.3f}"
             )
+            print(message)
             last_report_end = window_end
+            _emit_progress(progress_callback, step_num, metrics, message)
+        else:
+            _emit_progress(progress_callback, step_num, metrics)
 
     elapsed = time.perf_counter() - t_start
     burnin = num_steps // 2

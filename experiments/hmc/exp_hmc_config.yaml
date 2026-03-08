@@ -10,11 +10,15 @@ experiment:
   # Random seed for MCMC chain (null → use data_seed).
   mcmc_seed: 42
   # Thinning: keep one sample every `drop` steps after burn-in.
-  drop: 10
+  drop: 1
   # Print progress every N steps. null → num_steps // 10.
   print_every: 10
   # Optional tag for output file names. null → auto-generated from sampler + settings.
   tag: null
+  # Write TensorBoard event logs under output_dir/tensorboard.
+  tensorboard: true
+  # Optional TensorBoard log root. null → <output_dir>/tensorboard
+  tensorboard_dir: null
   # Show plots interactively after saving.
   show: false
 
@@ -25,9 +29,9 @@ true_params:
 
 hmc:
   # Total number of HMC MCMC steps.
-  num_steps: 10000
+  num_steps: 2000
   # Burn-in length; null → num_steps // 2.
-  burnin: 5000
+  burnin: 1000
   # Initial leapfrog step size.
   step_size: 0.05
   # Number of leapfrog steps per proposal.
@@ -57,7 +61,7 @@ nuts:
   # Target Metropolis acceptance probability for dual-averaging adaptation.
   target_accept_prob: 0.6
   # Dual-averaging exploration shrinkage.
-  adaptation_rate: 0.01
+  adaptation_rate: 0.05
   # Number of adaptation steps; null → burnin.
   adaptation_steps: null
   # Seed for the frozen PF used inside NUTS (null → no freezing).
@@ -87,8 +91,8 @@ prior:
   beta: 0.01
 
 filter:
-  # Inner PF engine: "standard" or "ot".
-  inner_pf: standard
+  # Inner PF engine: "standard" or "ot" or "soft".
+  inner_pf: soft
   # Proposal distribution inside inner PF: "bootstrap", "ledh", or "edh".
   proposal_kind: bootstrap
   # Number of particles in inner PF.
@@ -98,7 +102,7 @@ filter:
   # Resampling mode: "never", "auto", or "always".
   resample: auto
   # Flow discretization steps for LEDH/EDH proposals.
-  num_lambda: 20
+  num_lambda: 5
   # Soft resampling mixture weight λ ∈ (0,1] 
   soft_lam: 0.95
   # OT resampling regularization (only used when inner_pf = "ot").

@@ -8,6 +8,7 @@ from experiments.hmc.pure_resamplers import (
     OTResampler,
     SoftResampler,
     StandardResampler,
+    normalize_log_weights,
     split_seed,
     to_stateless_seed,
 )
@@ -30,10 +31,7 @@ class PureParticleFilter:
 
     @staticmethod
     def _log_normalize(log_w: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        logz = tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
-        log_w_n = log_w - logz
-        w = tf.exp(log_w_n)
-        return log_w_n, w, tf.squeeze(logz, axis=-1)
+        return normalize_log_weights(log_w)
 
     @staticmethod
     def _ess(w: tf.Tensor) -> tf.Tensor:
@@ -89,6 +87,7 @@ class PureParticleFilter:
                 y_t,
                 params=params,
                 seed=seeds[k + 1],
+                time_index=k,
                 y_prev=y_prev,
                 log_w_prev=log_w_prev,
             )
@@ -101,7 +100,7 @@ class PureParticleFilter:
                 tf.float32,
             )
             logf = tf.cast(
-                self.ssm.transition_dist(x_prev, y_prev=y_prev, params=params).log_prob(x_pred),
+                self.ssm.transition_dist(x_prev, y_prev=y_prev, params=params, time_index=k).log_prob(x_pred),
                 tf.float32,
             )
             log_w = log_w_prev + loglik + (logf - log_q)

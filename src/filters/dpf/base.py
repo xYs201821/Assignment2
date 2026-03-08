@@ -72,7 +72,7 @@ class DPFBase(ParticleFilter):
             return out[0], out[1]
         return out, None
 
-    def _sample_proposal(self, x_prev, y_t, y_prev=None, log_w_prev=None):
+    def _sample_proposal(self, x_prev, y_t, y_prev=None, log_w_prev=None, time_index=None):
         seed = self.ssm._tfp_seed()
         proposal = self.proposal
         if callable(proposal):
@@ -84,6 +84,7 @@ class DPFBase(ParticleFilter):
                     seed=seed,
                     y_prev=y_prev,
                     log_w_prev=log_w_prev,
+                    time_index=time_index,
                 )
             except TypeError:
                 out = proposal(self.ssm, x_prev, y_t, seed=seed)
@@ -96,9 +97,13 @@ class DPFBase(ParticleFilter):
                     seed=seed,
                     y_prev=y_prev,
                     log_w_prev=log_w_prev,
+                    time_index=time_index,
                 )
             else:
-                out = proposal.sample(self.ssm, x_prev, y_t, seed=seed)
+                try:
+                    out = proposal.sample(self.ssm, x_prev, y_t, seed=seed, time_index=time_index)
+                except TypeError:
+                    out = proposal.sample(self.ssm, x_prev, y_t, seed=seed)
         else:
             raise TypeError("proposal must be callable or expose .sample(...).")
 
@@ -115,9 +120,13 @@ class DPFBase(ParticleFilter):
                         y_t,
                         y_prev=y_prev,
                         log_w_prev=log_w_prev,
+                        time_index=time_index,
                     )
                 else:
-                    log_q = proposal.log_prob(self.ssm, x_pred, x_prev, y_t)
+                    try:
+                        log_q = proposal.log_prob(self.ssm, x_pred, x_prev, y_t, time_index=time_index)
+                    except TypeError:
+                        log_q = proposal.log_prob(self.ssm, x_pred, x_prev, y_t)
             except (NotImplementedError, AttributeError):
                 # Some SSMs may not expose transition_dist/log_prob; in that case
                 # keep bootstrap semantics (no proposal correction).
@@ -163,7 +172,12 @@ class DPFBase(ParticleFilter):
         )
         return y_loc, cov_eff
 
-    def _linearized_transition_cov(self, x_prev: tf.Tensor, cov_q: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor]:
+    def _linearized_transition_cov(
+        self,
+        x_prev: tf.Tensor,
+        cov_q: tf.Tensor,
+        time_index=None,
+    ) -> tuple[tf.Tensor, tf.Tensor]:
         if not callable(getattr(self.ssm, "f_with_noise", None)):
             raise NotImplementedError("f_with_noise is required for linearized transition fallback.")
 
@@ -175,11 +189,11 @@ class DPFBase(ParticleFilter):
 
         ssm_jac = getattr(self.ssm, "jacobian_f_q", None)
         if callable(ssm_jac):
-            F_q_flat, x_loc_flat = ssm_jac(x_flat, q0)
+            F_q_flat, x_loc_flat = ssm_jac(x_flat, q0, time_index=time_index)
         else:
             with tf.GradientTape() as tape:
                 tape.watch(q0)
-                x_loc_flat = self.ssm.f_with_noise(x_flat, q0)
+                x_loc_flat = self.ssm.f_with_noise(x_flat, q0, time_index=time_index)
             F_q_flat = tape.batch_jacobian(x_loc_flat, q0)
 
         F_q_flat = tf.convert_to_tensor(F_q_flat, dtype=_dc.DTYPE)
@@ -237,10 +251,11 @@ class DPFBase(ParticleFilter):
         x_prev: tf.Tensor,
         x_pred: tf.Tensor,
         y_prev: tf.Tensor | None = None,
+        time_index=None,
     ) -> tf.Tensor:
         # Preferred path: exact transition density.
         try:
-            trans_dist = self.ssm.transition_dist(x_prev, y_prev=y_prev)
+            trans_dist = self.ssm.transition_dist(x_prev, y_prev=y_prev, time_index=time_index)
             if trans_dist is not None:
                 return tf.cast(trans_dist.log_prob(x_pred), _dc.DTYPE)
         except (NotImplementedError, AttributeError):
@@ -257,9 +272,9 @@ class DPFBase(ParticleFilter):
                 "transition_dist is unavailable and fallback requires ssm.cov_eps_x."
             )
 
-        x_loc = tf.cast(self.ssm.f(x_prev), _dc.DTYPE)
+        x_loc = tf.cast(self.ssm.f(x_prev, time_index=time_index), _dc.DTYPE)
         try:
-            x_loc_lin, cov_eff = self._linearized_transition_cov(x_prev, cov_q)
+            x_loc_lin, cov_eff = self._linearized_transition_cov(x_prev, cov_q, time_index=time_index)
             x_loc = x_loc_lin
         except Exception:  # noqa: BLE001
             cov_eff = tf.convert_to_tensor(cov_q, dtype=_dc.DTYPE)
@@ -288,6 +303,7 @@ class DPFBase(ParticleFilter):
         )
 
     def step(self, x_prev, log_w_prev, y_t, resample="auto", y_prev=None,
+             time_index=None,
              training: bool | None = None):
         """One DPF step: propagate, weight, normalize, and optional resample.
 
@@ -310,6 +326,7 @@ class DPFBase(ParticleFilter):
             y_t,
             y_prev=y_prev,
             log_w_prev=log_w_prev,
+            time_index=time_index,
         )
 
         loglik = self._observation_log_prob(x_pred, y_t)
@@ -324,6 +341,7 @@ class DPFBase(ParticleFilter):
                 x_prev,
                 x_pred,
                 y_prev=y_prev,
+                time_index=time_index,
             )
             log_w = log_w + tf.cast(log_f - log_q, _dc.DTYPE)
         log_w_norm, w_pre, logz_t = self._log_normalize(log_w)
@@ -455,6 +473,7 @@ class DPFBase(ParticleFilter):
                 y_t,
                 resample=resample,
                 y_prev=y_prev,
+                time_index=t,
                 training=training,
             )
             if bool(getattr(self, "stop_grad_through_time", False)):

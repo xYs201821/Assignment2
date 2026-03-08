@@ -5,6 +5,19 @@ from dataclasses import dataclass
 import tensorflow as tf
 
 
+def sanitize_log_tensor(values: tf.Tensor) -> tf.Tensor:
+    values = tf.convert_to_tensor(values)
+    neg_large = tf.cast(-1e30, values.dtype)
+    return tf.where(tf.math.is_finite(values), values, neg_large * tf.ones_like(values))
+
+
+def normalize_log_weights(log_w: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
+    log_w = sanitize_log_tensor(log_w)
+    logz = tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
+    log_w_n = log_w - logz
+    return log_w_n, tf.exp(log_w_n), tf.squeeze(logz, axis=-1)
+
+
 def to_stateless_seed(seed: tf.Tensor | int) -> tf.Tensor:
     seed_t = tf.convert_to_tensor(seed, dtype=tf.int32)
     if seed_t.shape.rank == 0:
@@ -76,7 +89,7 @@ def sinkhorn_log_plan(
 @dataclass
 class StandardResampler:
     def resample(self, x: tf.Tensor, log_w: tf.Tensor, seed: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        w = tf.exp(log_w)
+        log_w, w, _ = normalize_log_weights(log_w)
         idx = systematic_resample_indices(w, seed)
         x_new = gather_particles(x, idx)
         n_particles = tf.shape(log_w)[-1]
@@ -93,7 +106,7 @@ class SoftResampler:
     lam: float = 0.95  # mixing coefficient; 1.0 → pure categorical, 0 → pure uniform
 
     def resample(self, x: tf.Tensor, log_w: tf.Tensor, seed: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        log_w = log_w - tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
+        log_w, _, _ = normalize_log_weights(log_w)
         lam = tf.cast(self.lam, log_w.dtype)
         n = tf.shape(log_w)[-1]
         log_uniform = -tf.math.log(tf.cast(n, log_w.dtype))
@@ -107,11 +120,14 @@ class SoftResampler:
             ),
             axis=0,
         )
+        # TF 2.19's stateless categorical can emit the out-of-range sentinel
+        # `num_classes` when a row of logits is entirely non-finite.
+        log_q = sanitize_log_tensor(log_q)
 
         idx = tf.random.stateless_categorical(log_q, num_samples=n, seed=to_stateless_seed(seed), dtype=tf.int32)
         x_new = gather_particles(x, idx)
         log_w_new = tf.gather(log_w, idx, batch_dims=1) - tf.gather(log_q, idx, batch_dims=1)
-        log_w_new = log_w_new - tf.reduce_logsumexp(log_w_new, axis=-1, keepdims=True)
+        log_w_new, _, _ = normalize_log_weights(log_w_new)
         return x_new, log_w_new, idx
 
 
@@ -123,12 +139,12 @@ class OTResampler:
 
     def resample(self, x: tf.Tensor, log_w: tf.Tensor, seed: tf.Tensor | None = None) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         del seed
-        log_w = log_w - tf.reduce_logsumexp(log_w, axis=-1, keepdims=True)
+        log_w, _, _ = normalize_log_weights(log_w)
         n_particles = tf.shape(x)[-2]
         log_uniform = -tf.math.log(tf.cast(n_particles, x.dtype))
         log_b = tf.fill(tf.shape(log_w), log_uniform)
         cost = pairwise_distance(x)
-        log_plan = sinkhorn_log_plan(log_w, log_b, cost, epsilon=self.epsilon, num_iters=self.num_iters)
+        log_plan = sinkhorn_log_plan(log_b, log_w, cost, epsilon=self.epsilon, num_iters=self.num_iters)
         plan = tf.exp(log_plan)
         col_mass = tf.reduce_sum(plan, axis=-2)
         weighted_sum = tf.einsum("bij,bid->bjd", plan, x)
@@ -136,4 +152,3 @@ class OTResampler:
         log_w_new = tf.fill(tf.shape(log_w), log_uniform)
         parent = tf.argmax(plan, axis=-2, output_type=tf.int32)
         return x_new, log_w_new, parent
-

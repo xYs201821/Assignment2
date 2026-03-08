@@ -31,11 +31,13 @@ class BootstrapProposal(Proposal):
     def dist(self, ssm, x_prev, y_t, **kwargs):
         del y_t
         y_prev = kwargs.get("y_prev")
-        return ssm.transition_dist(x_prev, y_prev=y_prev)
+        time_index = kwargs.get("time_index")
+        return ssm.transition_dist(x_prev, y_prev=y_prev, time_index=time_index)
 
     def sample(self, ssm, x_prev, y_t, seed=None, **kwargs):
         y_prev = kwargs.get("y_prev")
-        x = ssm.sample_transition(x_prev, seed=seed, y_prev=y_prev)
+        time_index = kwargs.get("time_index")
+        x = ssm.sample_transition(x_prev, seed=seed, y_prev=y_prev, time_index=time_index)
         return x, self.log_prob(ssm, x, x_prev, y_t, **kwargs)
 
 

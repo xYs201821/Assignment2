@@ -31,7 +31,7 @@ class BootstrapParticleFilter(ParticleFilter):
             y = tf.zeros([batch_size, T, self.ssm.obs_dim], dtype=tf.float32)
         _ = self.filter(y, resample=resample)
 
-    def step(self, x_prev, log_w_prev, y_t, resample="auto"):
+    def step(self, x_prev, log_w_prev, y_t, resample="auto", time_index=None):
         """Bootstrap PF step: propagate, weight, and resample.
 
         Shapes:
@@ -47,7 +47,7 @@ class BootstrapParticleFilter(ParticleFilter):
           log_w_pre: [B, N]
           logz_t: [B]
         """
-        x_pred = self.ssm.sample_transition(x_prev, seed=self.ssm._tfp_seed())
+        x_pred = self.ssm.sample_transition(x_prev, seed=self.ssm._tfp_seed(), time_index=time_index)
         loglik = self.ssm.observation_dist(x_pred).log_prob(y_t[..., tf.newaxis, :])
         log_w = log_w_prev + tf.cast(loglik, tf.float32)
 
@@ -158,6 +158,7 @@ class BootstrapParticleFilter(ParticleFilter):
                 log_w,
                 y_t,
                 resample=resample,
+                time_index=t,
             )
             x_prev = x
 
