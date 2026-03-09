@@ -7,7 +7,6 @@ import sys
 from typing import List
 import tensorflow as tf
 
-tf.config.set_visible_devices([], "GPU")
 _EXPERIMENTS = {
     "exp1": "experiments.exp1.exp1_linear_gaussian",
     "exp2a": "experiments.exp2a.exp2a_stochastic_vol",

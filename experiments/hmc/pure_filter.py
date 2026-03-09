@@ -27,7 +27,7 @@ class PureParticleFilter:
         self.proposal = proposal
         self.resampler = resampler
         self.cfg = cfg
-        self._resampler_needs_seed = isinstance(resampler, (StandardResampler, SoftResampler))
+        self._resampler_needs_seed = isinstance(resampler, (StandardResampler, SoftResampler, OTResampler))
 
     @staticmethod
     def _log_normalize(log_w: tf.Tensor) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:

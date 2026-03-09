@@ -63,9 +63,12 @@ def gather_particles(x: tf.Tensor, idx: tf.Tensor) -> tf.Tensor:
     return tf.reshape(out_flat, shape)
 
 
-def pairwise_distance(x: tf.Tensor) -> tf.Tensor:
+def pairwise_distance(x: tf.Tensor, y: tf.Tensor | None = None) -> tf.Tensor:
+    x = tf.convert_to_tensor(x)
+    y = x if y is None else tf.convert_to_tensor(y, dtype=x.dtype)
     x_sq = tf.reduce_sum(tf.square(x), axis=-1, keepdims=True)
-    dist = x_sq - 2.0 * tf.matmul(x, x, transpose_b=True) + tf.transpose(x_sq, perm=[0, 2, 1])
+    y_sq = tf.reduce_sum(tf.square(y), axis=-1)[:, tf.newaxis, :]
+    dist = x_sq - 2.0 * tf.matmul(x, y, transpose_b=True) + y_sq
     return tf.maximum(dist, tf.zeros_like(dist))
 
 
@@ -167,12 +170,16 @@ class OTResampler:
 
     def resample(self, x: tf.Tensor, log_w: tf.Tensor, seed: tf.Tensor | None = None) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
         log_w, w, _ = normalize_log_weights(log_w)
+        seed = tf.constant([0, 1], dtype=tf.int32) if seed is None else to_stateless_seed(seed)
         n_particles = tf.shape(x)[-2]
         uniform_mass = tf.math.reciprocal(tf.cast(n_particles, x.dtype))
         log_uniform = tf.math.log(uniform_mass)
         log_b = tf.fill(tf.shape(log_w), log_uniform)
         b = tf.fill(tf.shape(log_w), uniform_mass)
-        cost = pairwise_distance(x)
+        target_idx = systematic_resample_indices(w, seed)
+        x_target = gather_particles(x, target_idx)
+        x_target = tf.stop_gradient(x_target)
+        cost = pairwise_distance(x, x_target)
         # log_plan = sinkhorn_log_plan(log_w, log_b, cost, epsilon=self.epsilon, num_iters=self.num_iters)
         # plan = tf.exp(log_plan)
         plan = sinkhorn_matrix_scaling(w, b, cost, epsilon=self.epsilon, num_iters=self.num_iters)
