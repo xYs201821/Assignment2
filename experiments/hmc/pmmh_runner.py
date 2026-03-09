@@ -189,6 +189,8 @@ def run_pmmh(
     pf_calls = 0
     t_start = time.perf_counter()
     last_report_end = 0
+    window_accepted_count = 0
+    window_step_count = 0
 
     init_seed = rng.uniform([], minval=1, maxval=2**31 - 1, dtype=tf.int32)
     ltarget, ll, lp, sigma2 = _log_target_from_unconstrained(
@@ -231,6 +233,8 @@ def run_pmmh(
             ltarget = ltarget_prop
             accept[i] = 1
 
+        window_accepted_count += int(accepted)
+        window_step_count += 1
         sigma2_chain[i] = sigma2.numpy()
         log_sigma2_chain[i] = unconstrained.numpy()
         loglik_chain[i] = float(ll.numpy())
@@ -238,9 +242,11 @@ def run_pmmh(
         logpost_chain[i] = float(lpost.numpy())
         logtarget_chain[i] = float(ltarget.numpy())
         step_num = i + 1
-        acc_rate = float(np.mean(accept[:step_num]))
+        window_acc_rate = float(window_accepted_count / max(window_step_count, 1))
+        overall_acc_rate = float(np.mean(accept[:step_num]))
         metrics = {
-            "accept_rate": acc_rate,
+            "accept_rate": window_acc_rate,
+            "overall_accept_rate": overall_acc_rate,
             "accepted": float(int(accepted)),
             "sigma_v2": float(sigma2[0].numpy()),
             "sigma_w2": float(sigma2[1].numpy()),
@@ -256,12 +262,14 @@ def run_pmmh(
             metrics["se_v2"] = se_v2
             metrics["se_w2"] = se_w2
             message = (
-                f"[PMMH] step={window_end}/{num_steps} acc={acc_rate:.3f} "
+                f"[PMMH] step={window_end}/{num_steps} acc={window_acc_rate:.3f} "
                 f"sigma_v2={float(sigma2[0].numpy()):.3f} sigma_w2={float(sigma2[1].numpy()):.3f} "
                 f"se_v2={se_v2:.3f} se_w2={se_w2:.3f}"
             )
             print(message)
             last_report_end = window_end
+            window_accepted_count = 0
+            window_step_count = 0
             _emit_progress(progress_callback, step_num, metrics, message)
         else:
             _emit_progress(progress_callback, step_num, metrics)

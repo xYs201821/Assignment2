@@ -227,7 +227,7 @@ class PureLEDHProposal:
             mu_next = mu + step[..., tf.newaxis] * (ax + b)
             mu = tf.where(bad[..., tf.newaxis], mu, mu_next)
 
-        log_q = log_q0 - tf.stop_gradient(_broadcast_logdet(logdet, log_q0))
+        log_q = log_q0 - _broadcast_logdet(logdet, log_q0)
         return mu, tf.cast(log_q, tf.float32)
 
 

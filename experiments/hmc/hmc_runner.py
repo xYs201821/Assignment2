@@ -140,17 +140,12 @@ def _prepare_gradient_mcmc(y_obs: tf.Tensor, cfg_dict: dict) -> dict[str, Any]:
     adaptation_steps = max(0, min(adaptation_steps, num_steps))
 
     frozen_pf_seed = int(cfg.seed) + 12345 if cfg.frozen_pf_seed is None else int(cfg.frozen_pf_seed)
-    pf_aux_seed_var = tf.Variable(
-        initial_value=tf.convert_to_tensor(_pf_seed_pair(frozen_pf_seed, 0), dtype=tf.int32),
-        trainable=False,
-        dtype=tf.int32,
-        shape=tf.TensorShape([2]),
-        name="pf_aux_seed",
-    )
+    default_pf_seed = tf.convert_to_tensor(_pf_seed_pair(frozen_pf_seed, 0), dtype=tf.int32)
 
     @tf.function(reduce_retracing=True)
-    def target_log_prob_fn(unconstrained: tf.Tensor) -> tf.Tensor:
+    def target_log_prob_with_seed(unconstrained: tf.Tensor, pf_seed: tf.Tensor) -> tf.Tensor:
         unconstrained = tf.convert_to_tensor(unconstrained, dtype=tf.float32)
+        pf_seed = tf.convert_to_tensor(pf_seed, dtype=tf.int32)
         sigma2 = unconstrained_to_sigma2(unconstrained)
         params = _params_from_unconstrained(unconstrained)
         ll = _sum_logz_from_filter(
@@ -158,10 +153,14 @@ def _prepare_gradient_mcmc(y_obs: tf.Tensor, cfg_dict: dict) -> dict[str, Any]:
             y_obs=y_obs,
             resample=cfg.resample,
             params=params,
-            seed=pf_aux_seed_var.read_value(),
+            seed=pf_seed,
         )
         lp = _log_prior_sigma2_tf(sigma2, prior)
         return ll + lp + log_abs_det_jacobian(unconstrained)
+
+    @tf.function(reduce_retracing=True)
+    def target_log_prob_fn(unconstrained: tf.Tensor) -> tf.Tensor:
+        return target_log_prob_with_seed(unconstrained, default_pf_seed)
 
     return {
         "cfg": cfg,
@@ -174,8 +173,8 @@ def _prepare_gradient_mcmc(y_obs: tf.Tensor, cfg_dict: dict) -> dict[str, Any]:
         "adaptation_steps": adaptation_steps,
         "init_unconstrained": init_unconstrained,
         "pf_seed_base": frozen_pf_seed,
-        "pf_aux_seed_var": pf_aux_seed_var,
         "target_log_prob_fn": target_log_prob_fn,
+        "target_log_prob_with_seed": target_log_prob_with_seed,
     }
 
 
@@ -270,25 +269,50 @@ def run_hmc(
     burnin = int(ctx["burnin"])
     adaptation_steps = int(ctx["adaptation_steps"])
     inner_pf = ctx["inner_pf"]
-    target_log_prob_fn = ctx["target_log_prob_fn"]
+    target_log_prob_with_seed = ctx["target_log_prob_with_seed"]
     pf_seed_base = int(ctx["pf_seed_base"])
-    pf_aux_seed_var = ctx["pf_aux_seed_var"]
     current_state = ctx["init_unconstrained"]
 
-    kernel = tfp.mcmc.SimpleStepSizeAdaptation(
-        inner_kernel=tfp.mcmc.HamiltonianMonteCarlo(
-            target_log_prob_fn=target_log_prob_fn,
-            step_size=tf.convert_to_tensor(cfg.step_size, dtype=tf.float32),
-            num_leapfrog_steps=int(cfg.num_leapfrog_steps),
-        ),
-        num_adaptation_steps=adaptation_steps,
-        target_accept_prob=float(cfg.target_accept_prob),
-        adaptation_rate=float(cfg.adaptation_rate),
-    )
+    @tf.function(reduce_retracing=True)
+    def _bootstrap_results(state, step_size, pf_seed):
+        def _target_log_prob_fn(unconstrained):
+            return target_log_prob_with_seed(unconstrained, pf_seed)
+
+        kernel = tfp.mcmc.SimpleStepSizeAdaptation(
+            inner_kernel=tfp.mcmc.HamiltonianMonteCarlo(
+                target_log_prob_fn=_target_log_prob_fn,
+                step_size=step_size,
+                num_leapfrog_steps=int(cfg.num_leapfrog_steps),
+            ),
+            num_adaptation_steps=adaptation_steps,
+            target_accept_prob=float(cfg.target_accept_prob),
+            adaptation_rate=float(cfg.adaptation_rate),
+        )
+        return kernel.bootstrap_results(state)
 
     @tf.function(reduce_retracing=True)
-    def _one_step(state, kernel_results):
-        return kernel.one_step(state, kernel_results)
+    def _one_step(state, kernel_results, pf_seed):
+        def _target_log_prob_fn(unconstrained):
+            return target_log_prob_with_seed(unconstrained, pf_seed)
+
+        kernel = tfp.mcmc.SimpleStepSizeAdaptation(
+            inner_kernel=tfp.mcmc.HamiltonianMonteCarlo(
+                target_log_prob_fn=_target_log_prob_fn,
+                step_size=kernel_results.new_step_size,
+                num_leapfrog_steps=int(cfg.num_leapfrog_steps),
+            ),
+            num_adaptation_steps=adaptation_steps,
+            target_accept_prob=float(cfg.target_accept_prob),
+            adaptation_rate=float(cfg.adaptation_rate),
+        )
+        fresh_results = kernel.bootstrap_results(state)
+        refreshed_results = fresh_results._replace(
+            target_accept_prob=kernel_results.target_accept_prob,
+            adaptation_rate=kernel_results.adaptation_rate,
+            step=kernel_results.step,
+            new_step_size=kernel_results.new_step_size,
+        )
+        return kernel.one_step(state, refreshed_results)
 
     if cfg.verbose:
         T_obs = int(tf.shape(y_obs)[1]) if y_obs.shape.rank and y_obs.shape.rank >= 2 else "unknown"
@@ -300,7 +324,12 @@ def run_hmc(
         )
         print("[HMC] compiling single-step graph (first step may take a while)...", flush=True)
 
-    kernel_results = kernel.bootstrap_results(current_state)
+    init_pf_seed = tf.convert_to_tensor(_pf_seed_pair(pf_seed_base, 1), dtype=tf.int32)
+    kernel_results = _bootstrap_results(
+        current_state,
+        tf.convert_to_tensor(cfg.step_size, dtype=tf.float32),
+        init_pf_seed,
+    )
 
     log_sigma2_chain = np.empty((num_steps, 2), dtype=np.float32)
     accept = np.zeros(num_steps, dtype=np.int32)
@@ -314,9 +343,12 @@ def run_hmc(
 
     for i in range(num_steps):
         pf_seed_i = _pf_seed_pair(pf_seed_base, i + 1)
-        pf_aux_seed_var.assign(pf_seed_i)
         pf_seed_trace[i] = pf_seed_i
-        current_state, kernel_results = _one_step(current_state, kernel_results)
+        current_state, kernel_results = _one_step(
+            current_state,
+            kernel_results,
+            tf.convert_to_tensor(pf_seed_i, dtype=tf.int32),
+        )
         inner = kernel_results.inner_results
         is_accepted = bool(inner.is_accepted.numpy())
         step_size = float(kernel_results.new_step_size.numpy())
@@ -413,25 +445,56 @@ def run_nuts(
     burnin = int(ctx["burnin"])
     adaptation_steps = int(ctx["adaptation_steps"])
     inner_pf = ctx["inner_pf"]
-    target_log_prob_fn = ctx["target_log_prob_fn"]
+    target_log_prob_with_seed = ctx["target_log_prob_with_seed"]
     pf_seed_base = int(ctx["pf_seed_base"])
-    pf_aux_seed_var = ctx["pf_aux_seed_var"]
     current_state = ctx["init_unconstrained"]
 
-    kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
-        inner_kernel=tfp.mcmc.NoUTurnSampler(
-            target_log_prob_fn=target_log_prob_fn,
-            step_size=tf.convert_to_tensor(cfg.step_size, dtype=tf.float32),
-            max_tree_depth=int(cfg.max_tree_depth),
-        ),
-        num_adaptation_steps=adaptation_steps,
-        target_accept_prob=float(cfg.target_accept_prob),
-        exploration_shrinkage=float(cfg.adaptation_rate),
-    )
+    @tf.function(reduce_retracing=True)
+    def _bootstrap_results(state, step_size, pf_seed):
+        def _target_log_prob_fn(unconstrained):
+            return target_log_prob_with_seed(unconstrained, pf_seed)
+
+        kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
+            inner_kernel=tfp.mcmc.NoUTurnSampler(
+                target_log_prob_fn=_target_log_prob_fn,
+                step_size=step_size,
+                max_tree_depth=int(cfg.max_tree_depth),
+            ),
+            num_adaptation_steps=adaptation_steps,
+            target_accept_prob=float(cfg.target_accept_prob),
+            exploration_shrinkage=float(cfg.adaptation_rate),
+        )
+        return kernel.bootstrap_results(state)
 
     @tf.function(reduce_retracing=True)
-    def _one_step(state, kernel_results):
-        return kernel.one_step(state, kernel_results)
+    def _one_step(state, kernel_results, pf_seed):
+        def _target_log_prob_fn(unconstrained):
+            return target_log_prob_with_seed(unconstrained, pf_seed)
+
+        kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
+            inner_kernel=tfp.mcmc.NoUTurnSampler(
+                target_log_prob_fn=_target_log_prob_fn,
+                step_size=kernel_results.new_step_size,
+                max_tree_depth=int(cfg.max_tree_depth),
+            ),
+            num_adaptation_steps=adaptation_steps,
+            target_accept_prob=float(cfg.target_accept_prob),
+            exploration_shrinkage=float(cfg.adaptation_rate),
+        )
+        fresh_results = kernel.bootstrap_results(state)
+        refreshed_results = fresh_results._replace(
+            target_accept_prob=kernel_results.target_accept_prob,
+            log_shrinkage_target=kernel_results.log_shrinkage_target,
+            exploration_shrinkage=kernel_results.exploration_shrinkage,
+            step_count_smoothing=kernel_results.step_count_smoothing,
+            decay_rate=kernel_results.decay_rate,
+            error_sum=kernel_results.error_sum,
+            log_averaging_step=kernel_results.log_averaging_step,
+            step=kernel_results.step,
+            num_adaptation_steps=kernel_results.num_adaptation_steps,
+            new_step_size=kernel_results.new_step_size,
+        )
+        return kernel.one_step(state, refreshed_results)
 
     if cfg.verbose:
         T_obs = int(tf.shape(y_obs)[1]) if y_obs.shape.rank and y_obs.shape.rank >= 2 else "unknown"
@@ -443,7 +506,12 @@ def run_nuts(
         )
         print("[NUTS] compiling single-step graph (first step may take a while)...", flush=True)
 
-    kernel_results = kernel.bootstrap_results(current_state)
+    init_pf_seed = tf.convert_to_tensor(_pf_seed_pair(pf_seed_base, 1), dtype=tf.int32)
+    kernel_results = _bootstrap_results(
+        current_state,
+        tf.convert_to_tensor(cfg.step_size, dtype=tf.float32),
+        init_pf_seed,
+    )
 
     log_sigma2_chain = np.empty((num_steps, 2), dtype=np.float32)
     accept = np.zeros(num_steps, dtype=np.int32)
@@ -460,9 +528,12 @@ def run_nuts(
 
     for i in range(num_steps):
         pf_seed_i = _pf_seed_pair(pf_seed_base, i + 1)
-        pf_aux_seed_var.assign(pf_seed_i)
         pf_seed_trace[i] = pf_seed_i
-        current_state, kernel_results = _one_step(current_state, kernel_results)
+        current_state, kernel_results = _one_step(
+            current_state,
+            kernel_results,
+            tf.convert_to_tensor(pf_seed_i, dtype=tf.int32),
+        )
         inner = kernel_results.inner_results
         is_accepted = bool(inner.is_accepted.numpy())
         step_size = float(kernel_results.new_step_size.numpy())

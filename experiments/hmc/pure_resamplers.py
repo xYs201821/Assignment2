@@ -76,6 +76,9 @@ def sinkhorn_log_plan(
     epsilon: float,
     num_iters: int,
 ) -> tf.Tensor:
+    if int(num_iters) <= 0:
+        raise ValueError("num_iters must be a positive integer.")
+
     eps = tf.cast(epsilon, cost.dtype)
     log_k = -cost / eps
     f = tf.zeros_like(log_a)
@@ -84,6 +87,31 @@ def sinkhorn_log_plan(
         f = log_a - tf.reduce_logsumexp(log_k + g[:, tf.newaxis, :], axis=-1)
         g = log_b - tf.reduce_logsumexp(log_k + f[:, :, tf.newaxis], axis=-2)
     return f[:, :, tf.newaxis] + log_k + g[:, tf.newaxis, :]
+
+
+def sinkhorn_matrix_scaling(
+    a: tf.Tensor,
+    b: tf.Tensor,
+    cost: tf.Tensor,
+    epsilon: float,
+    num_iters: int,
+) -> tf.Tensor:
+    eps = tf.cast(epsilon, cost.dtype)
+    k = tf.exp(-cost / eps)
+    tiny = tf.cast(1e-16, cost.dtype)
+    k = tf.maximum(k, tiny)
+
+    u = tf.ones_like(a)
+    v = tf.ones_like(b)
+    for _ in range(int(num_iters)):
+        kv = tf.einsum("bij,bj->bi", k, v)
+        u = tf.math.divide_no_nan(a, tf.maximum(kv, tiny))
+        ktu = tf.einsum("bij,bi->bj", k, u)
+        v = tf.math.divide_no_nan(b, tf.maximum(ktu, tiny))
+
+    plan = u[:, :, tf.newaxis] * k * v[:, tf.newaxis, :]
+    plan = tf.maximum(plan, tiny)
+    return plan
 
 
 @dataclass
@@ -138,14 +166,17 @@ class OTResampler:
     jitter: float = 1e-8
 
     def resample(self, x: tf.Tensor, log_w: tf.Tensor, seed: tf.Tensor | None = None) -> tuple[tf.Tensor, tf.Tensor, tf.Tensor]:
-        del seed
-        log_w, _, _ = normalize_log_weights(log_w)
+        log_w, w, _ = normalize_log_weights(log_w)
         n_particles = tf.shape(x)[-2]
-        log_uniform = -tf.math.log(tf.cast(n_particles, x.dtype))
+        uniform_mass = tf.math.reciprocal(tf.cast(n_particles, x.dtype))
+        log_uniform = tf.math.log(uniform_mass)
         log_b = tf.fill(tf.shape(log_w), log_uniform)
+        b = tf.fill(tf.shape(log_w), uniform_mass)
         cost = pairwise_distance(x)
-        log_plan = sinkhorn_log_plan(log_b, log_w, cost, epsilon=self.epsilon, num_iters=self.num_iters)
-        plan = tf.exp(log_plan)
+        # log_plan = sinkhorn_log_plan(log_w, log_b, cost, epsilon=self.epsilon, num_iters=self.num_iters)
+        # plan = tf.exp(log_plan)
+        plan = sinkhorn_matrix_scaling(w, b, cost, epsilon=self.epsilon, num_iters=self.num_iters)
+       
         col_mass = tf.reduce_sum(plan, axis=-2)
         weighted_sum = tf.einsum("bij,bid->bjd", plan, x)
         x_new = weighted_sum / tf.maximum(col_mass[..., tf.newaxis], tf.cast(self.jitter, x.dtype))
