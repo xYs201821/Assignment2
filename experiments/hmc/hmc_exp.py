@@ -630,6 +630,8 @@ def main() -> None:
                         save_payload["max_depth_hit_rate"] = np.float64(result["max_depth_hit_rate"])
                     if "divergence_rate" in result:
                         save_payload["divergence_rate"] = np.float64(result["divergence_rate"])
+                    if "pf_seed_trace" in result:
+                        save_payload["pf_seed_trace"] = np.asarray(result["pf_seed_trace"], dtype=np.int32)
                     if "chain_ess" in result:
                         save_payload["chain_ess_sigma2"] = np.asarray(result["chain_ess"], dtype=np.float64)
                         save_payload["chain_ess_min_sigma2"] = np.float64(result["chain_ess_min"])

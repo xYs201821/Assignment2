@@ -42,7 +42,7 @@ hmc:
   adaptation_rate: 0.01
   # Number of adaptation steps; null → burnin.
   adaptation_steps: null
-  # Seed for the frozen PF used inside HMC (null → no freezing).
+  # Base seed for per-transition PF auxiliaries inside HMC.
   frozen_pf_seed: 42
   # Initial sigma_v^2 for chain start.
   init_sigma_v2: 10.0
@@ -55,7 +55,7 @@ nuts:
   # Burn-in length; null → num_steps // 2.
   burnin: 5000
   # Initial NUTS step size.
-  step_size: 0.05
+  step_size: 1.0
   # Maximum binary tree depth for NUTS trajectory expansion.
   max_tree_depth: 6
   # Target Metropolis acceptance probability for dual-averaging adaptation.
@@ -64,7 +64,7 @@ nuts:
   adaptation_rate: 0.05
   # Number of adaptation steps; null → burnin.
   adaptation_steps: null
-  # Seed for the frozen PF used inside NUTS (null → no freezing).
+  # Base seed for per-transition PF auxiliaries inside NUTS.
   frozen_pf_seed: 42
   # Initial sigma_v^2 for chain start.
   init_sigma_v2: 10.0
@@ -73,7 +73,7 @@ nuts:
 
 pmmh:
   # Total number of PMMH MCMC steps.
-  num_steps: 20000
+  num_steps: 10000
   burnin: 5000
   # Random-walk proposal SD on sigma_v^2 scale (mapped to log-space internally).
   proposal_std_v: 0.15
@@ -92,9 +92,9 @@ prior:
 
 filter:
   # Inner PF engine: "standard" or "ot" or "soft".
-  inner_pf: soft
+  inner_pf: standard
   # Proposal distribution inside inner PF: "bootstrap", "ledh", or "edh".
-  proposal_kind: bootstrap
+  proposal_kind: ledh
   # Number of particles in inner PF.
   num_particles: 1000
   # ESS threshold for resampling trigger.
@@ -102,12 +102,12 @@ filter:
   # Resampling mode: "never", "auto", or "always".
   resample: auto
   # Flow discretization steps for LEDH/EDH proposals.
-  num_lambda: 5
+  num_lambda: 10
   # Soft resampling mixture weight λ ∈ (0,1] 
-  soft_lam: 0.95
+  soft_lam: 0.99
   # OT resampling regularization (only used when inner_pf = "ot").
-  ot_epsilon: 0.1
+  ot_epsilon: 10.0
   # OT Sinkhorn iterations.
-  ot_num_iters: 10
+  ot_num_iters: 25
   # OT jitter for numerical stability.
   ot_jitter: 1.0e-6

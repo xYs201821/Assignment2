@@ -114,6 +114,11 @@ def _sum_logz_from_filter(
     return tf.reduce_sum(log_z[0])
 
 
+def _pf_seed_pair(base_seed: int, index: int) -> np.ndarray:
+    seed0 = np.int32(base_seed + 2 * int(index))
+    return np.asarray([seed0, np.int32(seed0 + 1)], dtype=np.int32)
+
+
 def _prepare_gradient_mcmc(y_obs: tf.Tensor, cfg_dict: dict) -> dict[str, Any]:
     cfg = SimpleNamespace(**cfg_dict)
     prior = tfd.InverseGamma(
@@ -135,7 +140,13 @@ def _prepare_gradient_mcmc(y_obs: tf.Tensor, cfg_dict: dict) -> dict[str, Any]:
     adaptation_steps = max(0, min(adaptation_steps, num_steps))
 
     frozen_pf_seed = int(cfg.seed) + 12345 if cfg.frozen_pf_seed is None else int(cfg.frozen_pf_seed)
-    frozen_pf_seed_t = tf.convert_to_tensor(frozen_pf_seed, dtype=tf.int32)
+    pf_aux_seed_var = tf.Variable(
+        initial_value=tf.convert_to_tensor(_pf_seed_pair(frozen_pf_seed, 0), dtype=tf.int32),
+        trainable=False,
+        dtype=tf.int32,
+        shape=tf.TensorShape([2]),
+        name="pf_aux_seed",
+    )
 
     @tf.function(reduce_retracing=True)
     def target_log_prob_fn(unconstrained: tf.Tensor) -> tf.Tensor:
@@ -147,7 +158,7 @@ def _prepare_gradient_mcmc(y_obs: tf.Tensor, cfg_dict: dict) -> dict[str, Any]:
             y_obs=y_obs,
             resample=cfg.resample,
             params=params,
-            seed=frozen_pf_seed_t,
+            seed=pf_aux_seed_var.read_value(),
         )
         lp = _log_prior_sigma2_tf(sigma2, prior)
         return ll + lp + log_abs_det_jacobian(unconstrained)
@@ -162,8 +173,8 @@ def _prepare_gradient_mcmc(y_obs: tf.Tensor, cfg_dict: dict) -> dict[str, Any]:
         "burnin": burnin,
         "adaptation_steps": adaptation_steps,
         "init_unconstrained": init_unconstrained,
-        "frozen_pf_seed": frozen_pf_seed,
-        "frozen_pf_seed_t": frozen_pf_seed_t,
+        "pf_seed_base": frozen_pf_seed,
+        "pf_aux_seed_var": pf_aux_seed_var,
         "target_log_prob_fn": target_log_prob_fn,
     }
 
@@ -174,6 +185,7 @@ def _finalize_gradient_mcmc(
     log_sigma2_chain: np.ndarray,
     accept: np.ndarray,
     elapsed: float,
+    pf_seed_trace: np.ndarray | None = None,
 ) -> Dict[str, Any]:
     cfg = ctx["cfg"]
     prior = ctx["prior"]
@@ -181,10 +193,15 @@ def _finalize_gradient_mcmc(
     y_obs = ctx["y_obs"]
     burnin = int(ctx["burnin"])
     inner_pf = ctx["inner_pf"]
-    frozen_pf_seed = int(ctx["frozen_pf_seed"])
-    frozen_pf_seed_t = ctx["frozen_pf_seed_t"]
+    pf_seed_base = int(ctx["pf_seed_base"])
 
     num_results = int(log_sigma2_chain.shape[0])
+    if pf_seed_trace is None:
+        pf_seed_trace = np.broadcast_to(_pf_seed_pair(pf_seed_base, 0), (num_results, 2)).copy()
+    else:
+        pf_seed_trace = np.asarray(pf_seed_trace, dtype=np.int32)
+        if pf_seed_trace.shape != (num_results, 2):
+            raise ValueError("pf_seed_trace must have shape [num_results, 2].")
     unconstrained_t = tf.convert_to_tensor(log_sigma2_chain, dtype=tf.float32)
     sigma2_samples = unconstrained_to_sigma2(unconstrained_t)
     sigma2_chain = np.asarray(sigma2_samples.numpy(), dtype=np.float64)
@@ -202,7 +219,7 @@ def _finalize_gradient_mcmc(
             y_obs=y_obs,
             resample=cfg.resample,
             params=_params_from_sigma2(tf.cast(sigma2_samples[i], tf.float32)),
-            seed=frozen_pf_seed_t,
+            seed=tf.convert_to_tensor(pf_seed_trace[i], dtype=tf.int32),
         )
         loglik_chain[i] = float(ll_i.numpy())
         logtarget_chain[i] = float(loglik_chain[i] + logprior_chain[i] + np.sum(log_sigma2_chain64[i]))
@@ -235,7 +252,8 @@ def _finalize_gradient_mcmc(
         "ot_epsilon": float(cfg.ot_epsilon),
         "ot_num_iters": int(cfg.ot_num_iters),
         "ot_jitter": float(cfg.ot_jitter),
-        "frozen_pf_seed": frozen_pf_seed,
+        "frozen_pf_seed": pf_seed_base,
+        "pf_seed_trace": pf_seed_trace,
         **chain_diag,
     }
 
@@ -253,6 +271,8 @@ def run_hmc(
     adaptation_steps = int(ctx["adaptation_steps"])
     inner_pf = ctx["inner_pf"]
     target_log_prob_fn = ctx["target_log_prob_fn"]
+    pf_seed_base = int(ctx["pf_seed_base"])
+    pf_aux_seed_var = ctx["pf_aux_seed_var"]
     current_state = ctx["init_unconstrained"]
 
     kernel = tfp.mcmc.SimpleStepSizeAdaptation(
@@ -285,12 +305,17 @@ def run_hmc(
     log_sigma2_chain = np.empty((num_steps, 2), dtype=np.float32)
     accept = np.zeros(num_steps, dtype=np.int32)
     step_size_chain = np.empty(num_steps, dtype=np.float32)
+    pf_seed_trace = np.empty((num_steps, 2), dtype=np.int32)
 
-    accepted_count = 0
+    window_accepted_count = 0
+    window_step_count = 0
     print_every = max(1, int(cfg.print_every))
     t_start = time.perf_counter()
 
     for i in range(num_steps):
+        pf_seed_i = _pf_seed_pair(pf_seed_base, i + 1)
+        pf_aux_seed_var.assign(pf_seed_i)
+        pf_seed_trace[i] = pf_seed_i
         current_state, kernel_results = _one_step(current_state, kernel_results)
         inner = kernel_results.inner_results
         is_accepted = bool(inner.is_accepted.numpy())
@@ -302,25 +327,28 @@ def run_hmc(
         step_size_chain[i] = step_size
 
         if is_accepted:
-            accepted_count += 1
+            window_accepted_count += 1
+        window_step_count += 1
 
+        step_num = i + 1
+        should_report = step_num == 1 or step_num % print_every == 0 or step_num == num_steps
+        message = None
+        window_accept_rate = float(window_accepted_count / max(window_step_count, 1))
+        if cfg.verbose and should_report:
+            message = (
+                f"[HMC] step {step_num}/{num_steps} "
+                f"accept_rate={window_accept_rate:.3f} "
+                f"sigma_v2={float(sigma2_current[0]):.3f} "
+                f"sigma_w2={float(sigma2_current[1]):.3f} "
+                f"step_size={step_size:.5f}"
+            )
+            print(message, flush=True)
         if cfg.verbose:
-            step_num = i + 1
-            message = None
-            if step_num == 1 or step_num % print_every == 0 or step_num == num_steps:
-                message = (
-                    f"[HMC] step {step_num}/{num_steps} "
-                    f"accept_rate={accepted_count / step_num:.3f} "
-                    f"sigma_v2={float(sigma2_current[0]):.3f} "
-                    f"sigma_w2={float(sigma2_current[1]):.3f} "
-                    f"step_size={step_size:.5f}"
-                )
-                print(message, flush=True)
             _emit_progress(
                 progress_callback,
                 step_num,
                 {
-                    "accept_rate": float(accepted_count / step_num),
+                    "accept_rate": window_accept_rate,
                     "accepted": float(int(is_accepted)),
                     "sigma_v2": float(sigma2_current[0]),
                     "sigma_w2": float(sigma2_current[1]),
@@ -329,24 +357,27 @@ def run_hmc(
                 message,
             )
         else:
-            step_num = i + 1
             _emit_progress(
                 progress_callback,
                 step_num,
                 {
-                    "accept_rate": float(accepted_count / step_num),
+                    "accept_rate": window_accept_rate,
                     "accepted": float(int(is_accepted)),
                     "sigma_v2": float(sigma2_current[0]),
                     "sigma_w2": float(sigma2_current[1]),
                     "step_size": float(step_size),
                 },
             )
+        if should_report:
+            window_accepted_count = 0
+            window_step_count = 0
     elapsed = time.perf_counter() - t_start
     result = _finalize_gradient_mcmc(
         ctx,
         log_sigma2_chain=log_sigma2_chain,
         accept=accept,
         elapsed=elapsed,
+        pf_seed_trace=pf_seed_trace,
     )
     if cfg.verbose:
         sigma2_chain = np.asarray(result["sigma2_chain"], dtype=np.float64)
@@ -354,7 +385,7 @@ def run_hmc(
         tail = sigma2_chain[burnin_used:] if burnin_used < sigma2_chain.shape[0] else sigma2_chain
         std = np.std(tail, axis=0) if tail.size else np.zeros(2, dtype=np.float64)
         print(
-            f"[HMC] done steps={int(result['num_steps'])} burnin={burnin_used} acc={float(np.mean(accept)):.3f} "
+            f"[HMC] done steps={int(result['num_steps'])} burnin={burnin_used} overall_acc={float(np.mean(accept)):.3f} "
             f"step_size_final={step_size_chain[-1]:.5f} "
             f"std_v2={float(std[0]):.4f} std_w2={float(std[1]):.4f}",
             flush=True,
@@ -383,6 +414,8 @@ def run_nuts(
     adaptation_steps = int(ctx["adaptation_steps"])
     inner_pf = ctx["inner_pf"]
     target_log_prob_fn = ctx["target_log_prob_fn"]
+    pf_seed_base = int(ctx["pf_seed_base"])
+    pf_aux_seed_var = ctx["pf_aux_seed_var"]
     current_state = ctx["init_unconstrained"]
 
     kernel = tfp.mcmc.DualAveragingStepSizeAdaptation(
@@ -418,12 +451,17 @@ def run_nuts(
     leapfrogs_chain = np.empty(num_steps, dtype=np.int32)
     max_depth_hits = np.zeros(num_steps, dtype=np.int32)
     divergences = np.zeros(num_steps, dtype=np.int32)
+    pf_seed_trace = np.empty((num_steps, 2), dtype=np.int32)
 
-    accepted_count = 0
+    window_accepted_count = 0
+    window_step_count = 0
     print_every = max(1, int(cfg.print_every))
     t_start = time.perf_counter()
 
     for i in range(num_steps):
+        pf_seed_i = _pf_seed_pair(pf_seed_base, i + 1)
+        pf_aux_seed_var.assign(pf_seed_i)
+        pf_seed_trace[i] = pf_seed_i
         current_state, kernel_results = _one_step(current_state, kernel_results)
         inner = kernel_results.inner_results
         is_accepted = bool(inner.is_accepted.numpy())
@@ -441,28 +479,31 @@ def run_nuts(
         divergences[i] = int(has_divergence)
 
         if is_accepted:
-            accepted_count += 1
+            window_accepted_count += 1
+        window_step_count += 1
 
+        step_num = i + 1
+        should_report = step_num == 1 or step_num % print_every == 0 or step_num == num_steps
+        message = None
+        window_accept_rate = float(window_accepted_count / max(window_step_count, 1))
+        if cfg.verbose and should_report:
+            message = (
+                f"[NUTS] step {step_num}/{num_steps} "
+                f"accept_rate={window_accept_rate:.3f} "
+                f"sigma_v2={float(sigma2_current[0]):.3f} "
+                f"sigma_w2={float(sigma2_current[1]):.3f} "
+                f"step_size={step_size:.5f} "
+                f"leapfrogs={leapfrogs_taken} "
+                f"max_depth_hit={int(reach_max_depth)} "
+                f"divergence={int(has_divergence)}"
+            )
+            print(message, flush=True)
         if cfg.verbose:
-            step_num = i + 1
-            message = None
-            if step_num == 1 or step_num % print_every == 0 or step_num == num_steps:
-                message = (
-                    f"[NUTS] step {step_num}/{num_steps} "
-                    f"accept_rate={accepted_count / step_num:.3f} "
-                    f"sigma_v2={float(sigma2_current[0]):.3f} "
-                    f"sigma_w2={float(sigma2_current[1]):.3f} "
-                    f"step_size={step_size:.5f} "
-                    f"leapfrogs={leapfrogs_taken} "
-                    f"max_depth_hit={int(reach_max_depth)} "
-                    f"divergence={int(has_divergence)}"
-                )
-                print(message, flush=True)
             _emit_progress(
                 progress_callback,
                 step_num,
                 {
-                    "accept_rate": float(accepted_count / step_num),
+                    "accept_rate": window_accept_rate,
                     "accepted": float(int(is_accepted)),
                     "sigma_v2": float(sigma2_current[0]),
                     "sigma_w2": float(sigma2_current[1]),
@@ -474,12 +515,11 @@ def run_nuts(
                 message,
             )
         else:
-            step_num = i + 1
             _emit_progress(
                 progress_callback,
                 step_num,
                 {
-                    "accept_rate": float(accepted_count / step_num),
+                    "accept_rate": window_accept_rate,
                     "accepted": float(int(is_accepted)),
                     "sigma_v2": float(sigma2_current[0]),
                     "sigma_w2": float(sigma2_current[1]),
@@ -489,12 +529,16 @@ def run_nuts(
                     "divergence": float(int(has_divergence)),
                 },
             )
+        if should_report:
+            window_accepted_count = 0
+            window_step_count = 0
     elapsed = time.perf_counter() - t_start
     result = _finalize_gradient_mcmc(
         ctx,
         log_sigma2_chain=log_sigma2_chain,
         accept=accept,
         elapsed=elapsed,
+        pf_seed_trace=pf_seed_trace,
     )
     if cfg.verbose:
         sigma2_chain = np.asarray(result["sigma2_chain"], dtype=np.float64)
@@ -502,7 +546,7 @@ def run_nuts(
         tail = sigma2_chain[burnin_used:] if burnin_used < sigma2_chain.shape[0] else sigma2_chain
         std = np.std(tail, axis=0) if tail.size else np.zeros(2, dtype=np.float64)
         print(
-            f"[NUTS] done steps={int(result['num_steps'])} burnin={burnin_used} acc={float(np.mean(accept)):.3f} "
+            f"[NUTS] done steps={int(result['num_steps'])} burnin={burnin_used} overall_acc={float(np.mean(accept)):.3f} "
             f"step_size_final={step_size_chain[-1]:.5f} "
             f"mean_leapfrogs={float(np.mean(leapfrogs_chain)):.2f} "
             f"max_depth_rate={float(np.mean(max_depth_hits)):.3f} "

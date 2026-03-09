@@ -35,6 +35,18 @@ def _broadcast_logdet(logdet: tf.Tensor, log_q0: tf.Tensor) -> tf.Tensor:
     return tf.cond(rank_diff > 0, _pad, lambda: logdet)
 
 
+def _log_abs_det_jacobian(jmat: tf.Tensor, *, scalar_case: bool) -> tuple[tf.Tensor, tf.Tensor]:
+    if scalar_case:
+        j_scalar = tf.squeeze(jmat, axis=[-2, -1])
+        sign = tf.sign(j_scalar)
+        safe_j = tf.where(tf.equal(sign, 0.0), tf.ones_like(j_scalar), j_scalar)
+        lad = tf.math.log(tf.abs(safe_j))
+        return sign, lad
+
+    out = tf.linalg.slogdet(jmat)
+    return out.sign, out.log_abs_determinant
+
+
 @dataclass
 class PureBootstrapProposal:
     def sample(
@@ -106,6 +118,7 @@ class PureEDHProposal:
         log_w_prev: tf.Tensor | None = None,
     ) -> tuple[tf.Tensor, tf.Tensor]:
         seeds = tf.random.experimental.stateless_split(_to_seed(seed), 2)
+        scalar_case = int(ssm.state_dim) == 1
         trans_dist = ssm.transition_dist(x_prev, y_prev=y_prev, params=params, time_index=time_index)
         mu = tf.cast(trans_dist.sample(seed=seeds[0]), tf.float32)
         log_q0 = tf.cast(trans_dist.log_prob(mu), tf.float32)
@@ -128,7 +141,7 @@ class PureEDHProposal:
         logdet = tf.zeros([batch], dtype=tf.float32)
 
         for j in range(self.num_lambda):
-            lam = tf.cast(j, mu.dtype) * step
+            lam = (tf.cast(j, mu.dtype) + 0.5) * step
             h, h_m = ssm.jacobian_h_x(m_bar, r0, params=params)
             h_r, _ = ssm.jacobian_h_r(m_bar, r0, params=params)
             hm = tf.einsum("bij,bj->bi", h, m_bar)
@@ -137,7 +150,7 @@ class PureEDHProposal:
             a, b = _edh_flow_solution(lam, h, p, r_eff, y_tilde, m0, self.jitter)
             jmat = i + step[..., tf.newaxis, tf.newaxis] * a
             jmat = jmat + tf.cast(self.jitter, jmat.dtype) * i
-            sign, lad = tf.linalg.slogdet(jmat)
+            sign, lad = _log_abs_det_jacobian(jmat, scalar_case=scalar_case)
             bad = tf.logical_or(tf.equal(sign, 0.0), tf.logical_not(tf.math.is_finite(lad)))
             lad = tf.where(bad, tf.zeros_like(lad), lad)
             logdet = logdet + lad
@@ -170,6 +183,7 @@ class PureLEDHProposal:
         log_w_prev: tf.Tensor | None = None,
     ) -> tuple[tf.Tensor, tf.Tensor]:
         seeds = tf.random.experimental.stateless_split(_to_seed(seed), 2)
+        scalar_case = int(ssm.state_dim) == 1
         trans_dist = ssm.transition_dist(x_prev, y_prev=y_prev, params=params, time_index=time_index)
         mu = tf.cast(trans_dist.sample(seed=seeds[0]), tf.float32)
         log_q0 = tf.cast(trans_dist.log_prob(mu), tf.float32)
@@ -195,8 +209,8 @@ class PureLEDHProposal:
         logdet = tf.zeros([batch, n], dtype=tf.float32)
 
         for j in range(self.num_lambda):
-            lam = tf.cast(j, mu.dtype) * step
-            lam_bn = tf.ones([batch, n], dtype=mu.dtype) * lam
+            lam = (tf.cast(j, mu.dtype) + 0.5) * step # mid point lam
+            lam_bn = tf.ones([batch, n], dtype=mu.dtype) * lam 
             h, h_loc = ssm.jacobian_h_x(mu, r0, params=params)
             h_r, _ = ssm.jacobian_h_r(mu, r0, params=params)
             hx = tf.einsum("bnij,bnj->bni", h, mu)
@@ -205,7 +219,7 @@ class PureLEDHProposal:
             a, b = _ledh_flow_solution(lam_bn, h, p_exp, r_eff, y_tilde, mu, self.jitter)
             jmat = i + step[..., tf.newaxis, tf.newaxis] * a
             jmat = jmat + tf.cast(self.jitter, jmat.dtype) * i
-            sign, lad = tf.linalg.slogdet(jmat)
+            sign, lad = _log_abs_det_jacobian(jmat, scalar_case=scalar_case)
             bad = tf.logical_or(tf.equal(sign, 0.0), tf.logical_not(tf.math.is_finite(lad)))
             lad = tf.where(bad, tf.zeros_like(lad), lad)
             logdet = logdet + lad
@@ -213,7 +227,7 @@ class PureLEDHProposal:
             mu_next = mu + step[..., tf.newaxis] * (ax + b)
             mu = tf.where(bad[..., tf.newaxis], mu, mu_next)
 
-        log_q = log_q0 - _broadcast_logdet(logdet, log_q0)
+        log_q = log_q0 - tf.stop_gradient(_broadcast_logdet(logdet, log_q0))
         return mu, tf.cast(log_q, tf.float32)
 
 
